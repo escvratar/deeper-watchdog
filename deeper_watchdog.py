@@ -1054,8 +1054,17 @@ def test_url_latency(url, timeout=3.5):
         return None, str(e)
 
 
+def best_of(*rounds):
+    """Per site, the fastest of several (latency, status) measurements; a failed one only if all failed.
+    A single request is noisy (a cold DNS lookup or connection alone can add a second), the best one shows
+    what the tunnel can do."""
+    return [min((m for m in ms if m[0] is not None), key=lambda m: m[0], default=ms[-1]) for ms in zip(*rounds)]
+
+
 def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
-    """Tests canaries for the given tunnel code. Returns (is_healthy, avg_lat, details)."""
+    """Tests canaries for the given tunnel code. Returns (is_healthy, best_lat, details).
+    A bad node slows every site down, so the tunnel fails only when even its fastest site is too slow:
+    a few slow sites next to a fast one are those sites' own problem, and a node change wouldn't fix them."""
     if max_latency_ms is None:
         max_latency_ms = MAX_LATENCY_MS
     endpoints = canaries or FALLBACK_CANARIES.get(tunnel_code, [])
@@ -1069,16 +1078,14 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
 
     def summary(measured):
         lats = [lat for lat, _ in measured if lat is not None]
-        return lats and sum(lats) / len(lats) <= max_latency_ms
+        return lats and min(lats) <= max_latency_ms
 
-    measured = measure_once()
+    measured = best_of(measure_once(), measure_once())
     retried = False
     if not summary(measured):
-        # One slow answer is often just noise: measure again and keep each site's better result
+        # Slow answers are often just noise: measure once more and keep each site's best result
         retried = True
-        again = measure_once()
-        measured = [min((m for m in pair if m[0] is not None), key=lambda m: m[0], default=pair[1])
-                    for pair in zip(measured, again)]
+        measured = best_of(measured, measure_once())
 
     results = []
     latencies = []
@@ -1095,11 +1102,11 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
     if not latencies:
         return False, 0, "All canaries failed" + note + ": " + "; ".join(results)
 
-    avg_lat = sum(latencies) / len(latencies)
-    if avg_lat > max_latency_ms:
-        return False, avg_lat, f"High latency ({avg_lat:.0f}ms > {max_latency_ms}ms){note}: " + "; ".join(results)
+    best = min(latencies)
+    if best > max_latency_ms:
+        return False, best, f"High latency (best {best:.0f}ms > {max_latency_ms}ms){note}: " + "; ".join(results)
 
-    return True, avg_lat, f"OK ({avg_lat:.0f}ms): " + "; ".join(results)
+    return True, best, f"OK (best {best:.0f}ms): " + "; ".join(results)
 
 
 def tunnel_services(client, code):
@@ -1581,7 +1588,8 @@ def measure_services():
         return
     urls = [f"https://{g['domains'][0]['domain']}" for g in groups]
     with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
-        measured = list(pool.map(lambda u: test_url_latency(u, timeout=LATENCY_TIMEOUT), urls))
+        measured = best_of(*[list(pool.map(lambda u: test_url_latency(u, timeout=LATENCY_TIMEOUT), urls))
+                             for _ in range(2)])
     SERVICE_RESULTS.clear()
     for g, u, (lat, status) in zip(groups, urls, measured):
         SERVICE_RESULTS[g["key"]] = {"name": g["name"], "tunnel": "split" if g["split"] else g["main"], "url": u,
@@ -1690,7 +1698,8 @@ GAIN_TRIED = {}  # auto-mode service -> when a comparison was last started becau
 
 def gain_compare():
     """After a check: an auto-mode service whose ping is worse than another working tunnel's by the auto-move
-    thresholds (or that doesn't answer) is compared right away instead of waiting for the daily comparison.
+    thresholds, slower than MAX_LATENCY_MS or not answering is compared right away instead of waiting for the
+    daily comparison (its tunnel can be healthy: the tunnel only fails when all of its sites are slow).
     The comparison measures the service itself in every tunnel and moves it only if that is really faster."""
     if not AUTO_GAIN_RECHECK or COMPARE["running"] or STATUS.get("all_slow"):
         return
@@ -1711,14 +1720,15 @@ def gain_compare():
         if not others or tunnel == "split":
             continue
         best = min(others, key=others.get)
-        if lat is None or (lat - others[best] >= AUTO_MIN_GAIN_MS and (lat - others[best]) * 100 >= AUTO_MIN_GAIN_PCT * lat):
+        if lat is None or lat > MAX_LATENCY_MS or (lat - others[best] >= AUTO_MIN_GAIN_MS and (lat - others[best]) * 100 >= AUTO_MIN_GAIN_PCT * lat):
             todo.append(k)
-            why.append(f"{k.split(':', 1)[1]} ({tunnel} {fmt_ms(lat) if lat else 'нет ответа'}, {best} {fmt_ms(others[best])})")
+            why.append(f"{k.split(':', 1)[1]} ({tunnel} {fmt_ms(lat) if lat else 'нет ответа'}"
+                       f"{' — медленно' if lat and lat > MAX_LATENCY_MS else ''}, {best} {fmt_ms(others[best])})")
     if todo and start_compare(todo):
         for k in todo:
             GAIN_TRIED[k] = now
         logger.info(f"Авторежим: другой туннель быстрее, сравниваю: {', '.join(why)}")
-        log_event("info", f"Авто: похоже, в другом туннеле быстрее, сравниваю: {', '.join(why)}")
+        log_event("info", f"Авто: сервис медленный или в другом туннеле быстрее, сравниваю: {', '.join(why)}")
 
 
 def auto_group_keys(groups):
@@ -2035,7 +2045,9 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
         apps = [a for a in ROUTES["apps"] if a["website"]]
         if apps:
             with ThreadPoolExecutor(max_workers=len(apps)) as pool:
-                measured = list(pool.map(lambda a: test_url_latency(a["website"], timeout=LATENCY_TIMEOUT), apps))
+                rounds = [list(pool.map(lambda a: test_url_latency(a["website"], timeout=LATENCY_TIMEOUT), apps))
+                          for _ in range(2)]
+            measured = best_of(*rounds)  # The same way as the tunnels' sites, so the numbers compare
             APP_RESULTS.clear()
             for a, (lat, status) in zip(apps, measured):
                 APP_RESULTS[a["app"]] = {"tunnel": a["tunnel"], "latency": lat, "status": status, "ok": lat is not None}
@@ -2564,7 +2576,7 @@ const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые са
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
  {title:"Проверка",fields:[
-  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Выше этого значения проверка считается неудачной"],
+  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Туннель не прошёл проверку, если медленнее все его сайты. Медленный сервис с «Авто» сравнивается с другими туннелями сразу"],
   ["FAIL_THRESHOLD","number","Сбоев подряд до восстановления","Сколько неудачных проверок подряд нужно для восстановления"],
   ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"],
   ["LATENCY_TIMEOUT","number","Таймаут запроса, сек","Сколько ждать ответа тестового сайта"],
@@ -2959,13 +2971,17 @@ function renderEvents(){const box=$("events");box.textContent="";const today=new
   el("div",{class:"tx",text:e.text}),el("div",{class:"tm",text:e.time.slice(0,10)===today?e.time.slice(11,16):e.time.slice(8,10)+"."+e.time.slice(5,7)+" "+e.time.slice(11,16)})));
  $("eventsMore").hidden=eventsData.length<=8;$("eventsMore").textContent=showAllEvents?"Свернуть":`Показать все (${Math.min(eventsData.length,150)})`}
 $("eventsMore").onclick=()=>{showAllEvents=!showAllEvents;renderEvents()};
+// A slow service in manual mode doesn't move by itself: the overview suggests comparing it
+function slowManual(key,x,d){if(x.tunnel==="split"||(x.latency!=null&&x.latency<=d.max_latency))return false;
+ const g=(d.groups||[]).find(g=>g.key===key),auto=new Set(d.auto);
+ return !auto.has(key)&&!(g&&g.domains.some(m=>auto.has(m.domain)))&&!(d.preferred||{})[key]}
 function renderServices(){const d=routesData;if(!d)return;
  const list=Object.entries(d.services||{}).sort((a,b)=>(a[1].ok-b[1].ok)||a[1].name.localeCompare(b[1].name));
  $("svcBlock").hidden=!list.length;const box=$("svcList");box.textContent="";
  for(const [key,x] of list){const prob=d.probation[key];
-  const b=el("button",{type:"button",class:"svc",title:`${hostOf(x.url)}: ${x.latency!=null?Math.round(x.latency)+" мс":"нет ответа ("+x.status+")"}`+(prob?` · проверяется после переноса ${prob.from} → ${prob.to}`:"")},
+  const b=el("button",{type:"button",class:"svc",title:`${hostOf(x.url)}: ${x.latency!=null?Math.round(x.latency)+" мс":"нет ответа ("+x.status+")"}`+(prob?` · проверяется после переноса ${prob.from} → ${prob.to}`:"")+(slowManual(key,x,d)?` · медленно в ${x.tunnel}, сравните туннели`:"")},
    el("span",{class:"dot "+pingKind(x.latency)}),x.name,
-   el("span",{class:"t"+(x.tunnel==="split"?" bad":""),text:x.tunnel==="split"?"⚠ разные страны":x.tunnel+(prob?" · проверка":"")}),
+   el("span",{class:"t"+(x.tunnel==="split"?" bad":""),text:x.tunnel==="split"?"⚠ разные страны":x.tunnel+(prob?" · проверка":slowManual(key,x,d)?" · сравните":"")}),
    el("span",{class:"v",text:x.latency!=null?Math.round(x.latency):"—"}));
   b.onclick=async()=>{$("rtFilter").value=x.name;openDoms.add(key);await loadRoutes();openSheet()};box.append(b)}}
 async function loadBackups(){const box=$("backupList");if(!box)return;let list;
@@ -2991,7 +3007,7 @@ function siteList(tunnel,x){
 // Check details are for the log; the card says the same in plain words when there is no site list
 function plainDetails(x){const d=x.details||"";if(!d)return "";
  if(/^All canaries failed/.test(d))return "Тестовые сайты не ответили";
- if(/^High latency/.test(d))return `Пинг ${Math.round(x.latency)} мс — выше допустимого`;
+ if(/^High latency/.test(d))return `Все сайты медленнее допустимого, лучший — ${Math.round(x.latency)} мс`;
  if(/^OK/.test(d))return "Тестовые сайты отвечают";
  return d.replace(/ \(HTTP \d+\)/g,"")}
 function renderTunnels(){
