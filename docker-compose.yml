@@ -1,0 +1,19 @@
+services:
+  deeper-watchdog:
+    # Ready image from GitHub (x86-64, ARM64, ARMv7). To build from this folder instead:
+    # docker compose up -d --build
+    image: ghcr.io/escvratar/deeper-watchdog:latest
+    build: .
+    container_name: deeper-watchdog
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

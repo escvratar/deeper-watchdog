@@ -1,0 +1,10 @@
+# Secrets and runtime data
+.env
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local backups
+*.bak
