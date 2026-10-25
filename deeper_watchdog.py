@@ -2562,7 +2562,27 @@ a.btn{text-decoration:none}
 
 /* Overview: tunnel cards */
 .sect{display:flex;align-items:baseline;justify-content:space-between;font-size:22px;font-weight:700;letter-spacing:-.025em;margin:30px 2px 12px}
-.tunnels{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;margin-bottom:6px}
+.tunnels{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:8px;margin-bottom:6px;align-items:start}
+.tcard.compact{padding:10px 12px}
+.tcard.compact .thead{gap:10px;cursor:pointer;-webkit-tap-highlight-color:transparent;border-radius:10px}
+.tcard.compact .thead:focus-visible{outline:2px solid var(--accent);outline-offset:4px}
+.tcard.compact .code{width:34px;height:34px}.tcard.compact .code .flag{font-size:24px}.tcard.compact .code .cc{font-size:8.5px;right:-5px}
+.tcard.compact .tname{font-size:15px}
+.tsub{display:flex;align-items:center;flex-wrap:wrap;gap:2px 8px;margin-top:2px;font-size:12px;color:var(--muted)}
+.tsub .tstate{margin-top:0;padding:1px 7px 1px 6px}
+.tsub .warn{color:var(--orange)}
+.tping{font-size:20px;font-weight:700;letter-spacing:-.03em;font-variant-numeric:tabular-nums;white-space:nowrap;line-height:1}
+.tping small{font-size:12px;font-weight:600;color:var(--muted);margin-left:2px}
+.tping.warn{color:var(--orange)}.tping.bad{color:var(--red)}.tping.none{color:var(--muted);font-weight:600}
+.tcard.compact .chev{width:7px;height:7px;border:solid var(--muted);border-width:0 1.8px 1.8px 0;transform:rotate(45deg) translate(-2px,-2px);transition:transform .25s var(--spring);flex:none}
+.tcard.compact.open .chev{transform:rotate(-135deg) translate(-2px,-2px)}
+.tcard.compact .tmore{margin:-4px -4px -4px 0}
+.tbody{margin-top:10px;padding-top:8px;border-top:.5px solid var(--sep)}
+.tbody .meta{font-size:12px}
+.tbody .spark{margin-top:8px}.tbody .spark svg{height:40px}
+.tbody .sitelist{margin-top:8px;padding-top:0;border-top:0}
+.tbody .details{margin-top:8px}
+.tcard.compact .tact{margin-top:8px}
 .tcard{padding:18px 20px 18px;position:relative;transition:transform .35s var(--spring),box-shadow .35s var(--spring);display:flex;flex-direction:column}
 @media (hover:hover){.tcard:hover{box-shadow:var(--shadow-lift);transform:translateY(-2px)}}
 .thead{display:flex;align-items:center;gap:12px}
@@ -3340,28 +3360,31 @@ function plainDetails(x){const d=x.details||"";if(!d)return "";
  if(/^High latency/.test(d))return `Все сайты медленнее допустимого, лучший — ${Math.round(x.latency)} мс`;
  if(/^OK/.test(d))return "Домены туннеля отвечают";
  return d.replace(/ \(HTTP \d+\)/g,"")}
+// Tunnel cards are one line each; a tap opens the chart, IP and domains. Opened ones stay open across updates
+const openCards=new Set();
 function renderTunnels(){
- const st=lastStatus;if(!st)return;const codes=Object.keys(st.tunnels||{});
+ const st=lastStatus;if(!st)return;
+ // Problems first: failing, working, without nodes, not checked
+ const rank=x=>x.unchecked?3:x.pool===0?2:x.healthy?1:0;
+ const codes=Object.keys(st.tunnels||{}).map((c,i)=>[c,i]).sort((a,b)=>rank(st.tunnels[a[0]])-rank(st.tunnels[b[0]])||a[1]-b[1]).map(a=>a[0]);
  const box=$("tunnels");box.textContent="";
- for(const c of codes){const x=st.tunnels[c];const action=(x.details||"").split(" → ")[1];
-  const act=actionRow(c);
-  if(x.unchecked){box.append(el("div",{class:"card tcard"},
-   el("div",{class:"thead"},codeBadge(c),
-    el("div",{},el("div",{class:"tname",text:x.country}),el("div",{class:"tstate"},el("span",{class:"dot"}),"Не проверяется")),tunnelButtons(c,x)),
-   el("div",{class:"ping"},"—"),
-   tmeta(x),
-   act||el("div",{class:"details",text:"Через этот туннель сейчас не идёт ни один сайт, поэтому пинг не измерить. Перенесите в него сервис в «Пинг и рекомендации» или добавьте тестовый сайт."})));continue}
-  const noNodes=x.pool===0;
-  box.append(el("div",{class:"card tcard"},
-   el("div",{class:"thead"},codeBadge(c),
-    el("div",{},el("div",{class:"tname",text:x.country}),
-     el("div",{class:"tstate "+(x.healthy?"ok":noNodes?"warn":"bad")},el("span",{class:"dot "+(x.healthy?"ok":noNodes?"warn":"bad")}),x.healthy?"Работает":noNodes?"Нет нод":"Сбой")),
-    tunnelButtons(c,x)),
-   el("div",{class:"ping "+(x.latency?pingKind(x.latency):"")},x.latency?String(Math.round(x.latency)):"—",el("small",{text:x.latency?"мс":""})),
-   tmeta(x,st.fail_threshold),
-   act,spark(c),
-   noNodes?el("div",{class:"details",text:"Нет активных нод: сервисы переносятся в другие туннели, туннель перестраивается."}):siteList(c,x)||el("div",{class:"details",text:plainDetails(x)}),
-   action?el("div",{class:"details",text:"→ "+action}):null))}
+ for(const c of codes){const x=st.tunnels[c],noNodes=x.pool===0,open=openCards.has(c);
+  const action=(x.details||"").split(" → ")[1];
+  const [cls,label]=x.unchecked?["","Не проверяется"]:x.healthy?["ok","Работает"]:noNodes?["warn","Нет нод"]:["bad","Сбой"];
+  const sub=el("div",{class:"tsub"},el("span",{class:"tstate "+cls},el("span",{class:"dot "+cls}),label),
+   el("span",{text:`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`}),
+   x.fails&&!x.unchecked?el("span",{class:"warn",text:`сбоев ${x.fails} из ${st.fail_threshold}`}):null);
+  const ping=el("div",{class:"tping "+(x.latency?pingKind(x.latency):"none")},x.latency?String(Math.round(x.latency)):"—",x.latency?el("small",{text:"мс"}):null);
+  const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(open),"aria-label":`${x.country}: ${label}, подробнее`},
+   codeBadge(c),el("div",{},el("div",{class:"tname",text:x.country}),sub),ping,el("span",{class:"chev","aria-hidden":"true"}),tunnelButtons(c,x));
+  const toggle=e=>{if(e.target.closest("button"))return;open?openCards.delete(c):openCards.add(c);renderTunnels()};
+  head.onclick=toggle;head.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle(e)}};
+  const body=open?el("div",{class:"tbody"},tmeta(x,x.unchecked?null:st.fail_threshold),spark(c),
+   x.unchecked?el("div",{class:"details",text:"Через этот туннель сейчас не идёт ни один сервис, поэтому пинг не измерить. Перенесите в него сервис в «Пинг и рекомендации»."})
+   :noNodes?el("div",{class:"details",text:"Нет активных нод: сервисы переносятся в туннели, где ноды есть."})
+   :siteList(c,x)||el("div",{class:"details",text:plainDetails(x)}),
+   action?el("div",{class:"details",text:"→ "+action}):null):null;
+  box.append(el("div",{class:"card tcard compact"+(open?" open":"")},head,actionRow(c),body))}
  if(!codes.length&&!st.error)box.append(el("div",{class:"card empty"},el("span",{class:"spin"}),"Ждём первую проверку…"))}
 function codeBadge(c){const f=flag(c);return f?el("span",{class:"code",title:tname(c)},el("span",{class:"fw"},el("span",{class:"flag",text:f})),el("span",{class:"cc",text:c})):el("span",{class:"code",text:c})}
 function tmeta(x,threshold){return el("div",{class:"meta"},el("span",{},icon("server"),x.ip||"—"),el("span",{},icon("nodes"),`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`),
