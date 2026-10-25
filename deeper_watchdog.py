@@ -616,6 +616,10 @@ AUTO_STATE.setdefault("rebuilt_at", {})  # code -> when the watchdog (or the use
 AUTO_STATE.setdefault("hosts", {})  # host -> {"seen": last answer through any tunnel, "good": last non-error status}
 # Only preferred services come back now; auto and sticky ones stay where a failover took them
 AUTO_STATE["evacuated"] = {k: e for k, e in AUTO_STATE["evacuated"].items() if k in preferred_tunnels()}
+# How long tunnels have been green survives a short restart (an update, a container restart): saved after every
+# check with the time it was saved. After a longer gap nobody knows what the tunnels did meanwhile: counted anew
+if time.time() - AUTO_STATE.get("alive_at", 0) <= CHECK_INTERVAL + 120:
+    GREEN_SINCE.update({c: t for c, t in (AUTO_STATE.get("green_since") or {}).items() if isinstance(t, (int, float))})
 # Ping history: tunnel -> [[unix_time, ms or None], ...]
 HISTORY = load_json(HISTORY_FILE, {})
 # Latest ping of every service: "group:<name>" -> {name, tunnel, url, latency, status, ok}
@@ -2406,6 +2410,9 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
         enforce_preferred(client, dict(GREEN_SINCE))
     except Exception as e:
         logger.error(f"Ошибка решений по сервисам: {e}")
+    with STATE_LOCK:
+        AUTO_STATE["green_since"] = dict(GREEN_SINCE)
+        AUTO_STATE["alive_at"] = time.time()
     save_auto_state()
 
     try:
