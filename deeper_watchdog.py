@@ -1126,6 +1126,8 @@ ERROR_PENALTY_MS = 5000   # ...and for an HTTP error the site doesn't always giv
 ERROR_STATUSES = (403, 429, 502, 503, 504)
 SERVICE_LOSS_PCT = 20     # A service degrades above this loss...
 SERVICE_TIMEOUTS = 3      # ...or after this many checks in a row without any answer
+SLOW_CHECKS = 2           # ...or slower than MAX_LATENCY_MS this many checks in a row
+SLOW_STREAK = {}          # service key -> checks in a row it was slower than MAX_LATENCY_MS in its current tunnel
 HOST_MEMORY_DAYS = 7      # A domain that hasn't answered anywhere this long doesn't count (e.g. a bare CDN domain)
 FAILOVER_LIMIT = 3        # Failovers of one service within an hour, after which it is left where it is
 # "<tunnel> <host>" -> quality of a site in a tunnel: {"url", "tunnel", "q", "lat", "tcp", "ttfb", "status",
@@ -1370,6 +1372,7 @@ def mark_moved(key):
     """Starts the hold-down: the service stays where it is for HOLD_DOWN seconds."""
     with STATE_LOCK:
         AUTO_STATE["moved_at"][key] = time.time()
+    SLOW_STREAK.pop(key, None)
 
 
 def held(key, dead=False):
@@ -1825,11 +1828,11 @@ def compare_routes(client, keys):
 
 
 def degraded(r):
-    """A service (its state from service_results) works badly in its tunnel: loss above SERVICE_LOSS_PCT,
-    SERVICE_TIMEOUTS checks in a row without an answer, most of its domains answering with an error status
-    (whatever the latency: the tunnel doesn't work for it), or a smoothed score worse than the latency limit."""
-    return r["loss"] * 100 > SERVICE_LOSS_PCT or r["fails"] >= SERVICE_TIMEOUTS or r.get("errors", 0) * 2 > 1 \
-        or r["q"] > MAX_LATENCY_MS
+    """A service (its state from service_results) works badly in its tunnel: slower than MAX_LATENCY_MS
+    SLOW_CHECKS checks in a row, loss above SERVICE_LOSS_PCT, SERVICE_TIMEOUTS checks in a row without an answer,
+    or most of its domains answering with an error status (whatever the latency: the tunnel doesn't work for it)."""
+    return r.get("slow_checks", 0) >= SLOW_CHECKS or r["loss"] * 100 > SERVICE_LOSS_PCT \
+        or r["fails"] >= SERVICE_TIMEOUTS or r.get("errors", 0) * 2 > 1
 
 
 def summarize(name, tunnel, url, recs):
@@ -1869,7 +1872,7 @@ def why_bad(r):
     return ("не отвечает" if not r["ok"] else f"потери {r['loss']:.0%}" if r["loss"] * 100 > SERVICE_LOSS_PCT
             else f"медленно, {fmt_ms(r['latency'])}" if slow
             else f"ошибки ответа (HTTP {r['status']})" if r.get("errors", 0)
-            else f"плохое качество, {fmt_ms(r['latency'])} с потерями")
+            else f"нет ответа {r['fails']} проверки подряд" if r["fails"] else f"плохое качество, {fmt_ms(r['latency'])}")
 
 
 def decide_services(client, current):
@@ -2378,6 +2381,11 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
 
     # Every service from the probes of all its domains, then what to do about the ones that work badly
     current = service_results(started)
+    # Slow checks in a row, in the tunnel the service is in now (a move starts the count anew)
+    for k, r in current.items():
+        slow = r["latency"] is not None and r["latency"] > MAX_LATENCY_MS
+        SLOW_STREAK[k] = SLOW_STREAK.get(k, 0) + 1 if slow else 0
+        r["slow_checks"] = SLOW_STREAK[k]
     # A tunnel rebuilt in this check starts its history anew: its services keep their last status meanwhile
     keys = {g["key"] for g in service_groups(ROUTES["whitelist"])}
     for k in [k for k in SERVICE_RESULTS if k not in keys]:
@@ -2917,8 +2925,8 @@ const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые са
  "Резервные копии и перенос":["archive","#8e8e93"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
- {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (не отвечает, теряет запросы, отдаёт ошибки, медленнее допустимого пинга) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
-  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сайт медленнее этого считается плохим"],
+ {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга 2 проверки подряд, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
+  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сервис медленнее этого 2 проверки подряд переезжает в туннель с нодами"],
   ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
   ["APPS","text","Приложения","Коды через запятую"]]},
