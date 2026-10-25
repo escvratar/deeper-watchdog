@@ -613,6 +613,7 @@ AUTO_STATE.setdefault("moved_at", {})  # key -> when the watchdog last moved it 
 AUTO_STATE.setdefault("returned", {})  # key -> {"at", "wait"}: last return to the preferred tunnel
 AUTO_STATE.setdefault("failovers", {})  # key -> times of failovers within the last hour
 AUTO_STATE.setdefault("rebuilt_at", {})  # code -> when the watchdog (or the user) last rebuilt the tunnel
+AUTO_STATE.setdefault("tours", {})  # key -> {"tried": {code: score}, "at", "settled"}: tunnels tried while it worked badly
 AUTO_STATE.setdefault("bad_ips", {})  # key -> {code: {ip: when}}: nodes a service had to leave for working badly
 AUTO_STATE.setdefault("hosts", {})  # host -> {"seen": last answer through any tunnel, "good": last non-error status}
 # Only preferred services come back now; auto and sticky ones stay where a failover took them
@@ -1134,10 +1135,11 @@ SERVICE_LOSS_PCT = 20     # A service degrades above this loss...
 SERVICE_TIMEOUTS = 3      # ...or after this many checks in a row without any answer
 SLOW_CHECKS = 2           # ...or slower than MAX_LATENCY_MS this many checks in a row
 SLOW_STREAK = {}          # service key -> checks in a row it was slower than MAX_LATENCY_MS in its current tunnel
+STAY_PINGS = {}           # service key -> its pings (None: no answer) in its current tunnel since it got there
 HOST_MEMORY_DAYS = 2      # A domain that hasn't answered anywhere this long doesn't count (e.g. a bare CDN domain)
 BAD_IP_HOURS = 24         # How long a node a service had to leave counts as bad for it
 CACHE_HOURS = 48          # Nothing the watchdog remembers about domains, nodes and moves is kept longer
-FAILOVER_LIMIT = 3        # Failovers of one service within an hour, after which it is left where it is
+TOUR_FORGET = 2 * 86400   # A tour of the tunnels is forgotten after this long
 # "<tunnel> <host>" -> quality of a site in a tunnel: {"url", "tunnel", "q", "lat", "tcp", "ttfb", "status",
 # "error", "loss", "window", "fails", "at"}. q is the smoothed score Q = RTT_tcp + TTFB + loss and error penalties
 QUALITY = {}
@@ -1386,6 +1388,7 @@ def mark_moved(key):
     with STATE_LOCK:
         AUTO_STATE["moved_at"][key] = time.time()
     SLOW_STREAK.pop(key, None)
+    STAY_PINGS.pop(key, None)
 
 
 def held(key, dead=False):
@@ -1438,6 +1441,7 @@ def prune_cache():
     AUTO_STATE["returned"] = {k: r for k, r in AUTO_STATE["returned"].items() if keep(r.get("at"))}
     AUTO_STATE["failovers"] = {k: [t for t in ts if keep(t)] for k, ts in AUTO_STATE["failovers"].items() if any(keep(t) for t in ts)}
     AUTO_STATE["blocked"] = {k: b for k, b in AUTO_STATE["blocked"].items() if b.get("until", 0) > now}
+    AUTO_STATE["tours"] = {k: v for k, v in AUTO_STATE["tours"].items() if now - v.get("at", 0) < TOUR_FORGET}
 
 
 def note_evacuated(key, from_code, to_code):
@@ -1588,6 +1592,7 @@ def _enforce_preferred(client, prefs):
             mark_moved(key)
             with STATE_LOCK:
                 AUTO_STATE["evacuated"].pop(key, None)
+                AUTO_STATE["tours"].pop(key, None)  # A new node: a fresh start
                 if evac and evac.get("from") == code:
                     AUTO_STATE["returned"][key] = {"at": time.time(), "wait": evac.get("wait", PREFERRED_RETURN_AFTER)}
             changed = True
@@ -1889,6 +1894,20 @@ def degraded(r):
         or r["fails"] >= SERVICE_TIMEOUTS or r.get("errors", 0) * 2 > 1
 
 
+def stay_score(key):
+    """How the service did in its current tunnel since it got there: the median of its pings, a check without an
+    answer counting as 10**6 (the smoothed score would still remember the time before the trouble)."""
+    pings = [p if p is not None else 10 ** 6 for p in STAY_PINGS.get(key, [])]
+    return median(pings) if pings else 10 ** 6
+
+
+def good(r):
+    """The service really works well (not just "not bad yet" right after a move): answers, within the latency limit,
+    no loss above SERVICE_LOSS_PCT, no error statuses."""
+    return r["ok"] and r["latency"] is not None and r["latency"] <= MAX_LATENCY_MS \
+        and r["loss"] * 100 <= SERVICE_LOSS_PCT and not r.get("errors", 0)
+
+
 def summarize(name, tunnel, url, recs):
     answered = [r for r in recs if r["lat"] is not None]
     return {"name": name, "tunnel": tunnel, "url": url,
@@ -1949,15 +1968,27 @@ def decide_services(client, current):
                 MANUAL_ALERTED.discard(key)
                 log_event("ok", f"{name} («Вручную»): в {r['tunnel']} снова работает, {fmt_ms(r['latency'])}", mail="service")
             continue
-        recent = [t for t in AUTO_STATE["failovers"].get(key, []) if now - t < 3600]
-        if bad and not held(key, dead=not r["ok"]) and len(recent) < FAILOVER_LIMIT:
+        tour = AUTO_STATE["tours"].get(key)
+        if tour:
+            # A tunnel tried on a node it no longer has is worth another try: its new node may be good
+            ips = {t["code"]: t.get("ip") for t in ROUTES["all_tunnels"] if t.get("nodes")}
+            renewed = [c for c in tour["tried"] if ips.get(c) and ips[c] != tour.get("ips", {}).get(c)]
+            if renewed:
+                with STATE_LOCK:
+                    for c in renewed:
+                        tour["tried"].pop(c, None)
+                    tour["settled"] = None
+                logger.info(f"{name}: новые ноды в {', '.join(renewed)}, туннели снова можно пробовать")
+            if good(r):  # Works now: the tour is over
+                with STATE_LOCK:
+                    AUTO_STATE["tours"].pop(key, None)
+                continue
+        if not bad:
+            continue
+        if tour and tour.get("settled") and r["ok"]:
+            continue  # Bad everywhere, left in the best tunnel until a new node shows up, unless it stops answering
+        if not held(key, dead=not r["ok"]):
             todo.append((key, r, mode))
-        elif bad and len(recent) >= FAILOVER_LIMIT and key not in MANUAL_ALERTED:
-            MANUAL_ALERTED.add(key)  # Bad in every tunnel it tried: likely the site itself
-            log_event("bad", f"{name}: за час сменил туннель {len(recent)} раза и везде {why_bad(r)}. "
-                             f"Похоже, не работает сам сервис: остаётся в {r['tunnel']}", mail="failover")
-        elif not bad:
-            MANUAL_ALERTED.discard(key)
     if not todo:
         return
     with MOVE_LOCK:
@@ -1969,9 +2000,29 @@ def decide_services(client, current):
             if move_to is None or cur != r["tunnel"]:
                 continue  # Moved meanwhile
             stays = mode in ("auto", "sticky")
-            target = failover_target(key, {cur} | (set() if stays else {mode}), tunnels)
-            if target is None:
-                continue
+            # A tour of the tunnels: each one with nodes it hasn't tried yet, in turn. Each stay is scored; once
+            # all are tried and none was good, it goes back to the best one and stays there
+            with STATE_LOCK:
+                tour = AUTO_STATE["tours"].get(key)
+                if not tour or (tour.get("settled") and not r["ok"]):
+                    tour = AUTO_STATE["tours"][key] = {"tried": {}, "ips": {}, "at": now}
+                tour["tried"][cur] = stay_score(key)
+                tour.setdefault("ips", {})[cur] = next((t.get("activeIp") for t in tunnels if t.get("tunnelCode") == cur), None)
+                tour["at"] = now
+            target = failover_target(key, set(tour["tried"]), tunnels)
+            settle = target is None
+            if settle:
+                with_nodes = {t.get("tunnelCode") for t in tunnels if t.get("activeNum", 0) > 0}
+                tried = {c: q for c, q in tour["tried"].items() if c in with_nodes or c == cur}
+                target = min(tried, key=tried.get)
+                with STATE_LOCK:
+                    tour["settled"] = now
+                scores = ", ".join(f"{c} {fmt_ms(q) if q < 10 ** 6 else 'нет ответа'}" for c, q in sorted(tried.items(), key=lambda x: x[1]))
+                if target == cur:
+                    text = f"{name}: плохо во всех туннелях ({scores}), остаётся в лучшем, {cur}. Новая попытка, когда где-нибудь появится новая нода"
+                    logger.warning(text)
+                    log_event("bad", text, mail="failover")
+                    continue
             if not move_to(target):
                 log_event("bad", f"{name}: в {cur} {why_bad(r)}, но перенести в {target} не удалось", mail="failover")
                 continue
@@ -1982,9 +2033,13 @@ def decide_services(client, current):
                 AUTO_STATE["probation"].pop(key, None)
                 if not stays:
                     note_evacuated(key, mode, target)
+            if not stays and target == mode:
+                with STATE_LOCK:
+                    AUTO_STATE["evacuated"].pop(key, None)  # The best of all tunnels is its preferred one
             wait = AUTO_STATE["evacuated"].get(key, {}).get("wait", PREFERRED_RETURN_AFTER)
-            text = f"{name}: в {cur} {why_bad(r)}, переехал в {target}" + (
-                "" if mode == "auto" else " и останется там, пока там работает" if mode == "sticky"
+            text = (f"{name}: плохо во всех туннелях ({scores}), переехал в лучший, {target}. Новая попытка, когда где-нибудь появится новая нода"
+                    if settle else f"{name}: в {cur} {why_bad(r)}, переехал в {target}") + (
+                "" if mode == "auto" or settle or target == mode else " и останется там, пока там работает" if mode == "sticky"
                 else f", вернётся в {mode}, когда он {span(wait)} подряд будет в норме")
             logger.warning(text)
             log_event("warn", text, mail="failover")
@@ -2444,6 +2499,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
         slow = r["latency"] is not None and r["latency"] > MAX_LATENCY_MS
         SLOW_STREAK[k] = SLOW_STREAK.get(k, 0) + 1 if slow else 0
         r["slow_checks"] = SLOW_STREAK[k]
+        STAY_PINGS[k] = (STAY_PINGS.get(k, []) + [r["latency"] if r["ok"] else None])[-20:]
     # A tunnel rebuilt in this check starts its history anew: its services keep their last status meanwhile
     keys = {g["key"] for g in service_groups(ROUTES["whitelist"])}
     for k in [k for k in SERVICE_RESULTS if k not in keys]:
@@ -2452,7 +2508,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
     try:
         check_probation(client)
         # Also when every tunnel fails: that stops repairs of the tunnels (not the nodes' fault), not moves of the
-        # services that work badly. Hold-down and FAILOVER_LIMIT keep them from bouncing between bad tunnels
+        # services that work badly. Hold-down and the tour of the tunnels keep them from bouncing between bad ones
         decide_services(client, current)
         enforce_preferred(client, dict(GREEN_SINCE))
     except Exception as e:
