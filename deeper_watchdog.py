@@ -86,6 +86,8 @@ SETTINGS_SCHEMA = {
     "DEEPER_PASS": ("secret", "", None, None),  # Only from .env or the web UI, never in the code
     "MAX_LATENCY_MS": ("int", "2500", 100, 60000),
     "CHECK_INTERVAL": ("int", "180", 30, 86400),
+    # Probes of every site per check: the best one is its ping, failed ones are its loss
+    "PROBE_ROUNDS": ("int", "3", 1, 5),
     # Not in the web UI: tunnels to watch (empty: all) and older per-tunnel test sites from .env
     "MONITOR_TUNNELS": ("str", "", None, None),
     # One "CODE=url1,url2" per line; .env CANARIES_XX values are the default
@@ -1118,9 +1120,8 @@ def shared_client():
 
 
 PROBE_WORKERS = 32        # Sites probed at once
-PROBE_ROUNDS = 2          # Probes of every site per check: the best one is its ping, failed ones are its loss
 EWMA_ALPHA = 0.3          # Weight of the newest check in the smoothed quality score
-LOSS_WINDOW = 10          # Latest probes of a site in a tunnel its loss is counted over (5 checks)
+LOSS_CHECKS = 5           # Checks a site's loss is counted over (their regular probes, PROBE_ROUNDS each)
 LOSS_PENALTY_MS = 3000    # Quality score points for 100% loss
 ERROR_PENALTY_MS = 5000   # ...and for an HTTP error the site doesn't always give: such a tunnel doesn't work for it
 ERROR_STATUSES = (403, 429, 502, 503, 504)
@@ -1196,8 +1197,9 @@ def probe_url(url, timeout=3.5):
                 pass
 
 
-def probe_all(urls, rounds=PROBE_ROUNDS):
+def probe_all(urls, rounds=None):
     """Probes every URL `rounds` times, each round all of them at once. Returns {url: [(tcp, ttfb, status)]}."""
+    rounds = rounds or PROBE_ROUNDS
     result = {u: [] for u in urls}
     if urls:
         with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(urls))) as pool:
@@ -1227,7 +1229,8 @@ def penalized(host, status):
 
 def record_quality(code, url, probes, now=None):
     """Folds one check's probes of a site into its quality in the tunnel: EWMA of the score, so a single
-    spike doesn't move anything, and the loss over the last LOSS_WINDOW probes. Returns the record."""
+    spike doesn't move anything, and the loss over the regular probes of the last LOSS_CHECKS checks.
+    Returns the record."""
     now = now or time.time()
     host = host_of(url)
     best = best_probe(probes)
@@ -1241,9 +1244,10 @@ def record_quality(code, url, probes, now=None):
                 h["good"] = now
         prev = QUALITY.get(f"{code} {host}") or {"window": [], "fails": 0}
         # The regular probes only: a repeat probe of a bad site is there to rule out noise, not to add loss
-        window = (prev["window"] + [p[0] is not None for p in probes[:PROBE_ROUNDS]])[-LOSS_WINDOW:]
+        size = LOSS_CHECKS * PROBE_ROUNDS
+        window = (prev["window"] + [p[0] is not None for p in probes[:PROBE_ROUNDS]])[-size:]
         # Over a full window from the start: one bad check of a new site isn't 100% loss
-        loss = (len(window) - sum(window)) / max(len(window), LOSS_WINDOW)
+        loss = (len(window) - sum(window)) / max(len(window), size)
         lat = best[0] + best[1] if best else None
         score = (lat if lat is not None else LATENCY_TIMEOUT * 1000) + LOSS_PENALTY_MS * loss + ERROR_PENALTY_MS * error
         rec = {"url": url, "tunnel": code, "lat": lat, "tcp": best and best[0], "ttfb": best and best[1],
@@ -2954,7 +2958,8 @@ const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const 
 const GROUPS=[
  {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга 2 проверки подряд, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
   ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сервис медленнее этого 2 проверки подряд переезжает в туннель с нодами"],
-  ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"]]},
+  ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"],
+  ["PROBE_ROUNDS","number","Замеров за проверку","Сколько раз меряется каждый домен, 1–5. В пинг идёт лучший замер, неудачные — в потери. Больше — точнее, но проверка дольше"]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
   ["APPS","text","Приложения","Коды через запятую"]]},
  {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку, сначала из него уезжают сервисы — они сразу снова работают. Потом меняется нода (до 2 раз). Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
