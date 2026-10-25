@@ -951,10 +951,8 @@ def shared_client():
 
 
 PROBE_WORKERS = 32        # Sites probed at once
-EWMA_ALPHA = 0.3          # Weight of the newest check in the smoothed quality score
 LOSS_CHECKS = 5           # Checks a site's loss is counted over (their regular probes, PROBE_ROUNDS each)
-LOSS_PENALTY_MS = 3000    # Quality score points for 100% loss
-ERROR_PENALTY_MS = 5000   # ...and for an HTTP error the site doesn't always give: such a tunnel doesn't work for it
+SAME_PING_MS = 50         # Pings closer than this are equal: then the one with less loss wins
 ERROR_STATUSES = (403, 429, 502, 503, 504)
 SERVICE_LOSS_PCT = 20     # A service degrades above this loss...
 BAD_STREAK = {}           # service key -> checks in a row it worked badly in its current tunnel
@@ -963,10 +961,10 @@ HOST_MEMORY_DAYS = 2      # A domain that hasn't answered anywhere this long doe
 BAD_IP_HOURS = 24         # How long a node a service had to leave counts as bad for it
 CACHE_HOURS = 48          # Nothing the watchdog remembers about domains, nodes and moves is kept longer
 TOUR_FORGET = 2 * 86400   # A tour of the tunnels is forgotten after this long
-# "<tunnel> <host>" -> quality of a site in a tunnel: {"url", "tunnel", "q", "lat", "tcp", "ttfb", "status",
-# "error", "loss", "window", "fails", "at"}. q is the smoothed score Q = RTT_tcp + TTFB + loss and error penalties
+# "<tunnel> <host>" -> quality of a site in a tunnel: {"url", "tunnel", "lat", "tcp", "ttfb", "status",
+# "error", "loss", "window", "fails", "at"}
 QUALITY = {}
-TUNNEL_Q = {}             # code -> median score of the tunnel's domains at its last check
+TUNNEL_LOSS = {}          # code -> median loss of the tunnel's domains at its last check
 LAST_CHECK = {}           # code -> {"bad", "counted", "silent"}: domain counts of the tunnel's last check
 SSL_CTX = ssl.create_default_context()
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -1060,9 +1058,8 @@ def penalized(host, status):
 
 
 def record_quality(code, url, probes, now=None):
-    """Folds one check's probes of a site into its quality in the tunnel: EWMA of the score, so a single
-    spike doesn't move anything, and the loss over the regular probes of the last LOSS_CHECKS checks.
-    Returns the record."""
+    """Folds one check's probes of a site into its quality in the tunnel: the ping of this check and the loss over
+    the regular probes of the last LOSS_CHECKS checks. Returns the record."""
     now = now or time.time()
     host = host_of(url)
     best = best_probe(probes)
@@ -1081,10 +1078,8 @@ def record_quality(code, url, probes, now=None):
         # Over a full window from the start: one bad check of a new site isn't 100% loss
         loss = (len(window) - sum(window)) / max(len(window), size)
         lat = best[0] + best[1] if best else None
-        score = (lat if lat is not None else LATENCY_TIMEOUT * 1000) + LOSS_PENALTY_MS * loss + ERROR_PENALTY_MS * error
         rec = {"url": url, "tunnel": code, "lat": lat, "tcp": best and best[0], "ttfb": best and best[1],
                "status": status, "error": error, "loss": loss, "window": window,
-               "q": score if "q" not in prev else EWMA_ALPHA * score + (1 - EWMA_ALPHA) * prev["q"],
                "fails": 0 if best else prev["fails"] + 1, "at": now}
         QUALITY[f"{code} {host}"] = rec
     return rec
@@ -1095,7 +1090,7 @@ def reset_quality(code):
     with STATE_LOCK:
         for k in [k for k in QUALITY if k.startswith(code + " ")]:
             del QUALITY[k]
-        TUNNEL_Q.pop(code, None)
+        TUNNEL_LOSS.pop(code, None)
 
 
 def median(values):
@@ -1146,11 +1141,11 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
     recs = {u: record_quality(tunnel_code, u, probes[u], now) for u in endpoints}
     for u, r in recs.items():
         SITE_RESULTS[f"{tunnel_code} {u}"] = {"url": u, "tunnel": tunnel_code, "latency": r["lat"], "status": r["status"],
-                                              "ok": r["lat"] is not None, "q": r["q"], "loss": r["loss"],
+                                              "ok": r["lat"] is not None, "loss": r["loss"],
                                               "counted": u in counted, "time": time.strftime("%H:%M:%S")}
     answered = [recs[u]["lat"] for u in counted if recs[u]["lat"] is not None]
     med = median(answered)
-    TUNNEL_Q[tunnel_code] = median([recs[u]["q"] for u in counted])
+    TUNNEL_LOSS[tunnel_code] = median([recs[u]["loss"] for u in counted])
     LAST_CHECK[tunnel_code] = {"bad": len(bad), "counted": len(counted), "silent": len(endpoints) - len(counted)}
 
     worst = sorted(bad, key=lambda u: recs[u]["lat"] if recs[u]["lat"] is not None else 10 ** 9, reverse=True)
@@ -1185,22 +1180,41 @@ def stable_for(code):
     return time.time() - since if since else 0
 
 
+def fastest(items, ms_of, loss_of, rest=lambda x: 0):
+    """The item with the lowest ping, but pings within SAME_PING_MS of the lowest one are equal: among those the
+    one with less loss wins, then the lowest `rest`, then the lower ping. Items without a ping go last."""
+    pinged = [x for x in items if ms_of(x) is not None]
+    if not pinged:
+        return min(items, key=rest, default=None)
+    low = min(ms_of(x) for x in pinged)
+    return min((x for x in pinged if ms_of(x) <= low + SAME_PING_MS),
+               key=lambda x: (loss_of(x) or 0, rest(x), ms_of(x)))
+
+
 def failover_target(key, exclude, tunnels):
     """The tunnel a service leaving `exclude` (a code or a set of them) moves to: any tunnel that has nodes.
     Among those: not on a node the service already had to leave (bad_ips), one that has kept its nodes for
-    STABLE_FOR seconds (a node that came a minute ago is often gone a minute later), working, the lowest quality
-    score, more nodes."""
+    STABLE_FOR seconds (a node that came a minute ago is often gone a minute later), working, the lowest ping
+    (less loss among equal pings), more nodes."""
     exclude = {exclude} if isinstance(exclude, str) else set(exclude)
     usable = [t for t in tunnels if t.get("activeNum", 0) > 0 and t.get("tunnelCode") not in exclude]
 
+    def st(t):
+        return STATUS["tunnels"].get(t["tunnelCode"]) or {}
+
     def rank(t):
-        st = STATUS["tunnels"].get(t["tunnelCode"]) or {}
-        known = st.get("latency") and not st.get("unchecked")
-        score = TUNNEL_Q.get(t["tunnelCode"]) if known else None
         return (t.get("activeIp") in bad_ips(key, t["tunnelCode"]), stable_for(t["tunnelCode"]) < STABLE_FOR,
-                not st.get("healthy", True),
-                score if score is not None else 10 ** 6, -stable_for(t["tunnelCode"]), -t.get("activeNum", 0))
-    return min(usable, key=rank)["tunnelCode"] if usable else None
+                not st(t).get("healthy", True))
+
+    def ping(t):
+        return st(t)["latency"] if st(t).get("latency") and not st(t).get("unchecked") else None
+
+    if not usable:
+        return None
+    first = min(map(rank, usable))
+    best = fastest([t for t in usable if rank(t) == first], ping, lambda t: TUNNEL_LOSS.get(t["tunnelCode"]),
+                   lambda t: (-stable_for(t["tunnelCode"]), -t.get("activeNum", 0)))
+    return best["tunnelCode"]
 
 
 def mark_moved(key):
@@ -1492,31 +1506,32 @@ def measure_site(url, samples):
 
 
 def pick_better_tunnel(pings, original):
-    """Returns a tunnel whose quality score beats the original one's by the hysteresis margin
-    (AUTO_MIN_GAIN_PCT and AUTO_MIN_GAIN_MS), or None: a small gain isn't worth breaking sessions."""
+    """Returns a tunnel clearly better than the original one, or None: a small gain isn't worth breaking sessions.
+    Better is a ping lower by AUTO_MIN_GAIN_PCT and AUTO_MIN_GAIN_MS without more loss, or far less loss."""
     base = pings.get(original, {})
-    base_q, base_status = base.get("q"), base.get("status")
+    base_ms, base_loss, base_status = base.get("ms"), base.get("loss", 1), base.get("status")
 
     def usable(p):
         # An HTTP error that the original tunnel didn't have usually means a geo-block
         geo_blocked = isinstance(p["status"], int) and p["status"] >= 400 and isinstance(base_status, int) and base_status < 400
-        return p.get("q") is not None and not geo_blocked
+        return p.get("ms") is not None and not p.get("errors") and not geo_blocked
 
     candidates = [t for t, p in pings.items() if t != original and usable(p)]
     if not candidates:
         return None
-    best = min(candidates, key=lambda t: pings[t]["q"])
-    best_q = pings[best]["q"]
-    if base_q is None:
+    best = fastest(candidates, lambda t: pings[t]["ms"], lambda t: pings[t]["loss"])
+    b = pings[best]
+    if base_ms is None or base.get("errors") or b["loss"] * 100 <= base_loss * 100 - SERVICE_LOSS_PCT:
         return best
-    if best_q <= base_q * (1 - AUTO_MIN_GAIN_PCT / 100) and base_q - best_q >= AUTO_MIN_GAIN_MS:
+    if b["ms"] <= base_ms * (1 - AUTO_MIN_GAIN_PCT / 100) and base_ms - b["ms"] >= AUTO_MIN_GAIN_MS \
+            and b["loss"] <= base_loss + 0.05:
         return best
     return None
 
 
 def measure_urls(urls, samples):
     """Measures several URLs of one service at once. Returns {"ms": average ping of the answering ones or None,
-    "q": quality score (lower is better) or None, "loss", "status", "answered", "total"}."""
+    "loss", "errors": share of the answering domains with an error status, "status", "answered", "total"}."""
     with ThreadPoolExecutor(max_workers=max(1, len(urls))) as pool:
         results = list(pool.map(lambda u: measure_site(u, samples), urls))
     answered = [(u, r) for u, r in zip(urls, results) if r[0] is not None]
@@ -1524,14 +1539,17 @@ def measure_urls(urls, samples):
     ms = sum(r[0] for _, r in answered) / len(answered) if answered else None
     loss = sum(r[2] for r in results) / len(results) if results else 1
     errors = sum(penalized(host_of(u), r[1]) for u, r in answered) / len(answered) if answered else 0
-    q = None if ms is None else ms + LOSS_PENALTY_MS * loss + ERROR_PENALTY_MS * errors
-    return {"ms": ms, "q": q, "loss": loss, "status": status, "answered": len(answered), "total": len(urls)}
+    return {"ms": ms, "loss": loss, "errors": errors, "status": status, "answered": len(answered), "total": len(urls)}
 
 
 def fastest_tunnel(pings):
-    """The tunnel where most of the service answers, and among those the best quality score."""
-    usable = [t for t, p in pings.items() if p.get("q") is not None]
-    return min(usable, key=lambda t: (-pings[t].get("answered", 1), pings[t]["q"])) if usable else None
+    """The tunnel where most of the service answers, then without errors, then the lowest ping."""
+    usable = [t for t, p in pings.items() if p.get("ms") is not None]
+    if not usable:
+        return None
+    first = min((-pings[t].get("answered", 1), pings[t].get("errors", 0) > 0) for t in usable)
+    return fastest([t for t in usable if (-pings[t].get("answered", 1), pings[t].get("errors", 0) > 0) == first],
+                   lambda t: pings[t]["ms"], lambda t: pings[t]["loss"])
 
 
 def finish_item(key, base, split, pings, error, restore, moved):
@@ -1614,8 +1632,8 @@ def compare_routes(client, keys):
         try:
             m = measure_urls(urls, COMPARE_SAMPLES)
         except Exception as e:
-            m = {"ms": None, "q": None, "loss": 1, "status": str(e), "answered": 0, "total": len(urls)}
-        logger.info(f"Сравнение {key} через {tunnel}: {fmt_ms(m['ms'])} в среднем, Q {m['q'] or 0:.0f}, потери {m['loss']:.0%}, "
+            m = {"ms": None, "loss": 1, "errors": 0, "status": str(e), "answered": 0, "total": len(urls)}
+        logger.info(f"Сравнение {key} через {tunnel}: {fmt_ms(m['ms'])} в среднем, потери {m['loss']:.0%}, "
                     f"ответили {m['answered']} из {len(urls)} ({m['status']})")
         pings[key][tunnel] = m
 
@@ -1691,13 +1709,13 @@ def summarize(name, tunnel, url, recs):
     return {"name": name, "tunnel": tunnel, "url": url,
             "latency": sum(r["lat"] for r in answered) / len(answered) if answered else None,
             "status": (answered or recs)[0]["status"], "ok": bool(answered),
-            "q": sum(r["q"] for r in recs) / len(recs), "loss": sum(r["loss"] for r in recs) / len(recs),
+            "loss": sum(r["loss"] for r in recs) / len(recs),
             "fails": min(r["fails"] for r in recs), "errors": sum(r["error"] for r in recs) / len(recs)}
 
 
 def service_results(since):
     """Every service's state from the probes of all its domains in their tunnels since `since`, and the same for
-    the configured apps by their website: {key: {name, tunnel, url, latency, status, ok, q, loss, fails}}."""
+    the configured apps by their website: {key: {name, tunnel, url, latency, status, ok, loss, fails}}."""
     result = {}
     for g in service_groups(ROUTES["whitelist"]):
         recs = [QUALITY.get(f"{d['tunnel']} {d['domain']}") for d in g["domains"]]
@@ -2107,7 +2125,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
         tunnel_status[code] = {
             "country": country, "ip": active_ip, "pool": active_num,
             "healthy": healthy, "latency": lat, "details": details, "fails": fails.get(code, 0),
-            "q": TUNNEL_Q.get(code), **LAST_CHECK.get(code, {}),
+            "loss": TUNNEL_LOSS.get(code), **LAST_CHECK.get(code, {}),
             "sites": [{k: r[k] for k in ("url", "latency", "status", "counted")}
                       for r in (SITE_RESULTS.get(f"{code} {ep}") for ep in canaries) if r],
         }
@@ -2208,7 +2226,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
             r = QUALITY.get(f"{a['tunnel'] or 'ZZ'} {host_of(a['website'])}")
             if r:
                 APP_RESULTS[a["app"]] = {"tunnel": a["tunnel"], "latency": r["lat"], "status": r["status"],
-                                         "ok": r["lat"] is not None, "q": r["q"], "loss": r["loss"]}
+                                         "ok": r["lat"] is not None, "loss": r["loss"]}
     except Exception as e:
         logger.warning(f"Не удалось получить приложения App Relocator: {e}")
 
@@ -3177,7 +3195,7 @@ function siteList(tunnel,x){
   el("span",{class:"h",text:hostOf(s.url)}),el("span",{class:"v",title:s.status!=null?String(s.status):"",
    text:!cnt(s)?"не в счёт":s.latency!=null?Math.round(s.latency)+" мс":"нет ответа"}));
  const head=x&&x.counted?el("li",{class:"muted"},`В норме ${x.counted-x.bad} из ${x.counted} ${plural(x.counted,"домена","доменов","доменов")}`
-  +(x.silent?`, ещё ${x.silent} не отвечают нигде`:"")+(x.q!=null?` · Q ${Math.round(x.q)}`:"")):null;
+  +(x.silent?`, ещё ${x.silent} не отвечают нигде`:"")+(x.loss?` · потери ${Math.round(x.loss*100)}%`:"")):null;
  const list=el("ul",{class:"sitelist"},head,...sorted.slice(0,5).map(row));
  if(sorted.length<=5)return list;
  const det=el("details",{class:"foldlist"},el("summary",{text:`Остальные домены (${sorted.length-5})`}),el("ul",{class:"sitelist"},...sorted.slice(5).map(row)));
