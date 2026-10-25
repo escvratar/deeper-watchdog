@@ -60,7 +60,7 @@
 git clone https://github.com/escvratar/deeper-watchdog.git
 cd deeper-watchdog
 cp .env.example .env
-nano .env            # DEEPER_PASS — пароль Deeper Connect, WEB_PASSWORD — пароль веб-интерфейса
+nano .env            # DEEPER_PASS — пароль Deeper Connect
 docker compose up -d
 ```
 
@@ -75,7 +75,6 @@ docker run -d --name deeper-watchdog --restart unless-stopped \
   -v /opt/deeper-watchdog/data:/data \
   -e DEEPER_HOST=34.34.34.34 \
   -e DEEPER_PASS='пароль Deeper Connect' \
-  -e WEB_PASSWORD='пароль веб-интерфейса' \
   -e TZ=Europe/Moscow \
   ghcr.io/escvratar/deeper-watchdog:latest
 ```
@@ -88,7 +87,7 @@ docker run -d --name deeper-watchdog --restart unless-stopped \
 1. **Образ:** `ghcr.io/escvratar/deeper-watchdog:latest` (в Portainer: Containers → Add container → Image).
 2. **Порт:** 8787 (хост) → 8787 (контейнер).
 3. **Том:** папка на USB-диске или в хранилище → `/data`, чтобы настройки переживали обновление.
-4. **Переменные окружения:** `DEEPER_PASS`, `WEB_PASSWORD`, при необходимости `DEEPER_HOST`, `TZ`.
+4. **Переменные окружения:** `DEEPER_PASS`, при необходимости `DEEPER_HOST`, `TZ`.
 5. **Перезапуск:** `unless-stopped` (или «Always»).
 
 Откройте `http://IP-устройства:8787`. Все остальные настройки меняются в веб-интерфейсе без перезапуска.
@@ -99,7 +98,7 @@ docker run -d --name deeper-watchdog --restart unless-stopped \
 
 | Где | Что |
 |---|---|
-| `.env` | Адрес и пароль Deeper Connect, пароль веб-интерфейса, начальные значения остальных настроек |
+| `.env` | Адрес и пароль Deeper Connect, начальные значения остальных настроек |
 | Веб-интерфейс → Настройки | Допустимый пинг, интервал проверки, замеров за проверку, приложения, перестроение туннелей (вкл/выкл и как часто), почта |
 | `data/settings.json` | Сохранённые из веб-интерфейса значения, имеют приоритет над `.env` |
 
@@ -153,7 +152,11 @@ docker exec -it deeper-watchdog python /app/deeper_watchdog.py --test-email     
 
 - Не публикуйте `.env` и папку `data/`: там пароли, почта и ваши правила. Оба исключены в `.gitignore`.
 - Пароли в экспортируемом файле настроек не сохраняются.
-- Задайте `WEB_PASSWORD`, если порт 8787 доступен не только вам, и не открывайте его в интернет.
+- **Пароль веб-интерфейса** задаётся при первом открытии страницы после развёртывания контейнера и хранится только
+  в виде хеша (`data/web_auth.json`). Каждое устройство вводит его один раз; сменить пароль и выйти на всех
+  устройствах можно в «Настройки → Доступ». Забыли пароль — удалите `data/web_auth.json` и задайте новый.
+  Можно задать его и в `.env` как `WEB_PASSWORD`: тогда он меняется только там.
+- Не открывайте порт 8787 в интернет.
 
 ## Лицензия
 

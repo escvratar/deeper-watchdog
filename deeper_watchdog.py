@@ -16,6 +16,9 @@ import ssl
 import socket
 import base64
 import hmac
+import hashlib
+import secrets
+import http.cookies
 import logging
 import smtplib
 import argparse
@@ -77,7 +80,7 @@ BACKUP_DIR = os.path.join(DATA_DIR, "rules-backups")
 # Web UI settings are env-only, so the UI can't lock itself out
 WEB_ENABLED = os.environ.get("WEB_ENABLED", "true").lower() in ("true", "1", "yes")
 WEB_PORT = int(os.environ.get("WEB_PORT", "8787"))
-WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")
+WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")  # Set in .env: it is the password. Otherwise set on the first visit
 
 # Settings editable from the web UI: key -> (type, default, min, max)
 SETTINGS_SCHEMA = {
@@ -2776,7 +2779,7 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
 <script>
 const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые сайты":["globe","#30b0c7"],"Приложения":["grid","#5856d6"],
  "Перестроение туннелей":["refresh","#ff9500"],
- "Резервные копии и перенос":["archive","#8e8e93"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
+ "Резервные копии и перенос":["archive","#8e8e93"],"Доступ":["lock","#34c759"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
  {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга 2 проверки подряд, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
@@ -2805,7 +2808,9 @@ const GROUPS=[
  {title:"Deeper Connect",fields:[
   ["DEEPER_HOST","text","IP-адрес устройства"],
   ["DEEPER_USER","text","Логин"],
-  ["DEEPER_PASS","password","Пароль"]]}];
+  ["DEEPER_PASS","password","Пароль"]]},
+ {title:"Доступ",foot:"Пароль спрашивается один раз на каждом устройстве. Смена пароля и «Выйти везде» заставят все остальные устройства войти заново.",fields:[
+  ["WEB_AUTH","webauth","Пароль веб-интерфейса"]]}];
 // Fields hidden unless the given setting has one of the values
 const SHOW_IF={
  REBUILD_EVERY_HOURS:["REBUILD_ENABLED",[true]],
@@ -2846,6 +2851,7 @@ const ICONS={
  more:'<circle cx="5.5" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.4" fill="currentColor" stroke="none"/>',
  updown:'<path d="m8 9.5 4-4 4 4M8 14.5l4 4 4-4"/>',
  pin:'<path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/>',
+ lock:'<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/>',
  sparkle:'<path d="M12 3.5 13.9 9 19.5 11l-5.6 2L12 18.5 10.1 13 4.5 11l5.6-2z"/><path d="M19 3.5v3M17.5 5h3"/>',
  hand:'<path d="M7 12.5V7.8a1.4 1.4 0 0 1 2.8 0V11M9.8 10.5V5.4a1.4 1.4 0 0 1 2.8 0v5M12.6 10.5V6.4a1.4 1.4 0 0 1 2.8 0V12M15.4 11V9a1.4 1.4 0 0 1 2.8 0v5a7 7 0 0 1-7 7h-.4A6.6 6.6 0 0 1 5 16.2l-.9-2.1a1.4 1.4 0 0 1 2.5-1.2l.4.6"/>',
  swap:'<path d="M5 8h13l-3.5-3.5M19 16H6l3.5 3.5"/>',
@@ -2968,7 +2974,8 @@ function toast(text,bad){const t=$("toast");t.textContent="";t.append(el("span",
  t.className="toast show"+(bad?" bad":"");clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.className="toast"+(bad?" bad":""),bad?6000:3500)}
 async function api(path,body){
  const r=await fetch(path,body===undefined?{cache:"no-store"}:{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
- const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error((d.errors||[d.error||r.statusText]).join("; "));return d}
+ const d=await r.json().catch(()=>({}));if(r.status===401){location.reload();throw new Error("Нужно войти")}
+ if(!r.ok)throw new Error((d.errors||[d.error||r.statusText]).join("; "));return d}
 const ms=v=>v!=null?Math.round(v)+" мс":"нет ответа";
 const hostOf=u=>{try{return new URL(u).hostname}catch(e){return u}};
 let countryNames={};const tname=c=>countryNames[c]||c;
@@ -3015,6 +3022,14 @@ GROUPS.forEach((g,gi)=>{
     c.onchange=()=>{input.value=[...list.querySelectorAll("[data-cat]")].filter(x=>x.checked).map(x=>x.dataset.cat).join(",")};
     list.append(el("label",{class:"mc-row"},c,el("span",{},el("b",{text:title}),el("small",{text:sub}))))}
    card.append(el("div",{class:"row block","data-field":key},el("div",{class:"row-text"},el("label",{text:label})),list,input));continue}
+  if(type==="webauth"){const inp=el("input",{type:"password",class:"field",placeholder:"Новый пароль",autocomplete:"new-password","aria-label":"Новый пароль"});
+   const set=el("button",{type:"button",class:"btn"},"Сменить"),out=el("button",{type:"button",class:"btn danger"},"Выйти везде");
+   set.onclick=async()=>{try{await api("/api/password",{password:inp.value});inp.value="";toast("Пароль изменён, остальные устройства вышли")}catch(e){toast(e.message,true)}};
+   out.onclick=async()=>{if(!await ask("Выйти на всех устройствах?","Пароль спросят заново везде, и на этом устройстве тоже.",{ok:"Выйти",danger:true}))return;
+    try{await api("/api/logout",{everywhere:true})}catch(e){}location.reload()};
+   fetch("api/auth",{cache:"no-store"}).then(r=>r.json()).then(d=>{if(d.from_env){inp.disabled=set.disabled=true;inp.placeholder="Задан в .env (WEB_PASSWORD)"}}).catch(()=>{});
+   card.append(el("div",{class:"row block"},el("div",{class:"row-text"},el("label",{text:label})),el("div",{class:"addrow"},inp,set)),
+    el("div",{class:"row"},el("div",{class:"row-text"},el("label",{text:"Выйти на всех устройствах"}),el("div",{class:"help",text:"Включая это"})),el("div",{class:"row-ctl"},out)));continue}
   if(type==="clearlog"){const b=el("button",{type:"button",class:"btn danger"},icon("trash"),"Очистить");
    b.onclick=async()=>{if(!await ask("Очистить журнал?","Все записи журнала будут удалены.",{ok:"Очистить",danger:true}))return;
     try{await api("/api/events/clear",{});toast("Журнал очищен");loadEvents()}catch(e){toast(e.message,true)}};
@@ -3231,9 +3246,12 @@ function updatePill(){const st=lastStatus;if(!st)return;
  const acts=Object.entries(st.actions||{}).filter(([,a])=>!a.text.startsWith("Проверка…"));
  if(acts.length)return setPill("warn",acts.map(([c,a])=>c+": "+a.text.replace(/…$/,"")).join(" · "));
  if(st.error)return setPill("bad","Нет связи с Deeper");
- const bad=Object.entries(st.tunnels||{}).filter(([,x])=>!x.healthy).map(([c])=>c);
+ // A failure is a tunnel with nodes that didn't pass its check; a tunnel without nodes is just waiting for them
+ const all=Object.entries(st.tunnels||{}),empty=all.filter(([,x])=>!(x.pool>0));
+ const bad=all.filter(([,x])=>x.pool>0&&!x.healthy&&!x.unchecked).map(([c])=>c);
  if(bad.length)return setPill("bad","Сбой: "+bad.join(", "));
- const n=Object.keys(st.tunnels||{}).length;setPill(n?"ok":"",n?"Все туннели в норме":"Ожидание первой проверки")}
+ if(all.length&&empty.length===all.length)return setPill("warn","Нет нод ни в одном туннеле");
+ setPill(all.length?"ok":"",all.length?"Все туннели в норме"+(empty.length?` · без нод: ${empty.length}`:""):"Ожидание первой проверки")}
 
 function renderApps(){
  const d=routesData,box=$("apps");if(!d)return;$("appsBlock").hidden=!d.apps.length;box.textContent="";
@@ -3476,6 +3494,122 @@ document.addEventListener("visibilitychange",()=>{if(!document.hidden)loadStatus
 """
 
 
+# Web UI access. The password is WEB_PASSWORD from .env, or, without it, one set on the very first visit after the
+# container is deployed (stored as a salted hash). A device that signed in once gets a session cookie and isn't asked
+# again; sessions are stored as hashes too
+AUTH_FILE = os.path.join(DATA_DIR, "web_auth.json")
+AUTH_LOCK = threading.Lock()
+SESSION_COOKIE = "dw_session"
+SESSION_DAYS = 3650
+MIN_PASSWORD = 6
+# Served without signing in: the sign-in page needs them
+PUBLIC_PATHS = {"/logo.svg", "/favicon.svg", "/logo.png", "/favicon.ico", "/logo-wide.png", "/icon-192.png",
+                "/apple-touch-icon.png", "/manifest.webmanifest", "/api/auth"}
+
+
+def load_auth():
+    data = load_json(AUTH_FILE, {})
+    data.setdefault("sessions", {})
+    return data
+
+
+def save_auth(data):
+    tmp = AUTH_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, AUTH_FILE)
+
+
+def hash_password(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
+
+
+def password_is_set():
+    return bool(WEB_PASSWORD) or bool(load_auth().get("hash"))
+
+
+def password_ok(password):
+    if WEB_PASSWORD:
+        return hmac.compare_digest(password, WEB_PASSWORD)
+    a = load_auth()
+    return bool(a.get("hash")) and hmac.compare_digest(hash_password(password, a["salt"]), a["hash"])
+
+
+def set_password(password, keep_session=None):
+    """Stores a new password; every other device has to sign in again. Returns a session token for this one."""
+    with AUTH_LOCK:
+        a = load_auth()
+        a["salt"] = secrets.token_hex(16)
+        a["hash"] = hash_password(password, a["salt"])
+        a["sessions"] = {k: v for k, v in a["sessions"].items() if k == keep_session}
+        save_auth(a)
+    return keep_session
+
+
+def token_key(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def new_session():
+    token = secrets.token_urlsafe(32)
+    with AUTH_LOCK:
+        a = load_auth()
+        a["sessions"][token_key(token)] = int(time.time())
+        save_auth(a)
+    return token
+
+
+def session_cookie(token, max_age=SESSION_DAYS * 86400):
+    return f"{SESSION_COOKIE}={token}; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Lax"
+
+
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Deeper Watchdog</title>
+<link rel="icon" href="logo.svg" type="image/svg+xml"><link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="manifest" href="manifest.webmanifest" crossorigin="use-credentials">
+<style>
+:root{color-scheme:light dark;--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#6e6e73;--fill:rgba(118,118,128,.12);--accent:#007aff;--red:#d70015}
+@media (prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--text:#f5f5f7;--muted:#98989d;--fill:rgba(118,118,128,.24);--accent:#0a84ff;--red:#ff453a}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--text);
+ font:15px/1.4 -apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI",Roboto,sans-serif;padding:24px 16px}
+form{width:100%;max-width:360px;background:var(--card);border-radius:20px;padding:28px 24px;box-shadow:0 10px 40px rgba(0,0,0,.08);display:flex;flex-direction:column;gap:12px}
+img{width:56px;height:56px;align-self:center}h1{font-size:22px;margin:4px 0 0;text-align:center;letter-spacing:-.02em}
+p{margin:0 0 6px;color:var(--muted);text-align:center;font-size:14px}
+input{font:inherit;color:inherit;background:var(--fill);border:0;border-radius:12px;padding:12px 14px;outline:none}
+input:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 35%,transparent)}
+button{font:inherit;font-weight:600;color:#fff;background:var(--accent);border:0;border-radius:12px;padding:12px;cursor:pointer}
+button:disabled{opacity:.6}.err{color:var(--red);font-size:13px;text-align:center;min-height:18px;margin:0}
+</style></head><body>
+<form id="f" autocomplete="on">
+ <img src="logo.svg" alt="">
+ <h1 id="t">Deeper Watchdog</h1><p id="s"></p>
+ <input type="text" name="username" autocomplete="username" value="admin" hidden>
+ <input id="p1" type="password" required>
+ <input id="p2" type="password" placeholder="Повторите пароль" autocomplete="new-password" hidden>
+ <button id="b" type="submit">Войти</button>
+ <p class="err" id="e" role="alert"></p>
+</form>
+<script>
+let setup=false;const $=id=>document.getElementById(id);
+fetch("api/auth",{cache:"no-store"}).then(r=>r.json()).then(d=>{setup=d.setup;
+ if(setup){$("t").textContent="Задайте пароль";$("s").textContent=`Первый запуск: придумайте пароль для веб-интерфейса, не короче ${d.min} символов. На этом устройстве его больше не спросят.`;
+  $("p1").placeholder="Новый пароль";$("p1").autocomplete="new-password";$("p2").hidden=false;$("p2").required=true;$("b").textContent="Сохранить и войти"}
+ else{$("s").textContent="Введите пароль. На этом устройстве его больше не спросят.";$("p1").placeholder="Пароль";$("p1").autocomplete="current-password"}
+ $("p1").focus()});
+$("f").onsubmit=async e=>{e.preventDefault();$("e").textContent="";
+ if(setup&&$("p1").value!==$("p2").value){$("e").textContent="Пароли не совпадают";return}
+ $("b").disabled=true;
+ try{const r=await fetch(setup?"api/setup":"api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:$("p1").value})});
+  const d=await r.json().catch(()=>({}));if(r.ok){location.reload();return}$("e").textContent=d.error||"Не получилось"}
+ catch(err){$("e").textContent="Нет связи с сервером"}
+ $("b").disabled=false;$("p1").select()};
+</script></body></html>
+"""
+
+
 class SettingsHandler(BaseHTTPRequestHandler):
     """Web UI for viewing status and editing settings."""
 
@@ -3496,28 +3630,69 @@ class SettingsHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # The browser went away (closed tab, reload): nothing to answer
 
-    def _check_auth(self):
-        if not WEB_PASSWORD:
+    def _session(self):
+        """The session token of this browser, if it is a valid one."""
+        try:
+            morsel = http.cookies.SimpleCookie(self.headers.get("Cookie", "")).get(SESSION_COOKIE)
+        except http.cookies.CookieError:
+            return None
+        if morsel and morsel.value and token_key(morsel.value) in load_auth()["sessions"]:
+            return morsel.value
+        return None
+
+    def _signed_in(self):
+        if self._session():
             return True
+        # Scripts may still send the password with HTTP Basic
         header = self.headers.get("Authorization", "")
-        if header.startswith("Basic "):
+        if header.startswith("Basic ") and password_is_set():
             try:
-                password = base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[-1]
-                if hmac.compare_digest(password, WEB_PASSWORD):
-                    return True
+                return password_ok(base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[-1])
             except Exception:
-                pass
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="Deeper Watchdog"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+                return False
+        return False
+
+    def _check_auth(self):
+        """Signed in, or a public path. Otherwise the page gets the sign-in (or first-run) form, an API call a 401."""
+        path = urllib.parse.urlparse(self.path).path
+        if path in PUBLIC_PATHS or self._signed_in():
+            return True
+        if self.command == "GET" and path == "/":
+            self._send(200, LOGIN_PAGE.encode("utf-8"), "text/html; charset=utf-8")
+        else:
+            self._send(401, {"error": "Нужно войти", "setup": not password_is_set()})
+        return False
+
+    def _auth_post(self, body):
+        """Sign-in, first-run password and sign-out. Returns True if the request was one of them."""
+        password = body.get("password") if isinstance(body, dict) else None
+        if self.path == "/api/setup":
+            if password_is_set():
+                return self._send(409, {"error": "Пароль уже задан"}) or True
+            if not isinstance(password, str) or len(password) < MIN_PASSWORD:
+                return self._send(400, {"error": f"Пароль не короче {MIN_PASSWORD} символов"}) or True
+            token = new_session()
+            set_password(password, keep_session=token_key(token))
+            logger.info("Задан пароль веб-интерфейса")
+            log_event("info", "Задан пароль веб-интерфейса", mail="changes")
+            return self._send(200, {"ok": True}, headers={"Set-Cookie": session_cookie(token)}) or True
+        if self.path == "/api/login":
+            if not isinstance(password, str) or not password_is_set() or not password_ok(password):
+                time.sleep(1)  # Slows down guessing
+                return self._send(403, {"error": "Неверный пароль"}) or True
+            token = new_session()
+            logger.info(f"Вход в веб-интерфейс с {self.client_address[0]}")
+            return self._send(200, {"ok": True}, headers={"Set-Cookie": session_cookie(token)}) or True
         return False
 
     def do_GET(self):
         if not self._check_auth():
             return
         self.path = urllib.parse.urlparse(self.path).path
-        if self.path == "/":
+        if self.path == "/api/auth":
+            self._send(200, {"setup": not password_is_set(), "signed_in": self._signed_in(), "min": MIN_PASSWORD,
+                             "from_env": bool(WEB_PASSWORD)})
+        elif self.path == "/":
             self._send(200, WEB_PAGE.encode("utf-8"), "text/html; charset=utf-8")
         elif self.path in ("/logo.svg", "/favicon.svg"):
             self._send(200, LOGO_SVG.encode("utf-8"), "image/svg+xml")
@@ -3591,8 +3766,6 @@ class SettingsHandler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        if not self._check_auth():
-            return
         # Requiring JSON forces a CORS preflight, so other sites can't post here
         if "application/json" not in self.headers.get("Content-Type", ""):
             return self._send(415, {"error": "expected application/json"})
@@ -3602,6 +3775,31 @@ class SettingsHandler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, {"error": "bad JSON"})
         self.path = urllib.parse.urlparse(self.path).path
+        if self.path in ("/api/setup", "/api/login"):
+            self._auth_post(body)
+            return
+        if not self._check_auth():
+            return
+        if self.path == "/api/password":
+            password = body.get("password") if isinstance(body, dict) else None
+            if WEB_PASSWORD:
+                return self._send(400, {"error": "Пароль задан в .env (WEB_PASSWORD): меняется там"})
+            if not isinstance(password, str) or len(password) < MIN_PASSWORD:
+                return self._send(400, {"error": f"Пароль не короче {MIN_PASSWORD} символов"})
+            session = self._session()
+            set_password(password, keep_session=session and token_key(session))
+            log_event("info", "Пароль веб-интерфейса изменён, остальные устройства вышли", mail="changes")
+            return self._send(200, {"ok": True})
+        if self.path == "/api/logout":
+            session = self._session()
+            with AUTH_LOCK:
+                a = load_auth()
+                if body.get("everywhere"):
+                    a["sessions"] = {}
+                elif session:
+                    a["sessions"].pop(token_key(session), None)
+                save_auth(a)
+            return self._send(200, {"ok": True}, headers={"Set-Cookie": session_cookie("", 0)})
 
         if self.path == "/api/settings":
             if not isinstance(body, dict):
@@ -4053,7 +4251,7 @@ def start_web_server():
         logger.error(f"Не удалось запустить веб-интерфейс на порту {WEB_PORT}: {e}")
         return
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    note = "" if WEB_PASSWORD else " (без пароля, задайте WEB_PASSWORD в .env)"
+    note = "" if password_is_set() else " (пароль ещё не задан: его попросит задать первая открытая страница)"
     logger.info(f"Веб-интерфейс настроек: http://<IP-сервера>:{WEB_PORT}/{note}")
 
 
