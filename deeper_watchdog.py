@@ -144,7 +144,7 @@ FIXED_SETTINGS = {
     "COMPARE_SAMPLES": 3,
     "ROUTE_SETTLE": 3,
     "AUTO_ROLLBACK": True,
-    "BEACONS_PER_TUNNEL": 3,
+    "BEACONS_PER_TUNNEL": 0,      # Beacons are off: the watchdog's own beacon rules are removed from Smart Route
     "EVENTS_DAYS": 3,
     "SHOW_EVENTS": True,
 }
@@ -370,7 +370,8 @@ def default_canaries(tunnel_code, routed_domains=None):
 
 
 def test_sites():
-    return [u.strip() for u in TEST_SITES.split(",") if u.strip()]
+    """Test sites are gone: tunnels are checked by the domains of their services only."""
+    return []
 
 
 def migrate_test_sites():
@@ -1237,7 +1238,8 @@ def record_quality(code, url, probes, now=None):
             if status not in ERROR_STATUSES:
                 h["good"] = now
         prev = QUALITY.get(f"{code} {host}") or {"window": [], "fails": 0}
-        window = (prev["window"] + [p[0] is not None for p in probes])[-LOSS_WINDOW:]
+        # The regular probes only: a repeat probe of a bad site is there to rule out noise, not to add loss
+        window = (prev["window"] + [p[0] is not None for p in probes[:PROBE_ROUNDS]])[-LOSS_WINDOW:]
         # Over a full window from the start: one bad check of a new site isn't 100% loss
         loss = (len(window) - sum(window)) / max(len(window), LOSS_WINDOW)
         lat = best[0] + best[1] if best else None
@@ -1338,9 +1340,19 @@ def tunnel_services(client, code):
     return items
 
 
+STABLE_FOR = 300  # Seconds a tunnel must keep its nodes and pass its checks before services move into it
+
+
+def stable_for(code):
+    """Seconds the tunnel has had nodes and passed its checks without a break (0: not now)."""
+    since = GREEN_SINCE.get(code)
+    return time.time() - since if since else 0
+
+
 def failover_target(key, exclude, tunnels):
-    """The best tunnel with nodes for a service leaving `exclude` (a code or a set of them): working, the lowest
-    quality score of its domains, more nodes."""
+    """The tunnel a service leaving `exclude` (a code or a set of them) moves to: any tunnel that has nodes.
+    Among those, one that has kept its nodes for STABLE_FOR seconds first (a node that came a minute ago is often
+    gone a minute later), then working, the lowest quality score, more nodes."""
     exclude = {exclude} if isinstance(exclude, str) else set(exclude)
     blocked = blocked_tunnel(key)
     usable = [t for t in tunnels if t.get("activeNum", 0) > 0 and t.get("tunnelCode") not in exclude | {blocked}]
@@ -1349,7 +1361,8 @@ def failover_target(key, exclude, tunnels):
         st = STATUS["tunnels"].get(t["tunnelCode"]) or {}
         known = st.get("latency") and not st.get("unchecked")
         score = TUNNEL_Q.get(t["tunnelCode"]) if known else None
-        return (not st.get("healthy", True), score if score is not None else 10 ** 6, -t.get("activeNum", 0))
+        return (stable_for(t["tunnelCode"]) < STABLE_FOR, not st.get("healthy", True),
+                score if score is not None else 10 ** 6, -stable_for(t["tunnelCode"]), -t.get("activeNum", 0))
     return min(usable, key=rank)["tunnelCode"] if usable else None
 
 
@@ -1429,10 +1442,11 @@ def _evacuate(client, code, only, reason, why, mail):
         else:
             failed.append(name)
     # Services that can't go anywhere are reported once per outage, not on every retry
-    if (failed or kept) and not moved and set(failed + kept) <= EVAC_NOTIFIED.get(code, set()):
+    stuck = failed + kept
+    if stuck and not moved and set(stuck) <= EVAC_NOTIFIED.get(code, set()):
         return moved
-    EVAC_NOTIFIED[code] = EVAC_NOTIFIED.get(code, set()) | set(failed + kept)
-    if moved or failed or kept:
+    EVAC_NOTIFIED[code] = EVAC_NOTIFIED.get(code, set()) | set(stuck)
+    if moved or stuck:
         save_auto_state()
         parts = ([f"Переехали: {', '.join(moved)}"] if moved else []) \
             + ([f"Не удалось перенести: {', '.join(failed)}"] if failed else []) \
@@ -1851,18 +1865,22 @@ MANUAL_ALERTED = set()  # Manual-mode services already reported as not working
 
 
 def why_bad(r):
+    slow = r["latency"] is not None and r["latency"] > MAX_LATENCY_MS
     return ("не отвечает" if not r["ok"] else f"потери {r['loss']:.0%}" if r["loss"] * 100 > SERVICE_LOSS_PCT
-            else f"ошибка {r['status']}" if r.get("errors", 0) * 2 > 1 else f"медленно, {fmt_ms(r['latency'])}")
+            else f"медленно, {fmt_ms(r['latency'])}" if slow
+            else f"ошибки ответа (HTTP {r['status']})" if r.get("errors", 0)
+            else f"плохое качество, {fmt_ms(r['latency'])} с потерями")
 
 
 def decide_services(client, current):
-    """Per-service decisions after a check. Sticky and preferred services leave a tunnel where they work badly
-    for the best working one (sticky ones stay there, preferred ones come back in enforce_preferred); manual ones
-    are only reported. Auto ones are compared and moved by gain_compare. `current`: service_results()."""
+    """Per-service decisions after a check. A service moves only when it works badly in its tunnel, and only to a
+    tunnel that has nodes: auto and sticky ones stay where they landed, preferred ones come back in
+    enforce_preferred; manual ones are only reported. Never a move just because another tunnel looks faster.
+    `current`: service_results()."""
     now, todo = time.time(), []
     for key, r in current.items():
         mode = service_mode(key)
-        if mode == "auto" or r["silent"] or r["tunnel"] in (None, "split", "ZZ", "LL"):
+        if r["silent"] or r["tunnel"] in (None, "split", "ZZ", "LL"):
             continue
         bad = degraded(r)
         name = key.split(":", 1)[1]
@@ -1893,7 +1911,8 @@ def decide_services(client, current):
             cur, move_to = movers.get(key, (None, None))
             if move_to is None or cur != r["tunnel"]:
                 continue  # Moved meanwhile
-            target = failover_target(key, {cur} | ({mode} if mode != "sticky" else set()), tunnels)
+            stays = mode in ("auto", "sticky")
+            target = failover_target(key, {cur} | (set() if stays else {mode}), tunnels)
             if target is None:
                 continue
             if not move_to(target):
@@ -1903,11 +1922,11 @@ def decide_services(client, current):
             with STATE_LOCK:
                 AUTO_STATE["failovers"][key] = [t for t in AUTO_STATE["failovers"].get(key, []) if now - t < 3600] + [now]
                 AUTO_STATE["probation"].pop(key, None)
-                if mode != "sticky":
+                if not stays:
                     note_evacuated(key, mode, target)
             wait = AUTO_STATE["evacuated"].get(key, {}).get("wait", PREFERRED_RETURN_AFTER)
             text = f"{name}: в {cur} {why_bad(r)}, переехал в {target}" + (
-                " и останется там, пока там работает" if mode == "sticky"
+                "" if mode == "auto" else " и останется там, пока там работает" if mode == "sticky"
                 else f", вернётся в {mode}, когда он {span(wait)} подряд будет в норме")
             logger.warning(text)
             log_event("warn", text, mail="failover")
@@ -1985,98 +2004,6 @@ def check_probation(client):
                 probation.pop(key, None)
             logger.info(f"Автоперенос {name} в {p['to']} подтверждён")
     save_auto_state()
-
-
-def scheduled_compare():
-    """Once a day, at AUTO_COMPARE_HOUR, compares the auto-mode services. A comparison missed because the
-    server was off (or busy) at that hour runs at the first check after it is back."""
-    if AUTO_COMPARE_HOUR < 0 or COMPARE["running"]:
-        return
-    now = time.localtime()
-    # The last moment a comparison was due: today at the hour, or yesterday if that hour hasn't come yet
-    due = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, AUTO_COMPARE_HOUR, 0, 0, 0, 0, -1))
-    if now.tm_hour < AUTO_COMPARE_HOUR:
-        due -= 86400
-    if scheduled_last() >= due:
-        return
-    keys = sorted(auto_keys(service_groups(ROUTES["whitelist"])))
-    if keys and not start_compare(keys):
-        return
-    late = time.time() - due > 3 * 3600
-    AUTO_STATE["last_scheduled"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_auto_state()
-    if keys:
-        text = f"{'Пропущенное ночью' if late else 'Плановое'} сравнение сервисов с «Авто»: {len(keys)}"
-        logger.info(text)
-        log_event("info", text)
-
-
-def scheduled_last():
-    """When the last daily comparison ran (older files keep only its date: counted as that day at the hour)."""
-    last = AUTO_STATE.get("last_scheduled") or ""
-    for fmt, hour in (("%Y-%m-%d %H:%M:%S", None), ("%Y-%m-%d", AUTO_COMPARE_HOUR)):
-        try:
-            ts = time.mktime(time.strptime(last, fmt))
-            return ts + (hour or 0) * 3600
-        except ValueError:
-            pass
-    return 0
-
-
-GAIN_TRIED = {}  # auto-mode service -> when a comparison was last started because another tunnel looked faster
-BAD_TRIED = {}  # auto-mode service -> times of comparisons started within the hour because it worked badly
-
-
-def gain_compare():
-    """After a check: an auto-mode service that works badly in its tunnel (degraded()), or whose quality score is
-    worse than another working tunnel's by the hysteresis margin, is compared right away instead of waiting for
-    the daily comparison (its tunnel can be healthy: the tunnel only fails when most of its domains are bad).
-    The comparison measures the service itself in every tunnel and moves it only if that is really better.
-    A service is left alone for HOLD_DOWN seconds after a move, unless it stops answering at all."""
-    if COMPARE["running"] or STATUS.get("all_slow"):
-        return
-    with_nodes = {c for c, s in STATUS["tunnels"].items() if s.get("pool")}
-    scores = {c: TUNNEL_Q[c] for c, s in STATUS["tunnels"].items()
-              if s.get("healthy") and not s.get("unchecked") and s.get("pool") and TUNNEL_Q.get(c) is not None}
-    current = service_results(0)
-    now, todo, why = time.time(), [], []
-    for k in sorted(auto_keys(service_groups(ROUTES["whitelist"]))):
-        r = current.get(k)
-        if not r or r["silent"] or r["tunnel"] in (None, "split") or k in AUTO_STATE["probation"] or held(k, dead=not r["ok"]):
-            continue
-        others = {c: q for c, q in scores.items() if c != r["tunnel"]}
-        best = min(others, key=others.get) if others else None
-        bad_tries = [t for t in BAD_TRIED.get(k, []) if now - t < 3600]
-        if degraded(r) and with_nodes - {r["tunnel"]}:
-            if len(bad_tries) >= FAILOVER_LIMIT:
-                continue  # Compared that often within the hour and still bad: likely the site itself
-            BAD_TRIED[k] = bad_tries
-            wait, reason = HOLD_DOWN, why_bad(r)
-        elif best and AUTO_GAIN_RECHECK and r["q"] - others[best] >= AUTO_MIN_GAIN_MS \
-                and (r["q"] - others[best]) * 100 >= AUTO_MIN_GAIN_PCT * r["q"]:
-            wait, reason = AUTO_GAIN_RECHECK * 60, f"Q {r['q']:.0f}, в {best} Q {others[best]:.0f}"
-        else:
-            continue
-        if now - GAIN_TRIED.get(k, 0) >= wait:
-            todo.append(k)
-            why.append(f"{k.split(':', 1)[1]} ({r['tunnel']}: {reason})")
-    if todo and start_compare(todo):
-        for k in todo:
-            GAIN_TRIED[k] = now
-            if k in BAD_TRIED:
-                BAD_TRIED[k].append(now)
-        logger.info(f"Авторежим: сравниваю {', '.join(why)}")
-        log_event("info", f"Авто: сервис работает плохо или в другом туннеле лучше, сравниваю: {', '.join(why)}")
-
-
-def unite_auto_groups():
-    """Starts a comparison for auto-mode services whose domains ended up in different countries:
-    it measures them and puts every domain where the quality is best."""
-    groups = service_groups(ROUTES["whitelist"])
-    auto = auto_keys(groups)
-    split = sorted(g["key"] for g in groups if g["split"] and g["key"] in auto)
-    if split and start_compare(split):
-        logger.info(f"Авторежим: домены в разных странах, собираю: {', '.join(k[6:] for k in split)}")
 
 
 def start_compare(domains):
@@ -2945,7 +2872,7 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
   <div class="ghead">Сайты и приложения</div>
   <div class="card" style="padding:14px 16px">
    <div class="small muted">Сравнение меряет все сервисы там, где они сейчас, затем по очереди переносит их все в каждый туннель и меряет разом, а в конце возвращает обратно. Во время сравнения сайты могут подтормаживать.
-   Пинг сервиса считается как средний по его доменам. Справа у каждого сервиса выбирается режим. «Авто» (по умолчанию): сервис держится в одной стране и сам переезжает туда, где качество лучше хотя бы на 30%, не чаще раза в 5 минут. «Вручную»: никогда не переносится сам, даже из туннеля без нод, при сбое приходит письмо. «Sticky»: при сбое уходит в лучший работающий туннель и остаётся там, пока тот сам не сломается. Туннель (📌): предпочтительный; при сбое сервис временно уходит и возвращается, когда туннель 5 минут подряд в норме.</div>
+   Пинг сервиса считается как средний по его доменам. Справа у каждого сервиса выбирается режим. «Авто» (по умолчанию): если в его туннеле плохая связь или нет нод, сервис переезжает в лучший туннель, где есть ноды, и остаётся там; просто потому, что где-то быстрее, не переезжает. «Вручную»: никогда не переносится сам, даже из туннеля без нод, при сбое приходит письмо. «Sticky»: при сбое уходит в лучший работающий туннель и остаётся там, пока тот сам не сломается. Туннель (📌): предпочтительный; при сбое сервис временно уходит и возвращается, когда туннель 5 минут подряд в норме.</div>
    <div class="toolbar">
     <label class="selall"><input type="checkbox" class="check" id="selAll">Выбрать все</label>
     <input class="field" id="rtFilter" type="search" placeholder="Поиск" aria-label="Поиск сайта">
@@ -2990,11 +2917,9 @@ const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые са
  "Резервные копии и перенос":["archive","#8e8e93"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
- {title:"Проверка",foot:"Каждый туннель проверяется по всем своим доменам, сайтам приложений и маячкам (Википедия, python.org и т. п.), так что проверяется даже туннель без сервисов. Сервис работает плохо, если не отвечает, теряет запросы, отдаёт ошибки или медленнее допустимого пинга: тогда он переезжает туда, где лучше, не чаще раза в 5 минут.",fields:[
+ {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (не отвечает, теряет запросы, отдаёт ошибки, медленнее допустимого пинга) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
   ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сайт медленнее этого считается плохим"],
   ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"]]},
- {title:"Тестовые сайты",foot:"Необязательно: туннели и так проверяются по своим доменам. Сайт из списка проверяет тот туннель, через который сейчас идёт его домен.",fields:[
-  ["TEST_SITES","canaries"]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
   ["APPS","text","Приложения","Коды через запятую"]]},
  {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку, сначала из него уезжают сервисы — они сразу снова работают. Потом меняется нода (до 2 раз). Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
@@ -3299,7 +3224,7 @@ function renderCanaries(focus){
  box.append(el("div",{class:"add",style:"margin-top:10px"},inp,btn));
  if(focus)box.querySelector("input").focus()}
 
-$("save").onclick=async()=>{$("TEST_SITES").value=testSites.join(",");const body={};for(const i of inputs)body[i.dataset.key]=val(i.dataset.key);
+$("save").onclick=async()=>{if($("TEST_SITES"))$("TEST_SITES").value=testSites.join(",");const body={};for(const i of inputs)body[i.dataset.key]=val(i.dataset.key);
  try{await api("/api/settings",body);toast("Сохранено");loadSettings();loadStatus()}catch(e){toast(e.message,true)}};
 $("testEmail").onclick=async()=>{toast("Отправка с сохранёнными настройками…");
  try{const d=await api("/api/test-email",{});toast(d.ok?"Тестовое письмо отправлено":"Ошибка: "+d.error,!d.ok)}catch(e){toast(e.message,true)}loadStatus()};
@@ -3565,7 +3490,7 @@ function renderItems(box,items,results,auto,d){box.textContent="";
   sel.onchange=()=>{sel.checked?selected.add(key):selected.delete(key);renderRoutes()};
   const pin=(d.preferred||{})[key]||"",mode=(d.modes||{})[key]||"auto",ev=(d.evacuated||{})[key],hold=(d.hold_down||{})[key];
   const sw=el("select",{class:"mini","aria-label":"Режим для "+name,title:"«Авто», «Вручную», «Sticky» или предпочтительный туннель"});
-  sw.append(el("option",{value:"auto","data-ic":"sparkle","data-sub":"Сам переезжает туда, где качество лучше",text:"Авто"}),
+  sw.append(el("option",{value:"auto","data-ic":"sparkle","data-sub":"При плохой связи или без нод переезжает туда, где есть ноды",text:"Авто"}),
    el("option",{value:"manual","data-ic":"hand","data-sub":"Никогда не переносится сам, только письмо при сбое",text:"Вручную"}),
    el("option",{value:"sticky","data-ic":"lock","data-sub":"При сбое уходит в лучший туннель и остаётся там",text:"Sticky"}));
   const pg=el("optgroup",{label:"Предпочтительный туннель"});
@@ -3936,9 +3861,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
             label = lambda m: MODE_NAMES.get(m) or f"📌 {m}"
             if was != mode:
                 log_event("info", f"{name}: режим {label(mode)} вместо {label(was)}")
-            if mode == "auto":
-                unite_auto_groups()
-            elif mode not in MODE_NAMES:
+            if mode not in MODE_NAMES:
                 nodes = {t["code"]: t["nodes"] for t in ROUTES["all_tunnels"]}
                 if not nodes.get(mode):
                     note = f"В {mode} сейчас нет нод: {name} переедет туда, когда они появятся"
@@ -4377,9 +4300,6 @@ def main():
                 try:
                     with ROUTE_LOCK:
                         run_watchdog_iteration(client, max_latency_ms=args.max_latency)
-                    unite_auto_groups()
-                    scheduled_compare()
-                    gain_compare()
                 except Exception as e:
                     logger.error(f"Ошибка итерации: {e}")
                 last_run = time.time()
