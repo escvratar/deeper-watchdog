@@ -91,6 +91,12 @@ SETTINGS_SCHEMA = {
     "CHECK_INTERVAL": ("int", "180", 30, 86400),
     # Probes of every site per check: the best one is its ping, failed ones are its loss
     "PROBE_ROUNDS": ("int", "3", 1, 5),
+    # Bad checks in a row before a service counts as failed and moves (slow, losing, not answering, errors)
+    "FAIL_CHECKS": ("int", "2", 1, 10),
+    # Failed checks of a tunnel in a row before its services leave it...
+    "EVACUATE_AFTER": ("int", "2", 1, 10),
+    # ...and before its node is switched (never before its services left; a rebuild is the last resort)
+    "FAIL_THRESHOLD": ("int", "3", 1, 20),
     # Not in the web UI: tunnels to watch (empty: all)
     "MONITOR_TUNNELS": ("str", "", None, None),
     # Off: the watchdog never rebuilds a tunnel by itself. On: only as the last resort (see recover_tunnel),
@@ -122,8 +128,6 @@ FIXED_SETTINGS = {
     "LATENCY_TIMEOUT": 3.5,       # Seconds to wait for the TCP handshake and the first byte
     "TUNNEL_FAIL_PCT": 50,        # A tunnel fails when at least this share of its domains is bad, %
     "SKIP_ALL_SLOW": True,        # Every tunnel failing at once is the network's fault: nothing is repaired
-    "EVACUATE_AFTER": 2,          # Failed checks in a row before services leave a failing tunnel
-    "FAIL_THRESHOLD": 3,          # ...and before its node is switched (and, as the last resort, it is rebuilt)
     "SWITCH_ATTEMPTS": 2,         # Node switches per outage before a rebuild is considered
     "VERIFY_CHECKS": 3,           # Checks after a node switch; most of them must pass
     "VERIFY_PAUSE": 5,            # Seconds after a switch and between those checks
@@ -953,9 +957,7 @@ LOSS_PENALTY_MS = 3000    # Quality score points for 100% loss
 ERROR_PENALTY_MS = 5000   # ...and for an HTTP error the site doesn't always give: such a tunnel doesn't work for it
 ERROR_STATUSES = (403, 429, 502, 503, 504)
 SERVICE_LOSS_PCT = 20     # A service degrades above this loss...
-SERVICE_TIMEOUTS = 3      # ...or after this many checks in a row without any answer
-SLOW_CHECKS = 2           # ...or slower than MAX_LATENCY_MS this many checks in a row
-SLOW_STREAK = {}          # service key -> checks in a row it was slower than MAX_LATENCY_MS in its current tunnel
+BAD_STREAK = {}           # service key -> checks in a row it worked badly in its current tunnel
 STAY_PINGS = {}           # service key -> its pings (None: no answer) in its current tunnel since it got there
 HOST_MEMORY_DAYS = 2      # A domain that hasn't answered anywhere this long doesn't count (e.g. a bare CDN domain)
 BAD_IP_HOURS = 24         # How long a node a service had to leave counts as bad for it
@@ -1205,7 +1207,7 @@ def mark_moved(key):
     """Starts the hold-down: the service stays where it is for HOLD_DOWN seconds."""
     with STATE_LOCK:
         AUTO_STATE["moved_at"][key] = time.time()
-    SLOW_STREAK.pop(key, None)
+    BAD_STREAK.pop(key, None)
     STAY_PINGS.pop(key, None)
 
 
@@ -1658,12 +1660,16 @@ def compare_routes(client, keys):
     client.refresh_apps_cache()
 
 
+def bad_now(r):
+    """The service worked badly in this check: no answer, slower than MAX_LATENCY_MS, loss above SERVICE_LOSS_PCT
+    over its recent probes, or most of its domains answering with an error status (whatever the latency)."""
+    return not r["ok"] or (r["latency"] is not None and r["latency"] > MAX_LATENCY_MS) \
+        or r["loss"] * 100 > SERVICE_LOSS_PCT or r.get("errors", 0) * 2 > 1
+
+
 def degraded(r):
-    """A service (its state from service_results) works badly in its tunnel: slower than MAX_LATENCY_MS
-    SLOW_CHECKS checks in a row, loss above SERVICE_LOSS_PCT, SERVICE_TIMEOUTS checks in a row without an answer,
-    or most of its domains answering with an error status (whatever the latency: the tunnel doesn't work for it)."""
-    return r.get("slow_checks", 0) >= SLOW_CHECKS or r["loss"] * 100 > SERVICE_LOSS_PCT \
-        or r["fails"] >= SERVICE_TIMEOUTS or r.get("errors", 0) * 2 > 1
+    """A service failed in its tunnel: it worked badly FAIL_CHECKS checks in a row (one bad check is noise)."""
+    return r.get("bad_checks", 0) >= FAIL_CHECKS
 
 
 def stay_score(key):
@@ -2139,7 +2145,8 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
             if moved:
                 tunnel_status[code]["details"] += f" → сервисы перенесены: {', '.join(moved)}"
                 publish_tunnel(code, tunnel_status[code])
-        if fails.get(code, 0) < FAIL_THRESHOLD:
+        # The node is switched only once its services had a chance to leave
+        if fails.get(code, 0) < max(FAIL_THRESHOLD, EVACUATE_AFTER):
             continue
         # 2. A node switch, 3. a rebuild as the last resort
         logger.warning(f"Туннель [{code} - {country}] не проходит проверку (сбоев подряд: {fails[code]}), восстановление...")
@@ -2207,11 +2214,10 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
 
     # Every service from the probes of all its domains, then what to do about the ones that work badly
     current = service_results(started)
-    # Slow checks in a row, in the tunnel the service is in now (a move starts the count anew)
+    # Bad checks in a row, in the tunnel the service is in now (a move starts the count anew)
     for k, r in current.items():
-        slow = r["latency"] is not None and r["latency"] > MAX_LATENCY_MS
-        SLOW_STREAK[k] = SLOW_STREAK.get(k, 0) + 1 if slow else 0
-        r["slow_checks"] = SLOW_STREAK[k]
+        BAD_STREAK[k] = BAD_STREAK.get(k, 0) + 1 if bad_now(r) else 0
+        r["bad_checks"] = BAD_STREAK[k]
         STAY_PINGS[k] = (STAY_PINGS.get(k, []) + [r["latency"] if r["ok"] else None])[-20:]
     # A tunnel rebuilt in this check starts its history anew: its services keep their last status meanwhile
     keys = {g["key"] for g in service_groups(ROUTES["whitelist"])}
@@ -2785,7 +2791,10 @@ const GROUPS=[
  {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга 2 проверки подряд, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
   ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сервис медленнее этого 2 проверки подряд переезжает в туннель с нодами"],
   ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"],
-  ["PROBE_ROUNDS","number","Замеров за проверку","Сколько раз меряется каждый домен, 1–5. В пинг идёт лучший замер, неудачные — в потери. Больше — точнее, но проверка дольше"]]},
+  ["PROBE_ROUNDS","number","Замеров за проверку","Сколько раз меряется каждый домен, 1–5. В пинг идёт лучший замер, неудачные — в потери. Больше — точнее, но проверка дольше"],
+  ["FAIL_CHECKS","number","Сбой сервиса — после, проверок подряд","Сервис переезжает, если плохо (медленно, потери, нет ответа, ошибки) столько проверок подряд. Одна плохая проверка — ещё не сбой"],
+  ["EVACUATE_AFTER","number","Сбой туннеля — после, проверок подряд","Туннель не прошёл столько проверок подряд — его сервисы уезжают туда, где есть ноды"],
+  ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Столько сбоев туннеля подряд — меняется нода. Не раньше, чем уехали сервисы"]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
   ["APPS","text","Приложения","Коды через запятую"]]},
  {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку, сначала из него уезжают сервисы — они сразу снова работают. Потом меняется нода (до 2 раз). Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
@@ -3272,20 +3281,18 @@ function renderApps(){
    seg))}
  requestAnimationFrame(thumbAll)}
 async function refreshTunnel(tunnel,btn){
- if(!await ask(`Перестроить ${flag(tunnel)} ${tunnel}?`,`Пул нод соберётся заново, на это время связь через ${tname(tunnel)} прервётся.`,{ok:"Перестроить",danger:true}))return;
- btn.disabled=true;
+ btn.disabled=true;toast(`Перестраиваю ${tunnel}…`);
  try{const r=await api("/api/refresh-tunnel",{tunnel});toast(`Туннель ${tunnel} перестроен: ${r.old_ip} → ${r.new_ip}, нод в пуле ${r.pool}`)}catch(e){toast(e.message,true)}
  btn.disabled=false;loadRoutes();setTimeout(loadStatus,4000)}
 async function switchNode(tunnel,btn){
- if(!await ask(`Сменить ноду ${flag(tunnel)} ${tunnel}?`,`Это затронет все сайты и приложения, которые идут через ${tname(tunnel)}.`,{ok:"Сменить"}))return;
- btn.disabled=true;
+ btn.disabled=true;toast(`Меняю ноду ${tunnel}…`);
  try{const r=await api("/api/switch-node",{tunnel});toast(`Нода ${tunnel}: ${r.old_ip} → ${r.new_ip}`)}catch(e){toast(e.message,true)}
  btn.disabled=false;loadRoutes();loadStatus()}
 
 $("checkNow").onclick=async()=>{const btn=$("checkNow"),before=lastStatus&&lastStatus.last_run;btn.disabled=true;setBtn(btn,"spin","Проверяем…");
  try{await api("/api/check-now",{});
   for(let i=0;i<60;i++){await new Promise(r=>setTimeout(r,2000));await loadStatus();if(lastStatus&&lastStatus.last_run!==before)break}
-  if(lastStatus&&lastStatus.last_run!==before){await loadRoutes();openSheet()}else toast("Проверка ещё идёт, результат появится позже")}
+  if(lastStatus&&lastStatus.last_run!==before){await loadRoutes();toast("Проверка завершена")}else toast("Проверка ещё идёт, результат появится позже")}
  catch(e){toast(e.message,true)}
  btn.disabled=false;setBtn(btn,"refresh","Проверить сейчас")};
 
@@ -3760,7 +3767,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "preferred": preferred_tunnels(),
             })
         elif self.path == "/api/status":
-            self._send(200, dict(STATUS, fail_threshold=FAIL_THRESHOLD, actions=ACTIONS, now=int(time.time()),
+            self._send(200, dict(STATUS, fail_threshold=max(FAIL_THRESHOLD, EVACUATE_AFTER), actions=ACTIONS, now=int(time.time()),
                                  show_events=SHOW_EVENTS))
         else:
             self._send(404, {"error": "not found"})
@@ -3881,6 +3888,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 save_settings({"PREFERRED_TUNNELS": preferred_setting(prefs)})
             log_event("info", f"{domain.split(':', 1)[-1]}: перенесён в {to} вручную"
                       + (", теперь это его предпочтительный туннель" if domain in prefs else ""), mail="changes")
+            CHECK_NOW.set()  # The tunnels it left and went to are checked right away: the overview shows them as they are
             self._send(200, {"ok": True})
         elif self.path == "/api/pin":
             # mode: "auto", "manual" or a tunnel code (preferred tunnel); "" from older pages is manual
@@ -3923,6 +3931,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                         ROUTE_LOCK.release()
                 else:
                     note = f"Идёт проверка или сравнение: {name} переедет в {mode} в течение минуты"
+            CHECK_NOW.set()
             self._send(200, {"ok": True, "note": note})
         elif self.path in ("/api/add-domains", "/api/delete-domains"):
             body = body if isinstance(body, dict) else {}
@@ -3983,6 +3992,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 log_event("info", f"Домены {what}: {', '.join(done[:8])}" + (f" и ещё {len(done) - 8}" if len(done) > 8 else ""))
             if error or failed:
                 return self._send(502, {"error": error or f"Deeper не принял: {', '.join(failed)}", "done": done})
+            if done:
+                CHECK_NOW.set()
             self._send(200, {"ok": True, "done": done})
         elif self.path == "/api/switch-node":
             tunnel = body.get("tunnel") if isinstance(body, dict) else None
