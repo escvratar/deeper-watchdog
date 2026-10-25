@@ -94,9 +94,8 @@ SETTINGS_SCHEMA = {
     # Bad checks in a row before a service counts as failed and moves (slow, losing, not answering, errors)
     "FAIL_CHECKS": ("int", "2", 1, 10),
     # Failed checks of a tunnel in a row before its services leave it...
-    "EVACUATE_AFTER": ("int", "2", 1, 10),
     # ...and before its node is switched (never before its services left; a rebuild is the last resort)
-    "FAIL_THRESHOLD": ("int", "3", 1, 20),
+    "FAIL_THRESHOLD": ("int", "2", 1, 20),
     # Not in the web UI: tunnels to watch (empty: all)
     "MONITOR_TUNNELS": ("str", "", None, None),
     # Off: the watchdog never rebuilds a tunnel by itself. On: only as the last resort (see recover_tunnel),
@@ -133,7 +132,7 @@ FIXED_SETTINGS = {
     "VERIFY_PAUSE": 5,            # Seconds after a switch and between those checks
     "REBUILD_WAIT": 30,           # Seconds to wait for a new IP after a rebuild
     "FAILOVER_EMPTY": True,       # Services leave a tunnel without nodes...
-    "FAILOVER_WAIT": 60,          # ...after this many seconds
+    "FAILOVER_WAIT": 0,           # ...after this many seconds: right away, they don't work there at all
     "EMPTY_REBUILD_AFTER": 3600,  # A tunnel without nodes is rebuilt only after an hour: Deeper finds nodes itself
     "AUTO_MIN_GAIN_PCT": 30,      # A comparison recommends a tunnel better by this much...
     "AUTO_MIN_GAIN_MS": 200,      # ...and by at least this many ms
@@ -1747,6 +1746,14 @@ def why_bad(r):
             else f"нет ответа {r['fails']} проверки подряд" if r["fails"] else f"плохое качество, {fmt_ms(r['latency'])}")
 
 
+def switch_pending(code):
+    """The tunnel fails its checks as a whole, has more than one node and node switches left: its services wait
+    for the switch and a new check instead of leaving. Not when every tunnel is slow: nothing is repaired then."""
+    st = STATUS["tunnels"].get(code) or {}
+    return not st.get("healthy", True) and not st.get("unchecked") and st.get("pool", 0) > 1 \
+        and SWITCHES.get(code, 0) < SWITCH_ATTEMPTS and not STATUS.get("all_slow")
+
+
 def decide_services(client, current):
     """Per-service decisions after a check. A service moves only when it works badly in its tunnel, and only to a
     tunnel that has nodes: auto ones stay where they landed, preferred ones come back in
@@ -1788,6 +1795,8 @@ def decide_services(client, current):
                 continue
         if not bad:
             continue
+        if switch_pending(r["tunnel"]):
+            continue  # Its tunnel fails as a whole and has another node: the node switch comes first
         if tour and tour.get("settled") and (r["ok"] or r["silent"]):
             # Bad everywhere, left in the best tunnel until a new node shows up, unless it stops answering. One that
             # answers nowhere just stays: a new tour would only move it around
@@ -2166,16 +2175,11 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
             NO_REBUILD_NOTED.discard(code)
             SWITCHES.pop(code, None)
             continue
-        # 1. Services leave the failing tunnel: they work again right away, whatever happens to the tunnel
-        if fails.get(code, 0) >= EVACUATE_AFTER and movable_services(client, code):
-            moved = evacuate(client, code, why="не проходит проверку", mail="failover")
-            if moved:
-                tunnel_status[code]["details"] += f" → сервисы перенесены: {', '.join(moved)}"
-                publish_tunnel(code, tunnel_status[code])
-        # The node is switched only once its services had a chance to leave
-        if fails.get(code, 0) < max(FAIL_THRESHOLD, EVACUATE_AFTER):
+        # The tunnel's services don't leave all together: each one that works badly leaves by itself
+        # (decide_services), the ones that are fine stay. While the tunnel can still switch its node they wait
+        if fails.get(code, 0) < FAIL_THRESHOLD:
             continue
-        # 2. A node switch, 3. a rebuild as the last resort
+        # 1. A node switch and a new check, 2. a rebuild as the last resort
         logger.warning(f"Туннель [{code} - {country}] не проходит проверку (сбоев подряд: {fails[code]}), восстановление...")
         set_action(code, "Восстановление…")
         try:
@@ -2821,11 +2825,10 @@ const GROUPS=[
   ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"],
   ["PROBE_ROUNDS","number","Замеров за проверку","Сколько раз меряется каждый домен, 1–5. В пинг идёт лучший замер, неудачные — в потери. Больше — точнее, но проверка дольше"],
   ["FAIL_CHECKS","number","Сбой сервиса — после, плохих проверок","Сервис переезжает, если ему плохо (медленно, потери, нет ответа, ошибки) в стольких из последних проверок (на одну больше этого числа): при 2 — в 2 из 3. Одна плохая проверка — ещё не сбой, а сервис на грани порога («плохо, хорошо, плохо») переезжает"],
-  ["EVACUATE_AFTER","number","Сбой туннеля — после, проверок подряд","Туннель не прошёл столько проверок подряд — его сервисы уезжают туда, где есть ноды"],
-  ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Столько сбоев туннеля подряд — меняется нода. Не раньше, чем уехали сервисы"]]},
+  ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Туннель не прошёл столько проверок подряд, и в нём больше одной ноды — меняется нода и туннель проверяется заново. Его сервисы ждут смены ноды и уезжают, только если не помогло"]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
   ["APPS","text","Приложения","Коды через запятую"]]},
- {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку, сначала из него уезжают сервисы — они сразу снова работают. Потом меняется нода (до 2 раз). Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
+ {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку и в нём больше одной ноды, сначала меняется нода (до 2 раз) и туннель проверяется заново, его сервисы ждут. Не помогло — уезжают только те сервисы, которым плохо. Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
   ["REBUILD_ENABLED","switch","Перестраивать в крайнем случае","Выключено: watchdog сам никогда не перестраивает туннели, только переносит сервисы и меняет ноды. Кнопка «Перестроить» в меню туннеля работает всегда"],
   ["REBUILD_EVERY_HOURS","number","Не чаще раза в, ч","Для каждого туннеля, считая и ручные перестроения"]]},
  {title:"Резервные копии и перенос",fold:true,foot:"Копия правил Deeper сохраняется сама перед каждым изменением, которое трогает много правил сразу: сравнением, переносом, добавлением и удалением доменов, загрузкой файла. Если что-то пойдёт не так, из копии всё возвращается как было. Хранятся последние 10, одинаковые подряд не повторяются. Файл содержит правила, приложения и настройки без паролей; при загрузке файла домены только добавляются и переносятся, лишние не удаляются.",fields:[
@@ -3799,7 +3802,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "preferred": preferred_tunnels(),
             })
         elif self.path == "/api/status":
-            self._send(200, dict(STATUS, fail_threshold=max(FAIL_THRESHOLD, EVACUATE_AFTER), actions=ACTIONS, now=int(time.time()),
+            self._send(200, dict(STATUS, fail_threshold=FAIL_THRESHOLD, actions=ACTIONS, now=int(time.time()),
                                  show_events=SHOW_EVENTS))
         else:
             self._send(404, {"error": "not found"})
@@ -4220,7 +4223,8 @@ def watch_nodes_once(client, tunnels):
             try:
                 EVAC_TRIED[code] = now
                 if tunnel_services(client, code):
-                    evacuate(client, code, only=None if FAILOVER_EMPTY else pinned, reason=f" дольше {int(empty_for)} с")
+                    evacuate(client, code, only=None if FAILOVER_EMPTY else pinned,
+                             reason=f" дольше {int(empty_for)} с" if empty_for >= 20 else "")
             except Exception as e:
                 logger.error(f"Ошибка переноса из пустого туннеля {code}: {e}")
             finally:
