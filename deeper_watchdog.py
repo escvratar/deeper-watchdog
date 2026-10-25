@@ -2282,7 +2282,8 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
             "sites": [dict({k: r[k] for k in ("url", "latency", "status", "counted")}, beacon=host_of(r["url"]) in beacon_domains())
                       for r in (SITE_RESULTS.get(f"{code} {ep}") for ep in canaries) if r],
         }
-        publish_tunnel(code, tunnel_status[code])
+        # The new failure count is shown once every tunnel is measured: if all of them fail, it doesn't count
+        publish_tunnel(code, dict(tunnel_status[code], fails=fails_before.get(code, 0)))
         checked.append((code, country, active_ip, active_num, canaries, details))
 
     # Every measured tunnel failing at once points at the local network or Deeper itself, not at the nodes:
@@ -2291,14 +2292,16 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
     all_slow = SKIP_ALL_SLOW and len(measured) >= 2 and not any(tunnel_status[c]["healthy"] for c in measured)
     if all_slow:
         if not STATUS.get("all_slow"):
-            log_event("warn", "Медленные все туннели сразу: похоже на проблему сети или Deeper, восстановление не запускается", mail="all_slow")
+            log_event("warn", "Медленные все туннели сразу: похоже на проблему сети или Deeper, ноды не меняются и туннели не перестраиваются", mail="all_slow")
         logger.warning("Все туннели не прошли проверку одновременно: восстановление пропущено")
         for c in measured:
             fails[c] = fails_before.get(c, 0)  # Not the nodes' fault: doesn't count towards a recovery
             LAST_FAIL_AT.pop(c, None)
             tunnel_status[c]["fails"] = fails[c]
             tunnel_status[c]["details"] += " → все туннели медленные одновременно, восстановление не запускалось"
-            publish_tunnel(c, tunnel_status[c])
+            tunnel_status[c]["all_slow"] = True
+    for c in measured:
+        publish_tunnel(c, tunnel_status[c])
     STATUS["all_slow"] = all_slow
 
     for code, country, active_ip, active_num, canaries, details in ([] if all_slow else checked):
@@ -2393,8 +2396,9 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
     SERVICE_RESULTS.update({k: r for k, r in current.items() if k.startswith("group:")})
     try:
         check_probation(client)
-        if not all_slow:
-            decide_services(client, current)
+        # Also when every tunnel fails: that stops repairs of the tunnels (not the nodes' fault), not moves of the
+        # services that work badly. Hold-down and FAILOVER_LIMIT keep them from bouncing between bad tunnels
+        decide_services(client, current)
         enforce_preferred(client, dict(GREEN_SINCE))
     except Exception as e:
         logger.error(f"Ошибка решений по сервисам: {e}")
@@ -3380,7 +3384,8 @@ function renderTunnels(){
   const doing=(st.actions||{})[c],long=doing&&!/^Проверка/.test(doing.text);
   const sub=el("div",{class:"tsub"},el("span",{class:"tstate "+cls},el("span",{class:"dot "+cls}),label),
    long?el("span",{class:"tdoing",title:doing.text,text:doing.text}):el("span",{text:`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`}),
-   !long&&x.fails&&!x.unchecked?el("span",{class:"warn",text:`сбоев ${x.fails} из ${st.fail_threshold}`}):null);
+   !long&&x.all_slow?el("span",{class:"warn",title:"Проверку не прошли все туннели сразу: похоже на сеть или Deeper, а не на ноды. Сбой не засчитывается, ноды не меняются; сервисы, которые плохо работают, всё равно переезжают туда, где есть ноды",text:"медленные все туннели"})
+   :!long&&x.fails&&!x.unchecked?el("span",{class:"warn",text:`сбоев ${x.fails} из ${st.fail_threshold}`}):null);
   const ping=el("div",{class:"tping "+(x.latency?pingKind(x.latency):"none")},x.latency?String(Math.round(x.latency)):"—",x.latency?el("small",{text:"мс"}):null);
   const busy=doing?el("span",{class:"spin tbusy",role:"status",title:doing.text,"aria-label":doing.text}):null;
   const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(open),"aria-label":`${x.country}: ${label}, подробнее`},
