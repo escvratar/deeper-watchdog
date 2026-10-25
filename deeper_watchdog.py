@@ -579,7 +579,7 @@ migrate_test_sites()
 
 HISTORY_HOURS = 24        # Ping history kept per tunnel
 MAX_EVENTS = 2000         # Event log length limit, on top of EVENTS_DAYS
-MAX_BACKUPS = 30          # Rule backups kept
+MAX_BACKUPS = 10          # Rule backups kept
 PROBATION_CHECKS = 3      # Good checks in a row after an auto move before it is trusted
 ROLLBACK_FAILS = 2        # Bad checks in a row that undo an auto move
 BLOCK_HOURS = 24          # How long auto mode avoids a tunnel it had to roll back from
@@ -2009,7 +2009,10 @@ def decide_services(client, current):
                 tour["tried"][cur] = stay_score(key)
                 tour.setdefault("ips", {})[cur] = next((t.get("activeIp") for t in tunnels if t.get("tunnelCode") == cur), None)
                 tour["at"] = now
-            target = failover_target(key, set(tour["tried"]), tunnels)
+            skip = set(tour["tried"])
+            if not stays and tunnel_ip(mode) in bad_ips(key, mode):
+                skip.add(mode)  # Its preferred tunnel is still on the node it had to leave: enforce_preferred decides
+            target = failover_target(key, skip, tunnels)
             settle = target is None
             if settle:
                 with_nodes = {t.get("tunnelCode") for t in tunnels if t.get("activeNum", 0) > 0}
@@ -2068,10 +2071,11 @@ def start_probation(key, previous, new, urls):
 
 
 def end_probation(key):
-    """A manual move: the user decides, auto mode stops watching and avoiding tunnels for this service."""
+    """A manual move or a mode change: the user decides. Auto mode stops watching and avoiding tunnels for this
+    service, and a tour of the tunnels starts afresh."""
     with STATE_LOCK:
         changed = [AUTO_STATE["probation"].pop(key, None), AUTO_STATE["blocked"].pop(key, None),
-                   AUTO_STATE["evacuated"].pop(key, None)] != [None, None, None]
+                   AUTO_STATE["evacuated"].pop(key, None), AUTO_STATE["tours"].pop(key, None)] != [None] * 4
     if changed:
         save_auto_state()
 
@@ -2804,6 +2808,9 @@ details.tgroup>.sitelist{margin:0 16px 0 72px;padding:6px 0 12px}
 .ghead{display:flex;align-items:center;gap:10px;font-size:20px;font-weight:700;letter-spacing:-.02em;color:var(--text);margin:30px 4px 10px;scroll-margin-top:84px}
 .ghead .tile{width:30px;height:30px;border-radius:8px}
 .ghead:first-child{margin-top:6px}
+.ghead.fold{cursor:pointer;-webkit-tap-highlight-color:transparent}
+.ghead.fold .chev{width:8px;height:8px;border:solid var(--muted);border-width:0 2px 2px 0;transform:rotate(45deg) translate(-2px,-2px);transition:transform .25s var(--spring);margin-left:4px}
+.ghead.fold.open .chev{transform:rotate(-135deg) translate(-2px,-2px)}
 .gfoot{font-size:13px;color:var(--muted);margin:8px 18px 0;line-height:1.45}
 .group{overflow:hidden}
 .row{display:flex;align-items:center;gap:12px 18px;padding:12px 18px;min-height:52px;position:relative}
@@ -3076,7 +3083,7 @@ const GROUPS=[
  {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку, сначала из него уезжают сервисы — они сразу снова работают. Потом меняется нода (до 2 раз). Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
   ["REBUILD_ENABLED","switch","Перестраивать в крайнем случае","Выключено: watchdog сам никогда не перестраивает туннели, только переносит сервисы и меняет ноды. Кнопка «Перестроить» в меню туннеля работает всегда"],
   ["REBUILD_EVERY_HOURS","number","Не чаще раза в, ч","Для каждого туннеля, считая и ручные перестроения"]]},
- {title:"Резервные копии и перенос",foot:"Копия правил Deeper сохраняется сама перед каждым изменением: переносом, добавлением и удалением доменов, сравнением. Хранятся последние 30. Файл содержит правила, приложения и настройки без паролей; при загрузке файла домены только добавляются и переносятся, лишние не удаляются.",fields:[
+ {title:"Резервные копии и перенос",fold:true,foot:"Копия правил Deeper сохраняется сама перед каждым изменением, которое трогает много правил сразу: сравнением, переносом, добавлением и удалением доменов, загрузкой файла. Если что-то пойдёт не так, из копии всё возвращается как было. Хранятся последние 10, одинаковые подряд не повторяются. Файл содержит правила, приложения и настройки без паролей; при загрузке файла домены только добавляются и переносятся, лишние не удаляются.",fields:[
   ["BACKUPS","backups"]]},
  {title:"Журнал",foot:"Записи старше 3 дней удаляются сами.",fields:[
   ["CLEAR_EVENTS","clearlog","Очистить журнал","Удалить все записи сейчас"]]},
@@ -3288,9 +3295,11 @@ function segmented(key,opts){const s=el("div",{class:"seg",role:"radiogroup","ar
 function syncSeg(key){const v=$(key).value;for(const b of document.querySelectorAll(`[data-seg="${key}"] button`))b.setAttribute("aria-pressed",b.dataset.value===v);
  requestAnimationFrame(()=>thumb(document.querySelector(`[data-seg="${key}"]`)))}
 GROUPS.forEach((g,gi)=>{
- const head=el("div",{class:"ghead",id:"g"+gi},tile(g.title),el("span",{text:g.title}));$("form").append(head);
+ const head=el("div",{class:"ghead"+(g.fold?" fold":""),id:"g"+gi},tile(g.title),el("span",{text:g.title}));$("form").append(head);
  const nb=el("button",{type:"button","data-g":"g"+gi},tile(g.title),el("span",{text:g.title}));
- nb.onclick=()=>{navPick=head.id;navPickAt=Date.now();navMark(head.id);head.scrollIntoView({behavior:"smooth",block:"start"})};$("sidenav").append(nb);
+ nb.onclick=()=>{if(g.fold)setFold(true);navPick=head.id;navPickAt=Date.now();navMark(head.id);head.scrollIntoView({behavior:"smooth",block:"start"})};$("sidenav").append(nb);
+ // A folded group: the heading opens and closes it, closed by default
+ let setFold=()=>{};
  const card=el("div",{class:"card group"});
  for(const [key,type,label,help,opts] of g.fields){
   if(type==="services"){const input=el("input",{type:"hidden",id:key});input.dataset.key=key;
@@ -3325,7 +3334,10 @@ GROUPS.forEach((g,gi)=>{
  if(g.title==="Почта")card.append(el("div",{class:"row"},el("div",{class:"row-text"},el("label",{text:"Проверка почты"}),
   el("div",{class:"help",text:"Письмо уходит с сохранёнными настройками: сначала нажмите «Сохранить»"})),
   el("div",{class:"row-ctl"},el("button",{class:"btn gray",id:"testEmail",type:"button"},icon("mail"),"Тестовое письмо"))));
- $("form").append(card);if(g.foot)$("form").append(el("div",{class:"gfoot",text:g.foot}))});
+ $("form").append(card);const foot=g.foot?el("div",{class:"gfoot",text:g.foot}):null;if(foot)$("form").append(foot);
+ if(g.fold){head.append(el("span",{class:"chev","aria-hidden":"true"}));head.setAttribute("role","button");head.tabIndex=0;
+  setFold=open=>{card.hidden=!open;if(foot)foot.hidden=!open;head.classList.toggle("open",open);head.setAttribute("aria-expanded",String(open))};
+  head.onclick=()=>setFold(card.hidden);head.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();setFold(card.hidden)}};setFold(false)}});
 // The sidebar follows the group in view
 navUpdate();if(!navBound){navBound=true;addEventListener("scroll",navUpdate,{passive:true})}
 const inputs=[...document.querySelectorAll("[data-key]")];
@@ -3487,9 +3499,10 @@ function plainDetails(x){const d=x.details||"";if(!d)return "";
 const openCards=new Set();let emptyOpen=false;
 function renderTunnels(){
  const st=lastStatus;if(!st)return;
- // Most nodes first; tunnels without nodes are folded into one row at the end
+ // Working tunnels first, then the other ones with nodes, each by node count; without nodes folded at the end
  const all=Object.keys(st.tunnels||{}).map((c,i)=>[c,i]);
- const codes=all.filter(([c])=>st.tunnels[c].pool>0).sort((a,b)=>st.tunnels[b[0]].pool-st.tunnels[a[0]].pool||a[1]-b[1]).map(a=>a[0]);
+ const working=c=>{const x=st.tunnels[c];return x.healthy&&!x.unchecked?0:1};
+ const codes=all.filter(([c])=>st.tunnels[c].pool>0).sort((a,b)=>working(a[0])-working(b[0])||st.tunnels[b[0]].pool-st.tunnels[a[0]].pool||a[1]-b[1]).map(a=>a[0]);
  const empty=all.filter(([c])=>!(st.tunnels[c].pool>0)).map(a=>a[0]);
  const box=$("tunnels");box.textContent="";
  const card=c=>{const x=st.tunnels[c],noNodes=x.pool===0,open=openCards.has(c);
@@ -4346,6 +4359,9 @@ def note_all_empty(tunnels, now):
             if REBUILD_ENABLED else ""), mail="all_empty")
 
 
+WATCH_ERROR = {"last": None}
+
+
 def watch_nodes():
     global WATCHER_ON
     WATCHER_ON = True
@@ -4355,7 +4371,13 @@ def watch_nodes():
             client = shared_client()
             watch_nodes_once(client, client.list_tunnels())
         except Exception as e:
-            logger.debug(f"Проверка нод: {e}")
+            # Every 10 s: said once per kind of error, not on every tick
+            msg = str(e)
+            if msg != WATCH_ERROR["last"]:
+                WATCH_ERROR["last"] = msg
+                logger.warning(f"Ошибка наблюдателя нод: {msg}")
+        else:
+            WATCH_ERROR["last"] = None
 
 
 def start_web_server():
