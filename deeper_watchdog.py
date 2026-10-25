@@ -2582,7 +2582,9 @@ a.btn{text-decoration:none}
 .tbody .spark{margin-top:8px}.tbody .spark svg{height:40px}
 .tbody .sitelist{margin-top:8px;padding-top:0;border-top:0}
 .tbody .details{margin-top:8px}
-.tcard.compact .tact{margin-top:8px}
+.tcard.compact .tbusy{width:14px;height:14px;border-width:2px;color:var(--accent);margin-right:-2px}
+.tsub{flex-wrap:nowrap;overflow:hidden;white-space:nowrap}
+.tsub>span{flex:none}.tsub .tdoing{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--accent-text);font-weight:550}
 .tcard{padding:18px 20px 18px;position:relative;transition:transform .35s var(--spring),box-shadow .35s var(--spring);display:flex;flex-direction:column}
 @media (hover:hover){.tcard:hover{box-shadow:var(--shadow-lift);transform:translateY(-2px)}}
 .thead{display:flex;align-items:center;gap:12px}
@@ -3371,12 +3373,16 @@ function renderTunnels(){
  for(const c of codes){const x=st.tunnels[c],noNodes=x.pool===0,open=openCards.has(c);
   const action=(x.details||"").split(" → ")[1];
   const [cls,label]=x.unchecked?["","Не проверяется"]:x.healthy?["ok","Работает"]:noNodes?["warn","Нет нод"]:["bad","Сбой"];
+  // What the watchdog is doing right now: a spinner by the ping, and for anything longer than a check its text in
+  // the second line, so the card keeps its height and nothing jumps
+  const doing=(st.actions||{})[c],long=doing&&!/^Проверка/.test(doing.text);
   const sub=el("div",{class:"tsub"},el("span",{class:"tstate "+cls},el("span",{class:"dot "+cls}),label),
-   el("span",{text:`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`}),
-   x.fails&&!x.unchecked?el("span",{class:"warn",text:`сбоев ${x.fails} из ${st.fail_threshold}`}):null);
+   long?el("span",{class:"tdoing",title:doing.text,text:doing.text}):el("span",{text:`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`}),
+   !long&&x.fails&&!x.unchecked?el("span",{class:"warn",text:`сбоев ${x.fails} из ${st.fail_threshold}`}):null);
   const ping=el("div",{class:"tping "+(x.latency?pingKind(x.latency):"none")},x.latency?String(Math.round(x.latency)):"—",x.latency?el("small",{text:"мс"}):null);
+  const busy=doing?el("span",{class:"spin tbusy",role:"status",title:doing.text,"aria-label":doing.text}):null;
   const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(open),"aria-label":`${x.country}: ${label}, подробнее`},
-   codeBadge(c),el("div",{},el("div",{class:"tname",text:x.country}),sub),ping,el("span",{class:"chev","aria-hidden":"true"}),tunnelButtons(c,x));
+   codeBadge(c),el("div",{},el("div",{class:"tname",text:x.country}),sub),busy,ping,el("span",{class:"chev","aria-hidden":"true"}),tunnelButtons(c,x));
   const toggle=e=>{if(e.target.closest("button"))return;open?openCards.delete(c):openCards.add(c);renderTunnels()};
   head.onclick=toggle;head.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle(e)}};
   const body=open?el("div",{class:"tbody"},tmeta(x,x.unchecked?null:st.fail_threshold),spark(c),
@@ -3384,15 +3390,11 @@ function renderTunnels(){
    :noNodes?el("div",{class:"details",text:"Нет активных нод: сервисы переносятся в туннели, где ноды есть."})
    :siteList(c,x)||el("div",{class:"details",text:plainDetails(x)}),
    action?el("div",{class:"details",text:"→ "+action}):null):null;
-  box.append(el("div",{class:"card tcard compact"+(open?" open":"")},head,actionRow(c),body))}
+  box.append(el("div",{class:"card tcard compact"+(open?" open":"")},head,body))}
  if(!codes.length&&!st.error)box.append(el("div",{class:"card empty"},el("span",{class:"spin"}),"Ждём первую проверку…"))}
 function codeBadge(c){const f=flag(c);return f?el("span",{class:"code",title:tname(c)},el("span",{class:"fw"},el("span",{class:"flag",text:f})),el("span",{class:"cc",text:c})):el("span",{class:"code",text:c})}
 function tmeta(x,threshold){return el("div",{class:"meta"},el("span",{},icon("server"),x.ip||"—"),el("span",{},icon("nodes"),`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`),
  threshold!=null?el("span",{class:x.fails?"warn":""},icon("tri"),`сбоев ${x.fails} из ${threshold}`):null)}
-// What the watchdog is doing with the tunnel right now (rebuild, node switch, waiting for nodes)
-function actionRow(c){const a=lastStatus&&(lastStatus.actions||{})[c];if(!a)return null;
- const sec=Math.max(0,lastStatus.now-a.since);
- return el("div",{class:"tact",role:"status"},el("span",{class:"spin","aria-hidden":"true"}),el("span",{text:a.text}),el("span",{class:"sec",text:sec+" с"}))}
 // Actions of a tunnel live in its "⋯" menu, like on Apple platforms
 function tunnelButtons(c,x){const busy=!!(lastStatus&&(lastStatus.actions||{})[c]);
  const b=el("button",{type:"button",class:"btn icon tmore","aria-label":"Действия с туннелем "+c,"aria-haspopup":"menu",title:busy?"Туннель сейчас занят":"Действия"},icon("more"));
