@@ -955,7 +955,7 @@ LOSS_CHECKS = 5           # Checks a site's loss is counted over (their regular 
 SAME_PING_MS = 50         # Pings closer than this are equal: then the one with less loss wins
 ERROR_STATUSES = (403, 429, 502, 503, 504)
 SERVICE_LOSS_PCT = 20     # A service degrades above this loss...
-BAD_STREAK = {}           # service key -> checks in a row it worked badly in its current tunnel
+BAD_STREAK = {}           # service key -> its recent checks in its current tunnel, True for a bad one
 STAY_PINGS = {}           # service key -> its pings (None: no answer) in its current tunnel since it got there
 HOST_MEMORY_DAYS = 2      # A domain that hasn't answered anywhere this long doesn't count (e.g. a bare CDN domain)
 BAD_IP_HOURS = 24         # How long a node a service had to leave counts as bad for it
@@ -1686,7 +1686,9 @@ def bad_now(r):
 
 
 def degraded(r):
-    """A service failed in its tunnel: it worked badly FAIL_CHECKS checks in a row (one bad check is noise)."""
+    """A service failed in its tunnel: it worked badly in FAIL_CHECKS of its last FAIL_CHECKS + 1 checks there.
+    One bad check is noise, but a service just around the limit (bad, good, bad) fails too: it never gets
+    FAIL_CHECKS bad ones in a row, yet it is slow half the time."""
     return r.get("bad_checks", 0) >= FAIL_CHECKS
 
 
@@ -1752,7 +1754,9 @@ def decide_services(client, current):
     now, todo = time.time(), []
     for key, r in current.items():
         mode = service_mode(key)
-        if r["silent"] or r["tunnel"] in (None, "split", "ZZ", "LL"):
+        # A service that hasn't answered anywhere lately doesn't count for its tunnel's health, but it is still
+        # worth trying elsewhere: it may only have been in tunnels it doesn't work through
+        if r["tunnel"] in (None, "split", "ZZ", "LL"):
             continue
         bad = degraded(r)
         name = key.split(":", 1)[1]
@@ -1781,8 +1785,10 @@ def decide_services(client, current):
                 continue
         if not bad:
             continue
-        if tour and tour.get("settled") and r["ok"]:
-            continue  # Bad everywhere, left in the best tunnel until a new node shows up, unless it stops answering
+        if tour and tour.get("settled") and (r["ok"] or r["silent"]):
+            # Bad everywhere, left in the best tunnel until a new node shows up, unless it stops answering. One that
+            # answers nowhere just stays: a new tour would only move it around
+            continue
         if not held(key, dead=not r["ok"]):
             todo.append((key, r, mode))
     if not todo:
@@ -1800,7 +1806,7 @@ def decide_services(client, current):
             # all are tried and none was good, it goes back to the best one and stays there
             with STATE_LOCK:
                 tour = AUTO_STATE["tours"].get(key)
-                if not tour or (tour.get("settled") and not r["ok"]):
+                if not tour or (tour.get("settled") and not r["ok"] and not r["silent"]):
                     tour = AUTO_STATE["tours"][key] = {"tried": {}, "ips": {}, "at": now}
                 tour["tried"][cur] = stay_score(key)
                 tour.setdefault("ips", {})[cur] = next((t.get("activeIp") for t in tunnels if t.get("tunnelCode") == cur), None)
@@ -2234,8 +2240,8 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
     current = service_results(started)
     # Bad checks in a row, in the tunnel the service is in now (a move starts the count anew)
     for k, r in current.items():
-        BAD_STREAK[k] = BAD_STREAK.get(k, 0) + 1 if bad_now(r) else 0
-        r["bad_checks"] = BAD_STREAK[k]
+        BAD_STREAK[k] = (BAD_STREAK.get(k, []) + [bad_now(r)])[-(FAIL_CHECKS + 1):]
+        r["bad_checks"] = sum(BAD_STREAK[k])
         STAY_PINGS[k] = (STAY_PINGS.get(k, []) + [r["latency"] if r["ok"] else None])[-20:]
     # A tunnel rebuilt in this check starts its history anew: its services keep their last status meanwhile
     keys = {g["key"] for g in service_groups(ROUTES["whitelist"])}
@@ -2806,11 +2812,11 @@ const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые са
  "Резервные копии и перенос":["archive","#8e8e93"],"Доступ":["lock","#34c759"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
- {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга 2 проверки подряд, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
-  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сервис медленнее этого 2 проверки подряд переезжает в туннель с нодами"],
+ {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга в 2 из 3 последних проверок, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
+  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сервис медленнее этого в 2 из 3 последних проверок переезжает в туннель с нодами"],
   ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"],
   ["PROBE_ROUNDS","number","Замеров за проверку","Сколько раз меряется каждый домен, 1–5. В пинг идёт лучший замер, неудачные — в потери. Больше — точнее, но проверка дольше"],
-  ["FAIL_CHECKS","number","Сбой сервиса — после, проверок подряд","Сервис переезжает, если плохо (медленно, потери, нет ответа, ошибки) столько проверок подряд. Одна плохая проверка — ещё не сбой"],
+  ["FAIL_CHECKS","number","Сбой сервиса — после, плохих проверок","Сервис переезжает, если ему плохо (медленно, потери, нет ответа, ошибки) в стольких из последних проверок (на одну больше этого числа): при 2 — в 2 из 3. Одна плохая проверка — ещё не сбой, а сервис на грани порога («плохо, хорошо, плохо») переезжает"],
   ["EVACUATE_AFTER","number","Сбой туннеля — после, проверок подряд","Туннель не прошёл столько проверок подряд — его сервисы уезжают туда, где есть ноды"],
   ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Столько сбоев туннеля подряд — меняется нода. Не раньше, чем уехали сервисы"]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
@@ -3208,8 +3214,12 @@ function plainDetails(x){const d=x.details||"";if(!d)return "";
  if(/^High latency/.test(d))return `Все сайты медленнее допустимого, лучший — ${Math.round(x.latency)} мс`;
  if(/^OK/.test(d))return "Домены туннеля отвечают";
  return d.replace(/ \(HTTP \d+\)/g,"")}
-// Tunnel cards are one line each; a tap opens the chart, IP and domains. Opened ones stay open across updates
-const openCards=new Set();let emptyOpen=false;
+// Tunnel cards are one line each; a tap opens the chart, IP and domains. Opened ones stay open across updates,
+// but not for long: CARD_OPEN_MS after it was opened a card folds back by itself (and a reload folds them all)
+const CARD_OPEN_MS=5*60*1000,openCards=new Map();let emptyOpen=0;
+setInterval(()=>{const old=Date.now()-CARD_OPEN_MS;let changed=emptyOpen&&emptyOpen<old;if(changed)emptyOpen=0;
+ for(const [c,at] of openCards)if(at<old){openCards.delete(c);openSites.delete(c);changed=true}
+ if(changed)renderTunnels()},15000);
 function renderTunnels(){
  const st=lastStatus;if(!st)return;
  // Working tunnels first, then the other ones with nodes, each by node count; without nodes folded at the end
@@ -3232,7 +3242,7 @@ function renderTunnels(){
   const busy=doing?el("span",{class:"spin tbusy",role:"status",title:doing.text,"aria-label":doing.text}):null;
   const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(open),"aria-label":`${x.country}: ${label}, подробнее`},
    codeBadge(c),el("div",{},el("div",{class:"tname",text:x.country}),sub),busy,ping,el("span",{class:"chev","aria-hidden":"true"}),tunnelButtons(c,x));
-  const toggle=e=>{if(e.target.closest("button"))return;open?openCards.delete(c):openCards.add(c);renderTunnels()};
+  const toggle=e=>{if(e.target.closest("button"))return;open?openCards.delete(c):openCards.set(c,Date.now());renderTunnels()};
   head.onclick=toggle;head.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle(e)}};
   const body=open?el("div",{class:"tbody"},tmeta(x,x.unchecked?null:st.fail_threshold),spark(c),
    x.unchecked?el("div",{class:"details",text:"Через этот туннель сейчас не идёт ни один сервис, поэтому пинг не измерить. Перенесите в него сервис в «Пинг и рекомендации»."})
@@ -3242,12 +3252,12 @@ function renderTunnels(){
   return el("div",{class:"card tcard compact"+(open?" open":"")},head,body)};
  for(const c of codes)box.append(card(c));
  if(empty.length){
-  const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(emptyOpen),"aria-label":`Без нод: ${empty.length}, показать`},
+  const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(!!emptyOpen),"aria-label":`Без нод: ${empty.length}, показать`},
    el("span",{class:"code"},el("span",{class:"dot warn"})),
    el("div",{},el("div",{class:"tname",text:`Нет нод · ${empty.length} ${plural(empty.length,"туннель","туннеля","туннелей")}`}),
     el("div",{class:"tsub tflags",text:empty.map(c=>`${flag(c)} ${c}`).join("  ")})),
    el("span",{class:"chev","aria-hidden":"true"}));
-  const toggle=()=>{emptyOpen=!emptyOpen;renderTunnels()};
+  const toggle=()=>{emptyOpen=emptyOpen?0:Date.now();renderTunnels()};
   head.onclick=toggle;head.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle()}};
   box.append(el("div",{class:"card tcard compact tempty"+(emptyOpen?" open":"")},head));
   if(emptyOpen)for(const c of empty)box.append(card(c))}
