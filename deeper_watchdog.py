@@ -613,6 +613,7 @@ AUTO_STATE.setdefault("moved_at", {})  # key -> when the watchdog last moved it 
 AUTO_STATE.setdefault("returned", {})  # key -> {"at", "wait"}: last return to the preferred tunnel
 AUTO_STATE.setdefault("failovers", {})  # key -> times of failovers within the last hour
 AUTO_STATE.setdefault("rebuilt_at", {})  # code -> when the watchdog (or the user) last rebuilt the tunnel
+AUTO_STATE.setdefault("bad_ips", {})  # key -> {code: {ip: when}}: nodes a service had to leave for working badly
 AUTO_STATE.setdefault("hosts", {})  # host -> {"seen": last answer through any tunnel, "good": last non-error status}
 # Only preferred services come back now; auto and sticky ones stay where a failover took them
 AUTO_STATE["evacuated"] = {k: e for k, e in AUTO_STATE["evacuated"].items() if k in preferred_tunnels()}
@@ -1133,7 +1134,9 @@ SERVICE_LOSS_PCT = 20     # A service degrades above this loss...
 SERVICE_TIMEOUTS = 3      # ...or after this many checks in a row without any answer
 SLOW_CHECKS = 2           # ...or slower than MAX_LATENCY_MS this many checks in a row
 SLOW_STREAK = {}          # service key -> checks in a row it was slower than MAX_LATENCY_MS in its current tunnel
-HOST_MEMORY_DAYS = 7      # A domain that hasn't answered anywhere this long doesn't count (e.g. a bare CDN domain)
+HOST_MEMORY_DAYS = 2      # A domain that hasn't answered anywhere this long doesn't count (e.g. a bare CDN domain)
+BAD_IP_HOURS = 24         # How long a node a service had to leave counts as bad for it
+CACHE_HOURS = 48          # Nothing the watchdog remembers about domains, nodes and moves is kept longer
 FAILOVER_LIMIT = 3        # Failovers of one service within an hour, after which it is left where it is
 # "<tunnel> <host>" -> quality of a site in a tunnel: {"url", "tunnel", "q", "lat", "tcp", "ttfb", "status",
 # "error", "loss", "window", "fails", "at"}. q is the smoothed score Q = RTT_tcp + TTFB + loss and error penalties
@@ -1361,8 +1364,9 @@ def stable_for(code):
 
 def failover_target(key, exclude, tunnels):
     """The tunnel a service leaving `exclude` (a code or a set of them) moves to: any tunnel that has nodes.
-    Among those, one that has kept its nodes for STABLE_FOR seconds first (a node that came a minute ago is often
-    gone a minute later), then working, the lowest quality score, more nodes."""
+    Among those: not on a node the service already had to leave (bad_ips), one that has kept its nodes for
+    STABLE_FOR seconds (a node that came a minute ago is often gone a minute later), working, the lowest quality
+    score, more nodes."""
     exclude = {exclude} if isinstance(exclude, str) else set(exclude)
     blocked = blocked_tunnel(key)
     usable = [t for t in tunnels if t.get("activeNum", 0) > 0 and t.get("tunnelCode") not in exclude | {blocked}]
@@ -1371,7 +1375,8 @@ def failover_target(key, exclude, tunnels):
         st = STATUS["tunnels"].get(t["tunnelCode"]) or {}
         known = st.get("latency") and not st.get("unchecked")
         score = TUNNEL_Q.get(t["tunnelCode"]) if known else None
-        return (stable_for(t["tunnelCode"]) < STABLE_FOR, not st.get("healthy", True),
+        return (t.get("activeIp") in bad_ips(key, t["tunnelCode"]), stable_for(t["tunnelCode"]) < STABLE_FOR,
+                not st.get("healthy", True),
                 score if score is not None else 10 ** 6, -stable_for(t["tunnelCode"]), -t.get("activeNum", 0))
     return min(usable, key=rank)["tunnelCode"] if usable else None
 
@@ -1395,6 +1400,44 @@ def return_wait(key):
     if r and time.time() - r["at"] < 1800:
         return min(max(r.get("wait", 0), PREFERRED_RETURN_AFTER) * 2, 3600)
     return PREFERRED_RETURN_AFTER
+
+
+def note_bad_ip(key, code, tunnels):
+    """The service leaves `code` for working badly there: its current node is bad for it. Under STATE_LOCK."""
+    ip = next((t.get("activeIp") for t in tunnels if t.get("tunnelCode") == code and t.get("activeNum", 0) > 0), None)
+    if ip:
+        AUTO_STATE["bad_ips"].setdefault(key, {}).setdefault(code, {})[ip] = time.time()
+
+
+def bad_ips(key, code):
+    """Nodes of the tunnel the service had to leave within BAD_IP_HOURS."""
+    now = time.time()
+    return {ip for ip, t in AUTO_STATE["bad_ips"].get(key, {}).get(code, {}).items() if now - t < BAD_IP_HOURS * 3600}
+
+
+def tunnel_ip(code):
+    """The tunnel's current node, as the node watcher saw it last."""
+    return next((t.get("ip") for t in ROUTES["all_tunnels"] if t.get("code") == code and t.get("nodes")), None)
+
+
+def prune_cache():
+    """Drops whatever the watchdog remembers that is older than CACHE_HOURS (bad nodes: BAD_IP_HOURS). Under STATE_LOCK."""
+    now = time.time()
+    keep = lambda t: isinstance(t, (int, float)) and now - t < CACHE_HOURS * 3600
+    for key in list(AUTO_STATE["bad_ips"]):
+        per = {c: {ip: t for ip, t in ips.items() if now - t < BAD_IP_HOURS * 3600}
+               for c, ips in AUTO_STATE["bad_ips"][key].items()}
+        per = {c: ips for c, ips in per.items() if ips}
+        if per:
+            AUTO_STATE["bad_ips"][key] = per
+        else:
+            del AUTO_STATE["bad_ips"][key]
+    AUTO_STATE["hosts"] = {h: v for h, v in AUTO_STATE["hosts"].items() if keep(v.get("seen")) or keep(v.get("good"))}
+    for name in ("moved_at", "rebuilt_at"):
+        AUTO_STATE[name] = {k: t for k, t in AUTO_STATE[name].items() if keep(t)}
+    AUTO_STATE["returned"] = {k: r for k, r in AUTO_STATE["returned"].items() if keep(r.get("at"))}
+    AUTO_STATE["failovers"] = {k: [t for t in ts if keep(t)] for k, ts in AUTO_STATE["failovers"].items() if any(keep(t) for t in ts)}
+    AUTO_STATE["blocked"] = {k: b for k, b in AUTO_STATE["blocked"].items() if b.get("until", 0) > now}
 
 
 def note_evacuated(key, from_code, to_code):
@@ -1445,6 +1488,7 @@ def _evacuate(client, code, only, reason, why, mail):
         if move_to(target):
             mark_moved(key)
             with STATE_LOCK:
+                note_bad_ip(key, code, tunnels)  # Only a tunnel with nodes has one: a failing one, not an empty one
                 # Only a preferred service comes back; auto and sticky ones stay where they landed
                 if key in prefs:
                     note_evacuated(key, prefs[key], target)
@@ -1505,7 +1549,9 @@ def enforce_preferred(client, green_since, only=None):
             continue
         evac = AUTO_STATE["evacuated"].get(k)
         if evac and evac.get("from") == c:
-            ready = now - max(green_since[c], evac.get("at", 0)) >= evac.get("wait", PREFERRED_RETURN_AFTER)
+            # Back only to another node: the one it left worked badly for it
+            ready = now - max(green_since[c], evac.get("at", 0)) >= evac.get("wait", PREFERRED_RETURN_AFTER) \
+                and tunnel_ip(c) not in bad_ips(k, c)
         else:
             ready = now - green_since[c] >= NODES_STABLE
         if ready:
@@ -1931,6 +1977,7 @@ def decide_services(client, current):
                 continue
             mark_moved(key)
             with STATE_LOCK:
+                note_bad_ip(key, cur, tunnels)
                 AUTO_STATE["failovers"][key] = [t for t in AUTO_STATE["failovers"].get(key, []) if now - t < 3600] + [now]
                 AUTO_STATE["probation"].pop(key, None)
                 if not stays:
@@ -2413,6 +2460,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
     with STATE_LOCK:
         AUTO_STATE["green_since"] = dict(GREEN_SINCE)
         AUTO_STATE["alive_at"] = time.time()
+        prune_cache()
     save_auto_state()
 
     try:
@@ -3566,7 +3614,9 @@ function renderItems(box,items,results,auto,d){box.textContent="";
    ?el("span",{class:"chip bad",text:"⚠ "+Object.entries(group.tunnels).map(([t,n])=>`${t} ${n}`).join(" · ")})
    :el("span",{class:"chip",text:tunnelLabel(tunnel)});
   const main=el("div",{class:"li-main"},el("div",{class:"li-title"},name,tchip));
-  if(pin&&ev&&ev.from===pin)main.append(el("div",{class:"warnline"},icon("clock"),`Временно в ${ev.to}: в ${pin} был сбой. Вернётся, когда ${pin} ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`));
+  if(pin&&ev&&ev.from===pin)main.append(el("div",{class:"warnline"},icon("clock"),ev.new_node
+   ?`Временно в ${ev.to}: на ноде ${pin} ему было плохо. Вернётся, когда в ${pin} будет другая нода и она ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`
+   :`Временно в ${ev.to}: в ${pin} был сбой. Вернётся, когда ${pin} ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`));
   else if(pin&&tunnel&&tunnel!==pin&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("pin"),`Вернётся в ${pin}, когда он будет в норме`));
   if(hold&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("clock"),`Удержание после переезда ещё ${Math.max(1,Math.round((hold-Date.now()/1000)/60))} мин`));
   if(group){const n=group.domains.length,del=el("button",{type:"button",class:"btn sm danger"},icon("trash"),n>1?"Удалить все домены":"Удалить домен");
@@ -3789,7 +3839,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "services": dict(SERVICE_RESULTS),
                 "probation": {k: {"from": p["from"], "to": p["to"]} for k, p in AUTO_STATE["probation"].items()},
                 "blocked": {k: b["tunnel"] for k, b in AUTO_STATE["blocked"].items() if b.get("until", 0) > time.time()},
-                "evacuated": dict(AUTO_STATE["evacuated"]),
+                "evacuated": {k: dict(e, new_node=tunnel_ip(e["from"]) in bad_ips(k, e["from"]))
+                              for k, e in AUTO_STATE["evacuated"].items()},
                 "preferred": preferred_tunnels(),
             })
         elif self.path == "/api/status":
