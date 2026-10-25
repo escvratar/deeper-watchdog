@@ -2584,7 +2584,8 @@ a.btn{text-decoration:none}
 .tbody .details{margin-top:8px}
 .tcard.compact .tbusy{width:14px;height:14px;border-width:2px;color:var(--accent);margin-right:-2px}
 .tsub{flex-wrap:nowrap;overflow:hidden;white-space:nowrap}
-.tsub>span{flex:none}.tsub .tdoing{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--accent-text);font-weight:550}
+.tsub>span{flex:none}.tsub.tflags{display:block;overflow:hidden;text-overflow:ellipsis}
+.tcard.tempty .code{background:var(--orange-soft)}.tsub .tdoing{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--accent-text);font-weight:550}
 .tcard{padding:18px 20px 18px;position:relative;transition:transform .35s var(--spring),box-shadow .35s var(--spring);display:flex;flex-direction:column}
 @media (hover:hover){.tcard:hover{box-shadow:var(--shadow-lift);transform:translateY(-2px)}}
 .thead{display:flex;align-items:center;gap:12px}
@@ -3363,14 +3364,15 @@ function plainDetails(x){const d=x.details||"";if(!d)return "";
  if(/^OK/.test(d))return "Домены туннеля отвечают";
  return d.replace(/ \(HTTP \d+\)/g,"")}
 // Tunnel cards are one line each; a tap opens the chart, IP and domains. Opened ones stay open across updates
-const openCards=new Set();
+const openCards=new Set();let emptyOpen=false;
 function renderTunnels(){
  const st=lastStatus;if(!st)return;
- // Problems first: failing, working, without nodes, not checked
- const rank=x=>x.unchecked?3:x.pool===0?2:x.healthy?1:0;
- const codes=Object.keys(st.tunnels||{}).map((c,i)=>[c,i]).sort((a,b)=>rank(st.tunnels[a[0]])-rank(st.tunnels[b[0]])||a[1]-b[1]).map(a=>a[0]);
+ // Most nodes first; tunnels without nodes are folded into one row at the end
+ const all=Object.keys(st.tunnels||{}).map((c,i)=>[c,i]);
+ const codes=all.filter(([c])=>st.tunnels[c].pool>0).sort((a,b)=>st.tunnels[b[0]].pool-st.tunnels[a[0]].pool||a[1]-b[1]).map(a=>a[0]);
+ const empty=all.filter(([c])=>!(st.tunnels[c].pool>0)).map(a=>a[0]);
  const box=$("tunnels");box.textContent="";
- for(const c of codes){const x=st.tunnels[c],noNodes=x.pool===0,open=openCards.has(c);
+ const card=c=>{const x=st.tunnels[c],noNodes=x.pool===0,open=openCards.has(c);
   const action=(x.details||"").split(" → ")[1];
   const [cls,label]=x.unchecked?["","Не проверяется"]:x.healthy?["ok","Работает"]:noNodes?["warn","Нет нод"]:["bad","Сбой"];
   // What the watchdog is doing right now: a spinner by the ping, and for anything longer than a check its text in
@@ -3390,8 +3392,19 @@ function renderTunnels(){
    :noNodes?el("div",{class:"details",text:"Нет активных нод: сервисы переносятся в туннели, где ноды есть."})
    :siteList(c,x)||el("div",{class:"details",text:plainDetails(x)}),
    action?el("div",{class:"details",text:"→ "+action}):null):null;
-  box.append(el("div",{class:"card tcard compact"+(open?" open":"")},head,body))}
- if(!codes.length&&!st.error)box.append(el("div",{class:"card empty"},el("span",{class:"spin"}),"Ждём первую проверку…"))}
+  return el("div",{class:"card tcard compact"+(open?" open":"")},head,body)};
+ for(const c of codes)box.append(card(c));
+ if(empty.length){
+  const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(emptyOpen),"aria-label":`Без нод: ${empty.length}, показать`},
+   el("span",{class:"code"},el("span",{class:"dot warn"})),
+   el("div",{},el("div",{class:"tname",text:`Нет нод · ${empty.length} ${plural(empty.length,"туннель","туннеля","туннелей")}`}),
+    el("div",{class:"tsub tflags",text:empty.map(c=>`${flag(c)} ${c}`).join("  ")})),
+   el("span",{class:"chev","aria-hidden":"true"}));
+  const toggle=()=>{emptyOpen=!emptyOpen;renderTunnels()};
+  head.onclick=toggle;head.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle()}};
+  box.append(el("div",{class:"card tcard compact tempty"+(emptyOpen?" open":"")},head));
+  if(emptyOpen)for(const c of empty)box.append(card(c))}
+ if(!all.length&&!st.error)box.append(el("div",{class:"card empty"},el("span",{class:"spin"}),"Ждём первую проверку…"))}
 function codeBadge(c){const f=flag(c);return f?el("span",{class:"code",title:tname(c)},el("span",{class:"fw"},el("span",{class:"flag",text:f})),el("span",{class:"cc",text:c})):el("span",{class:"code",text:c})}
 function tmeta(x,threshold){return el("div",{class:"meta"},el("span",{},icon("server"),x.ip||"—"),el("span",{},icon("nodes"),`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`),
  threshold!=null?el("span",{class:x.fails?"warn":""},icon("tri"),`сбоев ${x.fails} из ${threshold}`):null)}
