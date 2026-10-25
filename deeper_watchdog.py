@@ -12,6 +12,8 @@ import sys
 import time
 import json
 import re
+import ssl
+import socket
 import base64
 import hmac
 import logging
@@ -83,55 +85,28 @@ SETTINGS_SCHEMA = {
     "DEEPER_USER": ("str", "admin", None, None),
     "DEEPER_PASS": ("secret", "", None, None),  # Only from .env or the web UI, never in the code
     "MAX_LATENCY_MS": ("int", "2500", 100, 60000),
-    "FAIL_THRESHOLD": ("int", "3", 1, 20),
-    "SKIP_ALL_SLOW": ("bool", "true", None, None),
     "CHECK_INTERVAL": ("int", "180", 30, 86400),
-    "LATENCY_TIMEOUT": ("float", "3.5", 0.5, 60),
+    # Not in the web UI: tunnels to watch (empty: all) and older per-tunnel test sites from .env
     "MONITOR_TUNNELS": ("str", "", None, None),
     # One "CODE=url1,url2" per line; .env CANARIES_XX values are the default
     "CANARIES": ("text", "", None, None),
     # Test sites, comma-separated: each one tests the tunnel its domain goes through right now
     "TEST_SITES": ("str", "", None, None),
-    "RECOVERY_ACTION": ("choice", "refresh", None, None),
-    "REBUILD_WAIT": ("int", "16", 0, 300),
-    # "smart" recovery: node switches before rebuilding, checks per switch, pause between checks
-    "SWITCH_ATTEMPTS": ("int", "3", 1, 10),
-    "VERIFY_CHECKS": ("int", "3", 1, 10),
-    "VERIFY_PAUSE": ("int", "5", 0, 120),
-    # Tunnel comparison for Smart Route domains (web UI button) and auto-moving of ticked domains
-    # Domains and "app:<name>" App Relocator apps that auto mode may move
-    "AUTO_ROUTE_DOMAINS": ("str", "", None, None),
-    # One "service_key=CODE" per line: the tunnel a service always goes back to while it has nodes
+    # Off: the watchdog never rebuilds a tunnel by itself. On: only as the last resort (see recover_tunnel),
+    # at most once per REBUILD_EVERY_HOURS per tunnel
+    "REBUILD_ENABLED": ("bool", "true", None, None),
+    "REBUILD_EVERY_HOURS": ("int", "2", 1, 48),
+    # Service modes. Every service and app is in auto mode unless it is listed here ("group:<name>", "app:<name>")
+    # Manual: never moved by the watchdog, even out of a tunnel without nodes; only reported
+    "MANUAL_SERVICES": ("str", "", None, None),
+    # Sticky failover: leaves a failing tunnel for the best working one and stays there
+    "STICKY_SERVICES": ("str", "", None, None),
+    # One "service_key=CODE" per line: preferred tunnel, left while it fails and returned to once it is green
     "PREFERRED_TUNNELS": ("text", "", None, None),
     # App Relocator apps shown in the web UI (Deeper app keys)
     "APPS": ("str", "instagram,telegram", None, None),
     # Extra/overriding service groups, one "Name=domain1,domain2" per line
     "SERVICE_GROUPS": ("text", "", None, None),
-    "AUTO_MIN_GAIN_PCT": ("int", "30", 0, 90),
-    "AUTO_MIN_GAIN_MS": ("int", "200", 0, 10000),
-    "COMPARE_SAMPLES": ("int", "3", 1, 10),
-    "ROUTE_SETTLE": ("int", "3", 0, 60),
-    # Daily comparison of auto-mode services at this hour (-1 = off)
-    "AUTO_COMPARE_HOUR": ("int", "4", -1, 23),
-    # An auto-mode service much slower than another tunnel gets compared right away, at most this often (min, 0 = off)
-    "AUTO_GAIN_RECHECK": ("int", "60", 0, 1440),
-    # Test sites per tunnel: too few of the user's go through a tunnel, temporary ones top it up
-    "SITES_PER_TUNNEL": ("int", "3", 1, 6),
-    # Event log: entries older than this many days are removed (0 = only the length limit); shown on the overview
-    "EVENTS_DAYS": ("int", "3", 0, 365),
-    "SHOW_EVENTS": ("bool", "true", None, None),
-    # Undo an auto move if the service stops working in its new tunnel
-    "AUTO_ROLLBACK": ("bool", "true", None, None),
-    # A tunnel left without nodes: its services move to a tunnel that has them, and come back later
-    "FAILOVER_EMPTY": ("bool", "true", None, None),
-    "FAILOVER_WAIT": ("int", "30", 5, 600),
-    "EMPTY_REBUILD_AFTER": ("int", "60", 0, 3600),
-    "EMPTY_REBUILD_EVERY": ("int", "300", 60, 86400),
-    # No nodes in any tunnel: all of them are rebuilt and checked again this often (0 = off)
-    "ALL_EMPTY_REBUILD_EVERY": ("int", "180", 0, 86400),
-    "FAILOVER_RETURN": ("bool", "true", None, None),
-    # Services that leave right after a rebuild that ended without nodes ("app:<name>" / "group:<name>")
-    "FAILOVER_PRIORITY": ("str", "", None, None),
     "SMTP_ENABLED": ("bool", "false", None, None),
     "SMTP_HOST": ("str", "", None, None),
     "SMTP_PORT": ("int", "465", 1, 65535),
@@ -141,7 +116,37 @@ SETTINGS_SCHEMA = {
     "SMTP_FROM": ("str", "", None, None),
     "SMTP_TO": ("str", "", None, None),
     # What to email about: categories from EMAIL_CATEGORIES
-    "EMAIL_EVENTS": ("str", "recovery,no_nodes,all_empty,auto,rollback,errors", None, None),
+    "EMAIL_EVENTS": ("str", "recovery,no_nodes,all_empty,auto,rollback,failover,service,errors", None, None),
+}
+# Fixed tuning: used to be settings, but the defaults are what works, and every knob made the page harder to use
+FIXED_SETTINGS = {
+    "LATENCY_TIMEOUT": 3.5,       # Seconds to wait for the TCP handshake and the first byte
+    "TUNNEL_FAIL_PCT": 50,        # A tunnel fails when at least this share of its domains is bad, %
+    "SKIP_ALL_SLOW": True,        # Every tunnel failing at once is the network's fault: nothing is repaired
+    "EVACUATE_AFTER": 2,          # Failed checks in a row before services leave a failing tunnel
+    "FAIL_THRESHOLD": 3,          # ...and before its node is switched (and, as the last resort, it is rebuilt)
+    "SWITCH_ATTEMPTS": 2,         # Node switches per outage before a rebuild is considered
+    "VERIFY_CHECKS": 3,           # Checks after a node switch; most of them must pass
+    "VERIFY_PAUSE": 5,            # Seconds after a switch and between those checks
+    "REBUILD_WAIT": 30,           # Seconds to wait for a new IP after a rebuild
+    "RECOVERY_ACTION": "smart",
+    "FAILOVER_EMPTY": True,       # Services leave a tunnel without nodes...
+    "FAILOVER_WAIT": 60,          # ...after this many seconds
+    "EMPTY_REBUILD_AFTER": 3600,  # A tunnel without nodes is rebuilt only after an hour: Deeper finds nodes itself
+    "ALL_EMPTY_REBUILD_EVERY": 0,  # No mass rebuilds when no tunnel has nodes: one at a time, like any other
+    "FAILOVER_PRIORITY": "",
+    "AUTO_MIN_GAIN_PCT": 30,      # Hysteresis: a move needs a quality score better by this much...
+    "AUTO_MIN_GAIN_MS": 200,      # ...and by at least this many ms
+    "HOLD_DOWN": 300,             # Seconds a service stays put after a move, unless it stops answering at all
+    "PREFERRED_RETURN_AFTER": 300,  # Seconds a preferred tunnel must be green before its services come back
+    "AUTO_GAIN_RECHECK": 60,      # Minutes between comparisons of one service that only looks slower
+    "AUTO_COMPARE_HOUR": 4,       # Daily comparison of auto-mode services at this hour
+    "COMPARE_SAMPLES": 3,
+    "ROUTE_SETTLE": 3,
+    "AUTO_ROLLBACK": True,
+    "BEACONS_PER_TUNNEL": 3,
+    "EVENTS_DAYS": 3,
+    "SHOW_EVENTS": True,
 }
 RECOVERY_ACTIONS = ("refresh", "switch", "smart")
 
@@ -161,13 +166,10 @@ ROUTE_LOCK = threading.Lock()
 ACTIONS = {}  # code -> {"text", "since"}: what the watchdog is doing with a tunnel right now, for the web UI
 NODE_WATCH_EVERY = 10  # Seconds between node count checks
 EMPTY_SINCE = {}  # code -> when the tunnel was first seen without nodes
-EMPTY_REBUILT = {}  # code -> when it was last rebuilt for having no nodes
 ALL_EMPTY_SINCE = 0  # When every monitored tunnel was first seen without nodes (0: some have nodes)
-ALL_EMPTY_REBUILT = 0  # When all tunnels were last rebuilt for that
-NODES_SINCE = {}  # code -> since when the tunnel has nodes
-NODES_STABLE = 20  # Seconds a tunnel must keep its nodes before services go back to it
+GREEN_SINCE = {}  # code -> since when the tunnel has nodes and passes its checks
+NODES_STABLE = 20  # Seconds a tunnel must be green before services moved away not by a failover go back to it
 ENFORCED_AT = 0  # When the node watcher last checked services against their preferred tunnels
-READY_SEEN = set()  # Tunnels that had stable nodes at the previous watcher tick
 # Held while services are moved between tunnels by failover, returns and preferred tunnels. Separate from
 # ROUTE_LOCK, so a long recovery of one tunnel doesn't hold up moving services out of another, empty one.
 # Order: ROUTE_LOCK before MOVE_LOCK, never the other way round
@@ -176,6 +178,7 @@ WATCHER_ON = False  # The node watcher runs: it handles empty tunnels, the check
 EVAC_TRIED = {}  # code -> when the watcher last tried to move services out of the empty tunnel
 EVAC_NOTIFIED = {}  # code -> services that couldn't be moved and were already reported in this outage
 LAST_FAIL_AT = {}  # code -> when a failed check was last counted
+NO_REBUILD_NOTED = set()  # Failing tunnels already reported as left alone because rebuilding is off
 
 
 def set_action(code, text=None):
@@ -247,7 +250,9 @@ def apply_settings():
     """Loads effective settings into module globals."""
     global MONITOR_TUNNELS, CANARIES, SMTP_FROM
     settings = current_settings()
+    globals().update(FIXED_SETTINGS)
     globals().update(settings)
+    globals()["EMPTY_REBUILD_EVERY"] = settings["REBUILD_EVERY_HOURS"] * 3600
     MONITOR_TUNNELS = [t.strip().upper() for t in settings["MONITOR_TUNNELS"].split(",") if t.strip()]
     CANARIES = {}
     for line in settings["CANARIES"].replace(";", "\n").splitlines():
@@ -354,7 +359,7 @@ def default_canaries(tunnel_code, routed_domains=None):
     """Default test sites for a tunnel when no override is set."""
     # 1. Domains the user routed through this tunnel in Smart Route: they really go through it
     if routed_domains and tunnel_code in routed_domains:
-        return routed_domains[tunnel_code][:2]
+        return routed_domains[tunnel_code]
 
     # 2. Configured test targets (Instagram, Telegram, YouTube, Gemini)
     if tunnel_code in FALLBACK_CANARIES:
@@ -362,34 +367,6 @@ def default_canaries(tunnel_code, routed_domains=None):
 
     # 3. Global fallback
     return ["https://www.youtube.com", "https://api.telegram.org"]
-
-
-CDN_HOSTS = ("azureedge.net", "cloudfront.net", "akamaized.net", "akamaihd.net", "fastly.net", "googlevideo.com",
-             "gstatic.com", "ggpht.com", "ytimg.com", "fbcdn.net", "cdninstagram.com", "googleusercontent.com")
-
-
-def own_domain_sites(client, code, routed_domains, site_routes, apps=None, limit=2, tries=12, skip=()):
-    """Temporary test sites for a tunnel with too few of the user's test sites going through it: websites
-    of apps relocated there, then its Smart Route domains, only those that really go through it and skipping
-    CDN domains without a site of their own (and hosts in skip). Empty if there are none."""
-    sites = [a.get("website") for a in (apps or {}).values() if a.get("tunnel") == code and a.get("website")]
-    sites += (routed_domains or {}).get(code, [])
-    hosts = [urllib.parse.urlparse(u).hostname or "" for u in sites]
-    hosts = list(dict.fromkeys(h[4:] if h.startswith("www.") else h for h in hosts))  # www.x and x are one site
-    hosts = [h for h in hosts if h and h not in skip
-             and not h.endswith(CDN_HOSTS) and not any("cdn" in x for x in h.split(".")[:-1])]
-    picked = []
-    for h in hosts[:tries]:
-        if h not in site_routes:
-            try:
-                site_routes[h] = client.get_domain_route(h)
-            except Exception:
-                site_routes[h] = None
-        if site_routes[h] == code:
-            picked.append(f"https://{h}")
-            if len(picked) >= limit:
-                break
-    return picked
 
 
 def test_sites():
@@ -428,8 +405,27 @@ def preferred_setting(prefs):
     return "\n".join(f"{k}={v}" for k, v in sorted(prefs.items()))
 
 
-def auto_route_domains():
-    return {d.strip() for d in AUTO_ROUTE_DOMAINS.split(",") if d.strip()}
+def listed(value):
+    return {k.strip() for k in value.split(",") if k.strip()}
+
+
+MODE_NAMES = {"auto": "«Авто»", "manual": "«Вручную»", "sticky": "«Sticky»", "": "«Вручную»"}
+
+
+def service_mode(key):
+    """"auto", "manual", "sticky" or the preferred tunnel's code."""
+    pref = preferred_tunnels().get(key)
+    if pref:
+        return pref
+    if key in listed(MANUAL_SERVICES):
+        return "manual"
+    return "sticky" if key in listed(STICKY_SERVICES) else "auto"
+
+
+def auto_keys(groups):
+    """Services ("group:<name>") and configured apps ("app:<name>") in auto mode."""
+    keys = [g["key"] for g in groups] + ["app:" + a for a in configured_apps()]
+    return {k for k in keys if service_mode(k) == "auto"}
 
 
 def configured_apps():
@@ -547,8 +543,10 @@ def base_name(domain):
 
 
 def service_groups(rules):
-    """Groups Smart Route rules ([{"domain", "tunnel"}]) into services.
+    """Groups Smart Route rules ([{"domain", "tunnel"}]) into services, without the watchdog's beacons.
     Returns [{"key", "name", "domains": [{"domain", "tunnel"}], "tunnels": {code: count}, "main", "split"}]."""
+    beacons = beacon_domains()
+    rules = [r for r in rules if r["domain"] not in beacons]
     known = known_groups()
     order = {}
     for name, patterns in known.items():
@@ -607,13 +605,18 @@ EVENTS = load_json(EVENTS_FILE, [])
 AUTO_STATE = load_json(AUTO_STATE_FILE, {})
 AUTO_STATE.setdefault("probation", {})
 AUTO_STATE.setdefault("blocked", {})
-AUTO_STATE.setdefault("evacuated", {})  # key -> {"from", "to", "since"}: services moved out of an empty tunnel
+AUTO_STATE.setdefault("evacuated", {})  # key -> {"from", "to", "since", "at", "wait"}: preferred services away from it
+AUTO_STATE.setdefault("moved_at", {})  # key -> when the watchdog last moved it (hold-down)
+AUTO_STATE.setdefault("returned", {})  # key -> {"at", "wait"}: last return to the preferred tunnel
+AUTO_STATE.setdefault("failovers", {})  # key -> times of failovers within the last hour
+AUTO_STATE.setdefault("rebuilt_at", {})  # code -> when the watchdog (or the user) last rebuilt the tunnel
+AUTO_STATE.setdefault("hosts", {})  # host -> {"seen": last answer through any tunnel, "good": last non-error status}
+# Only preferred services come back now; auto and sticky ones stay where a failover took them
+AUTO_STATE["evacuated"] = {k: e for k, e in AUTO_STATE["evacuated"].items() if k in preferred_tunnels()}
 # Ping history: tunnel -> [[unix_time, ms or None], ...]
 HISTORY = load_json(HISTORY_FILE, {})
 # Latest ping of every service: "group:<name>" -> {name, tunnel, url, latency, status, ok}
 SERVICE_RESULTS = {}
-SERVICES_EVERY = 15 * 60  # Seconds between service status measurements
-SERVICES_MEASURED = {"at": 0}
 
 
 # Email categories the user picks in the settings
@@ -663,6 +666,83 @@ def blocked_tunnel(key):
     """Tunnel auto mode must not pick for a service right now (after a rollback), or None."""
     b = AUTO_STATE["blocked"].get(key)
     return b["tunnel"] if b and b.get("until", 0) > time.time() else None
+
+
+# Sites that always answer and that nobody routes on purpose, from different hosts next to each other, so one
+# tunnel's beacons don't all depend on one company
+BEACON_POOL = ("wikipedia.org", "python.org", "debian.org", "wikimedia.org", "apache.org", "ubuntu.com",
+               "wiktionary.org", "w3.org", "kernel.org", "wikidata.org", "ietf.org", "archlinux.org",
+               "mediawiki.org", "iana.org", "gnu.org", "mozilla.org", "pypi.org", "postgresql.org",
+               "nodejs.org", "libreoffice.org", "nginx.org", "npmjs.com", "gimp.org", "kde.org",
+               "videolan.org", "blender.org", "xfce.org", "cpan.org", "openssl.org", "jquery.com",
+               "mariadb.org", "haskell.org", "isc.org", "gnome.org")
+
+
+def beacon_domains():
+    """Beacon domain -> tunnel it is kept in."""
+    return AUTO_STATE.get("beacons", {})
+
+
+def ensure_beacons(client, tunnels):
+    """Keeps BEACONS_PER_TUNNEL beacon rules in every monitored tunnel: a tunnel without services is still
+    measured, and its bad node is still noticed. Beacons aren't services: never compared, moved or evacuated.
+    A beacon rule that disappeared or was moved is put back; beacons of a tunnel gone from Deeper are reused."""
+    codes = [t.get("tunnelCode") for t in tunnels if t.get("tunnelCode") and (not MONITOR_TUNNELS or t.get("tunnelCode") in MONITOR_TUNNELS)]
+    rules = {i.get("domainName"): i.get("tunnelCode") for i in client.get_whitelist_domains()}
+    with STATE_LOCK:
+        beacons = AUTO_STATE.setdefault("beacons", {})
+        # Taken out of the pool in a newer version: no longer a beacon
+        for d in [d for d in beacons if d not in BEACON_POOL]:
+            del beacons[d]
+    drop = [d for d, c in beacons.items() if c not in codes]
+    for c in codes:
+        mine = [d for d, t in beacons.items() if t == c]
+        drop += mine[BEACONS_PER_TUNNEL:]
+    added, fixed, removed, failed = [], [], [], []
+    for d in drop:
+        if d in rules and (rules[d] == beacons[d] or rules[d] not in codes):
+            (removed if client.delete_domains([d]) else failed).append(d)
+        with STATE_LOCK:
+            beacons.pop(d, None)
+    free = [d for d in BEACON_POOL if d not in beacons and d not in rules and not any(r.endswith("." + d) for r in rules)]
+    for c in codes:
+        for d in [d for d, t in beacons.items() if t == c]:
+            if rules.get(d) == c:
+                continue
+            ok = client.move_domain(d, rules[d], c) if d in rules else client.add_domain(d, c)
+            (fixed if ok else failed).append(f"{d} → {c}")
+    count = lambda c: sum(t == c for t in beacons.values())
+    # Round by round, so with more tunnels than the pool covers every tunnel still gets some
+    for n in range(1, BEACONS_PER_TUNNEL + 1):
+        for c in codes:
+            if count(c) < n and free:
+                d = free.pop(0)
+                if client.add_domain(d, c):
+                    with STATE_LOCK:
+                        beacons[d] = c
+                    added.append(f"{d} → {c}")
+                else:
+                    failed.append(f"{d} → {c}")
+    # Pool used up: a tunnel short of beacons takes one from the tunnel that has the most (e.g. a new tunnel)
+    for c in codes:
+        while count(c) < BEACONS_PER_TUNNEL:
+            rich = max(codes, key=count)
+            if count(rich) <= count(c) + 1:
+                break
+            d = next(d for d, t in beacons.items() if t == rich)
+            if not client.move_domain(d, rich, c):
+                failed.append(f"{d} → {c}")
+                break
+            with STATE_LOCK:
+                beacons[d] = c
+            added.append(f"{d} → {c} (из {rich})")
+    if added or fixed or removed or failed:
+        save_auto_state()
+        text = "Маячки туннелей: " + "; ".join(
+            ([f"добавлены {', '.join(added)}"] if added else []) + ([f"возвращены {', '.join(fixed)}"] if fixed else [])
+            + ([f"убраны {', '.join(removed)}"] if removed else []) + ([f"не удалось: {', '.join(failed)}"] if failed else []))
+        logger.info(text)
+        log_event("bad" if failed else "info", text)
 
 
 def take_snapshot(client):
@@ -1036,77 +1116,215 @@ def shared_client():
         return _SHARED["client"]
 
 
-def test_url_latency(url, timeout=3.5):
-    """Measures HTTP response time in ms. Returns (latency_ms, status_or_error)."""
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    )
-    t0 = time.time()
+PROBE_WORKERS = 32        # Sites probed at once
+PROBE_ROUNDS = 2          # Probes of every site per check: the best one is its ping, failed ones are its loss
+EWMA_ALPHA = 0.3          # Weight of the newest check in the smoothed quality score
+LOSS_WINDOW = 10          # Latest probes of a site in a tunnel its loss is counted over (5 checks)
+LOSS_PENALTY_MS = 3000    # Quality score points for 100% loss
+ERROR_PENALTY_MS = 5000   # ...and for an HTTP error the site doesn't always give: such a tunnel doesn't work for it
+ERROR_STATUSES = (403, 429, 502, 503, 504)
+SERVICE_LOSS_PCT = 20     # A service degrades above this loss...
+SERVICE_TIMEOUTS = 3      # ...or after this many checks in a row without any answer
+HOST_MEMORY_DAYS = 7      # A domain that hasn't answered anywhere this long doesn't count (e.g. a bare CDN domain)
+FAILOVER_LIMIT = 3        # Failovers of one service within an hour, after which it is left where it is
+# "<tunnel> <host>" -> quality of a site in a tunnel: {"url", "tunnel", "q", "lat", "tcp", "ttfb", "status",
+# "error", "loss", "window", "fails", "at"}. q is the smoothed score Q = RTT_tcp + TTFB + loss and error penalties
+QUALITY = {}
+TUNNEL_Q = {}             # code -> median score of the tunnel's domains at its last check
+LAST_CHECK = {}           # code -> {"bad", "counted", "silent"}: domain counts of the tunnel's last check
+SSL_CTX = ssl.create_default_context()
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+
+def host_of(url):
+    return urllib.parse.urlparse(url if "://" in url else "https://" + url).hostname or ""
+
+
+def probe_url(url, timeout=3.5):
+    """One synthetic request split into phases: the TCP handshake (SYN -> SYN-ACK) to the site's port, then TLS
+    and an HTTP HEAD up to the first byte of the answer (TTFB). DNS stays outside the timings.
+    Returns (tcp_ms, ttfb_ms, status): times are None if the request failed, status is the HTTP code or the error."""
+    u = urllib.parse.urlparse(url if "://" in url else "https://" + url)
+    host, https = u.hostname, u.scheme != "http"
+    port = u.port or (443 if https else 80)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            lat = (time.time() - t0) * 1000.0
-            return lat, resp.status
-    except urllib.error.HTTPError as e:
-        lat = (time.time() - t0) * 1000.0
-        return lat, e.code
+        addrs = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except Exception as e:
-        return None, str(e)
+        return None, None, f"DNS: {e}"
+    sock, error = None, "нет адреса"
+    try:
+        for family, _, _, _, addr in addrs:
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            t0 = time.monotonic()
+            try:
+                sock.connect(addr)
+                break
+            except OSError as e:
+                sock.close()
+                sock, error = None, "таймаут TCP" if isinstance(e, socket.timeout) else f"TCP: {e}"
+        if sock is None:
+            return None, None, error
+        t1 = time.monotonic()
+        if https:
+            sock = SSL_CTX.wrap_socket(sock, server_hostname=host)
+        path = (u.path or "/") + (f"?{u.query}" if u.query else "")
+        sock.sendall(f"HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\n"
+                     f"Connection: close\r\n\r\n".encode())
+        first = sock.recv(32)
+        t2 = time.monotonic()
+        if not first:
+            return None, None, "соединение закрыто без ответа"
+        m = re.match(rb"HTTP/[\d.]+ (\d{3})", first)
+        return (t1 - t0) * 1000, (t2 - t1) * 1000, int(m.group(1)) if m else "ответ не HTTP"
+    except socket.timeout:
+        return None, None, "таймаут ответа"
+    except ssl.SSLError as e:
+        return None, None, f"TLS: {e.reason or e}"
+    except ConnectionResetError:
+        return None, None, "сброс соединения (TLS reset)"
+    except Exception as e:
+        return None, None, str(e)
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
-def best_of(*rounds):
-    """Per site, the fastest of several (latency, status) measurements; a failed one only if all failed.
-    A single request is noisy (a cold DNS lookup or connection alone can add a second), the best one shows
-    what the tunnel can do."""
-    return [min((m for m in ms if m[0] is not None), key=lambda m: m[0], default=ms[-1]) for ms in zip(*rounds)]
+def probe_all(urls, rounds=PROBE_ROUNDS):
+    """Probes every URL `rounds` times, each round all of them at once. Returns {url: [(tcp, ttfb, status)]}."""
+    result = {u: [] for u in urls}
+    if urls:
+        with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(urls))) as pool:
+            for _ in range(rounds):
+                for u, p in zip(urls, pool.map(lambda u: probe_url(u, timeout=LATENCY_TIMEOUT), urls)):
+                    result[u].append(p)
+    return result
+
+
+def best_probe(probes):
+    """The fastest answered probe, or None."""
+    return min((p for p in probes if p[0] is not None), key=lambda p: p[0] + p[1], default=None)
+
+
+def host_known(host, now=None):
+    """The domain has answered through some tunnel lately: its silence means something."""
+    seen = AUTO_STATE["hosts"].get(host, {}).get("seen", 0)
+    return (now or time.time()) - seen < HOST_MEMORY_DAYS * 86400
+
+
+def penalized(host, status):
+    """An error status counts against a tunnel only if the site has answered normally lately:
+    a site that always answers 403 (e.g. to anything that isn't a browser) is just that kind of site."""
+    good = AUTO_STATE["hosts"].get(host, {}).get("good", 0)
+    return status in ERROR_STATUSES and time.time() - good < HOST_MEMORY_DAYS * 86400
+
+
+def record_quality(code, url, probes, now=None):
+    """Folds one check's probes of a site into its quality in the tunnel: EWMA of the score, so a single
+    spike doesn't move anything, and the loss over the last LOSS_WINDOW probes. Returns the record."""
+    now = now or time.time()
+    host = host_of(url)
+    best = best_probe(probes)
+    status = best[2] if best else probes[-1][2]
+    with STATE_LOCK:
+        h = AUTO_STATE["hosts"].setdefault(host, {})
+        error = bool(best) and penalized(host, status)
+        if best:
+            h["seen"] = now
+            if status not in ERROR_STATUSES:
+                h["good"] = now
+        prev = QUALITY.get(f"{code} {host}") or {"window": [], "fails": 0}
+        window = (prev["window"] + [p[0] is not None for p in probes])[-LOSS_WINDOW:]
+        # Over a full window from the start: one bad check of a new site isn't 100% loss
+        loss = (len(window) - sum(window)) / max(len(window), LOSS_WINDOW)
+        lat = best[0] + best[1] if best else None
+        score = (lat if lat is not None else LATENCY_TIMEOUT * 1000) + LOSS_PENALTY_MS * loss + ERROR_PENALTY_MS * error
+        rec = {"url": url, "tunnel": code, "lat": lat, "tcp": best and best[0], "ttfb": best and best[1],
+               "status": status, "error": error, "loss": loss, "window": window,
+               "q": score if "q" not in prev else EWMA_ALPHA * score + (1 - EWMA_ALPHA) * prev["q"],
+               "fails": 0 if best else prev["fails"] + 1, "at": now}
+        QUALITY[f"{code} {host}"] = rec
+    return rec
+
+
+def reset_quality(code):
+    """A new node is a new route: the tunnel's history no longer says anything about it."""
+    with STATE_LOCK:
+        for k in [k for k in QUALITY if k.startswith(code + " ")]:
+            del QUALITY[k]
+        TUNNEL_Q.pop(code, None)
+
+
+def median(values):
+    values = sorted(values)
+    n = len(values)
+    return (values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2) if n else None
 
 
 def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
-    """Tests canaries for the given tunnel code. Returns (is_healthy, best_lat, details).
-    A bad node slows every site down, so the tunnel fails only when even its fastest site is too slow:
-    a few slow sites next to a fast one are those sites' own problem, and a node change wouldn't fix them."""
+    """Probes every given site of the tunnel. Returns (is_healthy, median_lat, details).
+    A bad node slows everything down, so the tunnel fails when at least TUNNEL_FAIL_PCT% of its domains are bad
+    (no answer, slower than max_latency_ms, or an error status): a few bad sites among good ones are those sites'
+    own problem, a node change wouldn't fix them. Domains that haven't answered anywhere lately don't count."""
     if max_latency_ms is None:
         max_latency_ms = MAX_LATENCY_MS
-    endpoints = canaries or FALLBACK_CANARIES.get(tunnel_code, [])
+    endpoints = list(dict.fromkeys(canaries or FALLBACK_CANARIES.get(tunnel_code, [])))
     if not endpoints:
         return True, 0, "No canaries configured"
 
-    def measure_once():
-        # All sites at once, so a check takes as long as the slowest site instead of their sum
-        with ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
-            return list(pool.map(lambda ep: test_url_latency(ep, timeout=LATENCY_TIMEOUT), endpoints))
+    now = time.time()
+    probes = probe_all(endpoints)
+    # Deeper resolves routed domains through the tunnel, so a DNS failure of a beacon or of a domain that answered
+    # lately is the tunnel's fault. A domain that never answered anywhere and doesn't resolve is just gone
+    beacons = beacon_domains()
+    trusted = lambda u: host_known(host_of(u), now) or host_of(u) in beacons
+    resolves = [u for u in endpoints if trusted(u)
+                or not all(isinstance(p[2], str) and p[2].startswith("DNS:") for p in probes[u])]
+    # Before this check is recorded: a domain answering for the first time counts too
+    counted = [u for u in resolves if trusted(u) or best_probe(probes[u])] or resolves
+    if not counted:
+        for u in endpoints:
+            record_quality(tunnel_code, u, probes[u], now)
+        LAST_CHECK[tunnel_code] = {"bad": 0, "counted": 0, "silent": len(endpoints)}
+        return True, 0, "No resolvable domains: " + ", ".join(host_of(u) for u in endpoints)
 
-    def summary(measured):
-        lats = [lat for lat, _ in measured if lat is not None]
-        return lats and min(lats) <= max_latency_ms
+    def is_bad(u):
+        best = best_probe(probes[u])
+        return best is None or best[0] + best[1] > max_latency_ms or penalized(host_of(u), best[2])
 
-    measured = best_of(measure_once(), measure_once())
+    bad = [u for u in counted if is_bad(u)]
     retried = False
-    if not summary(measured):
-        # Slow answers are often just noise: measure once more and keep each site's best result
+    if bad and len(bad) * 100 >= TUNNEL_FAIL_PCT * len(counted):
+        # Bad answers are often just noise: the bad sites are probed once more, each keeps its best probe
         retried = True
-        measured = best_of(measured, measure_once())
+        for u, extra in probe_all(bad, rounds=1).items():
+            probes[u] += extra
+        bad = [u for u in counted if is_bad(u)]
 
-    results = []
-    latencies = []
-    for ep, (lat, status) in zip(endpoints, measured):
-        SITE_RESULTS[f"{tunnel_code} {ep}"] = {"url": ep, "tunnel": tunnel_code, "latency": lat, "status": status,
-                            "ok": lat is not None, "time": time.strftime("%H:%M:%S")}
-        if lat is not None:
-            latencies.append(lat)
-            results.append(f"{ep}: {lat:.0f}ms (HTTP {status})")
-        else:
-            results.append(f"{ep}: FAIL ({status})")
+    recs = {u: record_quality(tunnel_code, u, probes[u], now) for u in endpoints}
+    for u, r in recs.items():
+        SITE_RESULTS[f"{tunnel_code} {u}"] = {"url": u, "tunnel": tunnel_code, "latency": r["lat"], "status": r["status"],
+                                              "ok": r["lat"] is not None, "q": r["q"], "loss": r["loss"],
+                                              "counted": u in counted, "beacon": host_of(u) in beacon_domains(),
+                                              "time": time.strftime("%H:%M:%S")}
+    answered = [recs[u]["lat"] for u in counted if recs[u]["lat"] is not None]
+    med = median(answered)
+    TUNNEL_Q[tunnel_code] = median([recs[u]["q"] for u in counted])
+    LAST_CHECK[tunnel_code] = {"bad": len(bad), "counted": len(counted), "silent": len(endpoints) - len(counted)}
 
+    worst = sorted(bad, key=lambda u: recs[u]["lat"] if recs[u]["lat"] is not None else 10 ** 9, reverse=True)
+    listed_bad = "; ".join(f"{host_of(u)}: " + (f"{recs[u]['lat']:.0f}ms (HTTP {recs[u]['status']})" if recs[u]["lat"] is not None
+                                               else f"FAIL ({recs[u]['status']})") for u in worst[:8]) \
+        + (f"; ещё {len(worst) - 8}" if len(worst) > 8 else "")
     note = " (после повторного замера)" if retried else ""
-    if not latencies:
-        return False, 0, "All canaries failed" + note + ": " + "; ".join(results)
-
-    best = min(latencies)
-    if best > max_latency_ms:
-        return False, best, f"High latency (best {best:.0f}ms > {max_latency_ms}ms){note}: " + "; ".join(results)
-
-    return True, best, f"OK (best {best:.0f}ms): " + "; ".join(results)
+    if not answered:
+        return False, 0, "All canaries failed" + note + ": " + listed_bad
+    if len(bad) * 100 >= TUNNEL_FAIL_PCT * len(counted):
+        return False, med, (f"Degraded (bad {len(bad)} of {len(counted)} domains, median {med:.0f}ms){note}: " + listed_bad)
+    return True, med, f"OK (median {med:.0f}ms, bad {len(bad)} of {len(counted)} domains)" + (f": {listed_bad}" if bad else "")
 
 
 def tunnel_services(client, code):
@@ -1120,16 +1338,45 @@ def tunnel_services(client, code):
     return items
 
 
-def failover_target(key, empty_code, tunnels):
-    """The best tunnel with nodes for a service leaving an empty one: working, faster, more nodes."""
+def failover_target(key, exclude, tunnels):
+    """The best tunnel with nodes for a service leaving `exclude` (a code or a set of them): working, the lowest
+    quality score of its domains, more nodes."""
+    exclude = {exclude} if isinstance(exclude, str) else set(exclude)
     blocked = blocked_tunnel(key)
-    usable = [t for t in tunnels if t.get("activeNum", 0) > 0 and t.get("tunnelCode") not in (empty_code, blocked)]
+    usable = [t for t in tunnels if t.get("activeNum", 0) > 0 and t.get("tunnelCode") not in exclude | {blocked}]
 
     def rank(t):
         st = STATUS["tunnels"].get(t["tunnelCode"]) or {}
         known = st.get("latency") and not st.get("unchecked")
-        return (not st.get("healthy", True), st["latency"] if known else 10 ** 6, -t.get("activeNum", 0))
+        score = TUNNEL_Q.get(t["tunnelCode"]) if known else None
+        return (not st.get("healthy", True), score if score is not None else 10 ** 6, -t.get("activeNum", 0))
     return min(usable, key=rank)["tunnelCode"] if usable else None
+
+
+def mark_moved(key):
+    """Starts the hold-down: the service stays where it is for HOLD_DOWN seconds."""
+    with STATE_LOCK:
+        AUTO_STATE["moved_at"][key] = time.time()
+
+
+def held(key, dead=False):
+    """In hold-down after a move. A service that doesn't answer at all isn't held."""
+    return not dead and time.time() - AUTO_STATE["moved_at"].get(key, 0) < HOLD_DOWN
+
+
+def return_wait(key):
+    """How long the preferred tunnel must be green before the service returns. A service that had to leave
+    again soon after a return waits twice as long each time (up to an hour), so it doesn't bounce."""
+    r = AUTO_STATE["returned"].get(key)
+    if r and time.time() - r["at"] < 1800:
+        return min(max(r.get("wait", 0), PREFERRED_RETURN_AFTER) * 2, 3600)
+    return PREFERRED_RETURN_AFTER
+
+
+def note_evacuated(key, from_code, to_code):
+    """A preferred service left its tunnel: remembers it so it comes back. Under STATE_LOCK."""
+    AUTO_STATE["evacuated"][key] = {"from": from_code, "to": to_code, "since": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "at": time.time(), "wait": return_wait(key)}
 
 
 def wait_for_nodes(client, code, seconds):
@@ -1144,48 +1391,59 @@ def wait_for_nodes(client, code, seconds):
         time.sleep(5)
 
 
-def evacuate(client, code, only=None, reason=""):
-    """Moves services (all, or only the given keys) out of a tunnel without nodes. Returns the moved keys."""
+def evacuate(client, code, only=None, reason="", why="нет нод", mail="no_nodes"):
+    """Moves services (all, or only the given keys) out of a tunnel without nodes or failing its checks.
+    Returns what moved where, as "name → CODE"."""
     prev = ACTIONS.get(code)
-    set_action(code, "Перенос сервисов в туннели с нодами…")
+    set_action(code, "Перенос сервисов в работающие туннели…")
     try:
         with MOVE_LOCK:
-            return _evacuate(client, code, only, reason)
+            return _evacuate(client, code, only, reason, why, mail)
     finally:
         set_action(code, prev and prev["text"])
 
 
-def _evacuate(client, code, only, reason):
+def _evacuate(client, code, only, reason, why, mail):
     tunnels = client.list_tunnels()
-    moved, failed = [], []
+    prefs = preferred_tunnels()
+    moved, failed, kept = [], [], []
     for key, move_to in tunnel_services(client, code):
         if only is not None and key not in only:
             continue
+        name = key.split(":", 1)[1]
+        if service_mode(key) == "manual":
+            kept.append(name)  # Never moved by the watchdog
+            continue
         target = failover_target(key, code, tunnels)
         if target is None:
-            failed.append(key.split(":", 1)[1])
+            failed.append(name)
             continue
         if move_to(target):
+            mark_moved(key)
             with STATE_LOCK:
-                first = AUTO_STATE["evacuated"].get(key, {}).get("from", code)  # Moved twice: return to the first one
-                AUTO_STATE["evacuated"][key] = {"from": first, "to": target, "since": time.strftime("%Y-%m-%d %H:%M:%S")}
+                # Only a preferred service comes back; auto and sticky ones stay where they landed
+                if key in prefs:
+                    note_evacuated(key, prefs[key], target)
                 AUTO_STATE["probation"].pop(key, None)  # Not auto mode's doing: nothing to roll back
-            moved.append(f"{key.split(':', 1)[1]} → {target}")
+            moved.append(f"{name} → {target}")
         else:
-            failed.append(key.split(":", 1)[1])
+            failed.append(name)
     # Services that can't go anywhere are reported once per outage, not on every retry
-    if failed and not moved and set(failed) <= EVAC_NOTIFIED.get(code, set()):
+    if (failed or kept) and not moved and set(failed + kept) <= EVAC_NOTIFIED.get(code, set()):
         return moved
-    EVAC_NOTIFIED[code] = EVAC_NOTIFIED.get(code, set()) | set(failed)
-    if moved or failed:
+    EVAC_NOTIFIED[code] = EVAC_NOTIFIED.get(code, set()) | set(failed + kept)
+    if moved or failed or kept:
         save_auto_state()
-        text = f"{code}: нет нод{reason}. " + (f"Переехали: {', '.join(moved)}" if moved else "") \
-            + (f"{'. ' if moved else ''}Не удалось перенести: {', '.join(failed)}" if failed else "")
+        parts = ([f"Переехали: {', '.join(moved)}"] if moved else []) \
+            + ([f"Не удалось перенести: {', '.join(failed)}"] if failed else []) \
+            + ([f"Остаются («Вручную»): {', '.join(kept)}"] if kept else [])
+        text = f"{code}: {why}{reason}. " + ". ".join(parts)
         logger.warning(text)
-        log_event("bad" if failed else "warn", text)
-        notify("no_nodes", f"[Deeper Connect] В туннеле {COUNTRY_NAMES.get(code, code)} нет нод", text + "\n")
-        client.get_routed_domains()
-        client.refresh_apps_cache()
+        log_event("bad" if failed or kept else "warn", text)
+        notify(mail, f"[Deeper Connect] {COUNTRY_NAMES.get(code, code)}: {why}", text + "\n")
+        if moved:
+            client.get_routed_domains()
+            client.refresh_apps_cache()
     return moved
 
 
@@ -1207,58 +1465,26 @@ def failover_empty_tunnels(client, tunnels):
             set_action(code)
 
 
-def return_evacuated(client):
-    """Brings services back to their tunnel once it has nodes again and its check passes."""
-    if not FAILOVER_RETURN or not AUTO_STATE["evacuated"]:
-        return
-    with MOVE_LOCK:
-        _return_evacuated(client)
-
-
-def _return_evacuated(client):
-    nodes = {t.get("tunnelCode"): t.get("activeNum", 0) for t in client.list_tunnels()}
-    prefs = preferred_tunnels()
-    # A tunnel removed from Deeper never gets nodes again: its services stay where they are now
-    gone = [(k, e) for k, e in AUTO_STATE["evacuated"].items() if nodes and e["from"] not in nodes and k not in prefs]
-    for key, e in gone:
-        AUTO_STATE["evacuated"].pop(key, None)
-        log_event("info", f"{key.split(':', 1)[1]}: туннеля {e['from']} больше нет в Deeper, остаётся в {e['to']}")
-    if gone:
-        save_auto_state()
-    due = [(k, e) for k, e in AUTO_STATE["evacuated"].items() if k not in prefs  # Those go back in enforce_preferred
-           and nodes.get(e["from"], 0) > 0 and (STATUS["tunnels"].get(e["from"]) or {}).get("healthy", True)]
-    if not due:
-        return
-    rules = [{"domain": i.get("domainName"), "tunnel": i.get("tunnelCode")} for i in client.get_whitelist_domains()]
-    groups = {g["key"]: g for g in service_groups(rules)}
-    apps = client.get_apps() if any(k.startswith("app:") for k, _ in due) else {}
-    for key, e in due:
-        name = key.split(":", 1)[1]
-        group = groups.get(key)
-        now_in = (apps.get(name) or {}).get("tunnel") if key.startswith("app:") else group and group["main"]
-        if now_in != e["to"]:
-            AUTO_STATE["evacuated"].pop(key, None)  # Moved by hand or by auto mode meanwhile: leave it be
-            continue
-        if key.startswith("app:"):
-            ok = client.set_app_tunnel(name, e["from"])
-        else:
-            ok = group_mover(client, group)[0](e["from"])
-        if ok:
-            AUTO_STATE["evacuated"].pop(key, None)
-            logger.info(f"{name} вернулся в {e['from']}: там снова есть ноды")
-            log_event("ok", f"{name}: вернулся из {e['to']} в {e['from']}, там снова есть ноды", mail="nodes_back")
-    save_auto_state()
-    client.get_routed_domains()
-
-
 PIN_RETRY = 300  # Seconds before retrying a move back to the preferred tunnel that Deeper refused
 PIN_FAILED = {}  # key -> time of the last refused move back
 
 
-def enforce_preferred(client, ready, only=None):
-    """Services with a preferred tunnel go back to it as soon as it has nodes (`ready`: tunnel codes with
-    nodes), whoever moved them away: a failover, a comparison that couldn't restore, Deeper's own app."""
-    prefs = {k: c for k, c in preferred_tunnels().items() if c in ready and (only is None or k in only)}
+def enforce_preferred(client, green_since, only=None):
+    """Services with a preferred tunnel go back to it, whoever moved them away: a failover, a comparison that
+    couldn't restore, Deeper's own app. `green_since`: code -> since when the tunnel has nodes and passes its
+    checks. A service that left a failing tunnel returns once it has been green for return_wait() seconds
+    since it left; one moved away otherwise, after NODES_STABLE seconds."""
+    now, prefs = time.time(), {}
+    for k, c in preferred_tunnels().items():
+        if c not in green_since or (only is not None and k not in only):
+            continue
+        evac = AUTO_STATE["evacuated"].get(k)
+        if evac and evac.get("from") == c:
+            ready = now - max(green_since[c], evac.get("at", 0)) >= evac.get("wait", PREFERRED_RETURN_AFTER)
+        else:
+            ready = now - green_since[c] >= NODES_STABLE
+        if ready:
+            prefs[k] = c
     if not prefs or COMPARE["running"]:
         return
     with MOVE_LOCK:
@@ -1288,11 +1514,14 @@ def _enforce_preferred(client, prefs):
         evac = AUTO_STATE["evacuated"].get(key)
         if move():
             PIN_FAILED.pop(key, None)
+            mark_moved(key)
             with STATE_LOCK:
                 AUTO_STATE["evacuated"].pop(key, None)
+                if evac and evac.get("from") == code:
+                    AUTO_STATE["returned"][key] = {"at": time.time(), "wait": evac.get("wait", PREFERRED_RETURN_AFTER)}
             changed = True
             logger.info(f"{name}: {cur} -> предпочтительный туннель {code}")
-            log_event("ok", f"{name}: вернулся из {cur} в {code}, там снова есть ноды" if evac and evac.get("from") == code
+            log_event("ok", f"{name}: вернулся из {cur} в {code}, он в норме {span(evac.get('wait', 0))}" if evac and evac.get("from") == code
                       else f"{name}: перенесён из {cur} в предпочтительный туннель {code}", mail="nodes_back")
         else:
             PIN_FAILED[key] = time.time()
@@ -1375,52 +1604,54 @@ def fmt_ms(ms):
 
 
 def measure_site(url, samples):
-    """Measures a site several times in a row. Returns (median_ms or None if any attempt failed, last_status)."""
-    lats, status = [], None
-    for _ in range(samples):
-        lat, status = test_url_latency(url, timeout=LATENCY_TIMEOUT)
-        if lat is None:
-            return None, status
-        lats.append(lat)
-    return sorted(lats)[len(lats) // 2], status
+    """Probes a site several times in a row. Returns (median ms of the answers or None, a status, loss 0..1)."""
+    probes = [probe_url(url, timeout=LATENCY_TIMEOUT) for _ in range(samples)]
+    answered = sorted(p[0] + p[1] for p in probes if p[0] is not None)
+    status = next((p[2] for p in probes if p[0] is not None), probes[-1][2])
+    return (answered[len(answered) // 2] if answered else None), status, 1 - len(answered) / len(probes)
 
 
 def pick_better_tunnel(pings, original):
-    """Returns a tunnel noticeably faster than the original one, or None."""
+    """Returns a tunnel whose quality score beats the original one's by the hysteresis margin
+    (AUTO_MIN_GAIN_PCT and AUTO_MIN_GAIN_MS), or None: a small gain isn't worth breaking sessions."""
     base = pings.get(original, {})
-    base_ms, base_status = base.get("ms"), base.get("status")
+    base_q, base_status = base.get("q"), base.get("status")
 
     def usable(p):
         # An HTTP error that the original tunnel didn't have usually means a geo-block
         geo_blocked = isinstance(p["status"], int) and p["status"] >= 400 and isinstance(base_status, int) and base_status < 400
-        return p["ms"] is not None and not geo_blocked
+        return p.get("q") is not None and not geo_blocked
 
     candidates = [t for t, p in pings.items() if t != original and usable(p)]
     if not candidates:
         return None
-    best = min(candidates, key=lambda t: pings[t]["ms"])
-    best_ms = pings[best]["ms"]
-    if base_ms is None:
+    best = min(candidates, key=lambda t: pings[t]["q"])
+    best_q = pings[best]["q"]
+    if base_q is None:
         return best
-    if best_ms <= base_ms * (1 - AUTO_MIN_GAIN_PCT / 100) and base_ms - best_ms >= AUTO_MIN_GAIN_MS:
+    if best_q <= base_q * (1 - AUTO_MIN_GAIN_PCT / 100) and base_q - best_q >= AUTO_MIN_GAIN_MS:
         return best
     return None
 
 
 def measure_urls(urls, samples):
-    """Measures several URLs of one service at once.
-    Returns (average of the answering ones or None, a status, how many answered)."""
-    with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+    """Measures several URLs of one service at once. Returns {"ms": average ping of the answering ones or None,
+    "q": quality score (lower is better) or None, "loss", "status", "answered", "total"}."""
+    with ThreadPoolExecutor(max_workers=max(1, len(urls))) as pool:
         results = list(pool.map(lambda u: measure_site(u, samples), urls))
-    answered = [ms for ms, _ in results if ms is not None]
-    status = next((st for ms, st in results if ms is not None), results[0][1] if results else None)
-    return (sum(answered) / len(answered) if answered else None), status, len(answered)
+    answered = [(u, r) for u, r in zip(urls, results) if r[0] is not None]
+    status = answered[0][1][1] if answered else (results[0][1] if results else None)
+    ms = sum(r[0] for _, r in answered) / len(answered) if answered else None
+    loss = sum(r[2] for r in results) / len(results) if results else 1
+    errors = sum(penalized(host_of(u), r[1]) for u, r in answered) / len(answered) if answered else 0
+    q = None if ms is None else ms + LOSS_PENALTY_MS * loss + ERROR_PENALTY_MS * errors
+    return {"ms": ms, "q": q, "loss": loss, "status": status, "answered": len(answered), "total": len(urls)}
 
 
 def fastest_tunnel(pings):
-    """The tunnel where most of the service answers, and among those the lowest average ping."""
-    usable = [t for t, p in pings.items() if p["ms"] is not None]
-    return min(usable, key=lambda t: (-pings[t].get("answered", 1), pings[t]["ms"])) if usable else None
+    """The tunnel where most of the service answers, and among those the best quality score."""
+    usable = [t for t, p in pings.items() if p.get("q") is not None]
+    return min(usable, key=lambda t: (-pings[t].get("answered", 1), pings[t]["q"])) if usable else None
 
 
 def finish_item(key, base, split, pings, error, auto, urls, move_to, restore, moved):
@@ -1443,6 +1674,8 @@ def finish_item(key, base, split, pings, error, auto, urls, move_to, restore, mo
             target = recommended or base
             if move_to(target):
                 final = target
+                if target != base:
+                    mark_moved(key)
             elif not restore():
                 error = "не удалось вернуть маршрут"
         elif moved:
@@ -1499,7 +1732,7 @@ def compare_routes(client, keys):
     if MONITOR_TUNNELS:
         tunnels = [t for t in tunnels if t in MONITOR_TUNNELS]
 
-    auto = auto_route_domains() | auto_group_keys(groups.values())
+    auto = auto_keys(groups.values())
 
     jobs = {}
     for key, g in groups.items():
@@ -1528,11 +1761,12 @@ def compare_routes(client, keys):
     def measure(key, tunnel):
         urls = jobs[key][2]
         try:
-            ms, status, answered = measure_urls(urls, COMPARE_SAMPLES)
+            m = measure_urls(urls, COMPARE_SAMPLES)
         except Exception as e:
-            ms, status, answered = None, str(e), 0
-        logger.info(f"Сравнение {key} через {tunnel}: {fmt_ms(ms)} в среднем, ответили {answered} из {len(urls)} ({status})")
-        pings[key][tunnel] = {"ms": ms, "status": status, "answered": answered, "total": len(urls)}
+            m = {"ms": None, "q": None, "loss": 1, "status": str(e), "answered": 0, "total": len(urls)}
+        logger.info(f"Сравнение {key} через {tunnel}: {fmt_ms(m['ms'])} в среднем, Q {m['q'] or 0:.0f}, потери {m['loss']:.0%}, "
+                    f"ответили {m['answered']} из {len(urls)} ({m['status']})")
+        pings[key][tunnel] = m
 
     def measure_all(keys, tunnel_of):
         # All at once: a few small requests per service, so they don't get in each other's way
@@ -1576,24 +1810,121 @@ def compare_routes(client, keys):
     client.refresh_apps_cache()
 
 
-def measure_services():
-    """Pings the main domain of every service once, for its status on the overview.
-    Not on every check: it doesn't affect tunnel health and would only make checks longer."""
-    if time.time() - SERVICES_MEASURED["at"] < SERVICES_EVERY:
+def degraded(r):
+    """A service (its state from service_results) works badly in its tunnel: loss above SERVICE_LOSS_PCT,
+    SERVICE_TIMEOUTS checks in a row without an answer, most of its domains answering with an error status
+    (whatever the latency: the tunnel doesn't work for it), or a smoothed score worse than the latency limit."""
+    return r["loss"] * 100 > SERVICE_LOSS_PCT or r["fails"] >= SERVICE_TIMEOUTS or r.get("errors", 0) * 2 > 1 \
+        or r["q"] > MAX_LATENCY_MS
+
+
+def summarize(name, tunnel, url, recs):
+    answered = [r for r in recs if r["lat"] is not None]
+    return {"name": name, "tunnel": tunnel, "url": url,
+            "latency": sum(r["lat"] for r in answered) / len(answered) if answered else None,
+            "status": (answered or recs)[0]["status"], "ok": bool(answered),
+            "q": sum(r["q"] for r in recs) / len(recs), "loss": sum(r["loss"] for r in recs) / len(recs),
+            "fails": min(r["fails"] for r in recs), "errors": sum(r["error"] for r in recs) / len(recs)}
+
+
+def service_results(since):
+    """Every service's state from the probes of all its domains in their tunnels since `since`, and the same for
+    the configured apps by their website: {key: {name, tunnel, url, latency, status, ok, q, loss, fails}}."""
+    result = {}
+    for g in service_groups(ROUTES["whitelist"]):
+        recs = [QUALITY.get(f"{d['tunnel']} {d['domain']}") for d in g["domains"]]
+        recs = [r for r in recs if r and r["at"] >= since]
+        counted = [r for r in recs if host_known(host_of(r["url"]))]
+        if recs:
+            # A service none of whose domains has answered anywhere lately: nothing to judge it by
+            result[g["key"]] = dict(summarize(g["name"], "split" if g["split"] else g["main"],
+                                              f"https://{g['domains'][0]['domain']}", counted or recs), silent=not counted)
+    for a in ROUTES["apps"]:
+        r = QUALITY.get(f"{a['tunnel'] or 'ZZ'} {host_of(a['website'] or '')}")
+        if a["website"] and r and r["at"] >= since:
+            result["app:" + a["app"]] = dict(summarize(a["app"], a["tunnel"], a["website"], [r]),
+                                             silent=not host_known(host_of(r["url"])))
+    return result
+
+
+MANUAL_ALERTED = set()  # Manual-mode services already reported as not working
+
+
+def why_bad(r):
+    return ("не отвечает" if not r["ok"] else f"потери {r['loss']:.0%}" if r["loss"] * 100 > SERVICE_LOSS_PCT
+            else f"ошибка {r['status']}" if r.get("errors", 0) * 2 > 1 else f"медленно, {fmt_ms(r['latency'])}")
+
+
+def decide_services(client, current):
+    """Per-service decisions after a check. Sticky and preferred services leave a tunnel where they work badly
+    for the best working one (sticky ones stay there, preferred ones come back in enforce_preferred); manual ones
+    are only reported. Auto ones are compared and moved by gain_compare. `current`: service_results()."""
+    now, todo = time.time(), []
+    for key, r in current.items():
+        mode = service_mode(key)
+        if mode == "auto" or r["silent"] or r["tunnel"] in (None, "split", "ZZ", "LL"):
+            continue
+        bad = degraded(r)
+        name = key.split(":", 1)[1]
+        if mode == "manual":
+            if bad and key not in MANUAL_ALERTED:
+                MANUAL_ALERTED.add(key)
+                log_event("bad", f"{name} («Вручную»): в {r['tunnel']} {why_bad(r)}, сам не переносится", mail="service")
+            elif not bad and key in MANUAL_ALERTED:
+                MANUAL_ALERTED.discard(key)
+                log_event("ok", f"{name} («Вручную»): в {r['tunnel']} снова работает, {fmt_ms(r['latency'])}", mail="service")
+            continue
+        recent = [t for t in AUTO_STATE["failovers"].get(key, []) if now - t < 3600]
+        if bad and not held(key, dead=not r["ok"]) and len(recent) < FAILOVER_LIMIT:
+            todo.append((key, r, mode))
+        elif bad and len(recent) >= FAILOVER_LIMIT and key not in MANUAL_ALERTED:
+            MANUAL_ALERTED.add(key)  # Bad in every tunnel it tried: likely the site itself
+            log_event("bad", f"{name}: за час сменил туннель {len(recent)} раза и везде {why_bad(r)}. "
+                             f"Похоже, не работает сам сервис: остаётся в {r['tunnel']}", mail="failover")
+        elif not bad:
+            MANUAL_ALERTED.discard(key)
+    if not todo:
         return
-    SERVICES_MEASURED["at"] = time.time()
-    groups = service_groups(ROUTES["whitelist"])
-    if not groups:
-        SERVICE_RESULTS.clear()
-        return
-    urls = [f"https://{g['domains'][0]['domain']}" for g in groups]
-    with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
-        measured = best_of(*[list(pool.map(lambda u: test_url_latency(u, timeout=LATENCY_TIMEOUT), urls))
-                             for _ in range(2)])
-    SERVICE_RESULTS.clear()
-    for g, u, (lat, status) in zip(groups, urls, measured):
-        SERVICE_RESULTS[g["key"]] = {"name": g["name"], "tunnel": "split" if g["split"] else g["main"], "url": u,
-                                     "latency": lat, "status": status, "ok": lat is not None}
+    with MOVE_LOCK:
+        tunnels = client.list_tunnels()
+        movers = service_movers(client)
+        for key, r, mode in todo:
+            name = key.split(":", 1)[1]
+            cur, move_to = movers.get(key, (None, None))
+            if move_to is None or cur != r["tunnel"]:
+                continue  # Moved meanwhile
+            target = failover_target(key, {cur} | ({mode} if mode != "sticky" else set()), tunnels)
+            if target is None:
+                continue
+            if not move_to(target):
+                log_event("bad", f"{name}: в {cur} {why_bad(r)}, но перенести в {target} не удалось", mail="failover")
+                continue
+            mark_moved(key)
+            with STATE_LOCK:
+                AUTO_STATE["failovers"][key] = [t for t in AUTO_STATE["failovers"].get(key, []) if now - t < 3600] + [now]
+                AUTO_STATE["probation"].pop(key, None)
+                if mode != "sticky":
+                    note_evacuated(key, mode, target)
+            wait = AUTO_STATE["evacuated"].get(key, {}).get("wait", PREFERRED_RETURN_AFTER)
+            text = f"{name}: в {cur} {why_bad(r)}, переехал в {target}" + (
+                " и останется там, пока там работает" if mode == "sticky"
+                else f", вернётся в {mode}, когда он {span(wait)} подряд будет в норме")
+            logger.warning(text)
+            log_event("warn", text, mail="failover")
+        save_auto_state()
+        client.get_routed_domains()
+        client.refresh_apps_cache()
+
+
+def service_movers(client):
+    """key -> (current tunnel or "split", move_to(tunnel)) for every service and configured app."""
+    rules = [{"domain": i.get("domainName"), "tunnel": i.get("tunnelCode")} for i in client.get_whitelist_domains()]
+    movers = {g["key"]: ("split" if g["split"] else g["main"], group_mover(client, g)[0]) for g in service_groups(rules)}
+    apps = client.get_apps()
+    for a in configured_apps():
+        if a in apps:
+            movers["app:" + a] = (apps[a].get("tunnel"), lambda t, a=a: client.set_app_tunnel(a, t))
+    return movers
 
 
 def start_probation(key, previous, new, urls):
@@ -1620,7 +1951,8 @@ def check_probation(client):
         return
     nodes = {t.get("tunnelCode"): t.get("activeNum", 0) for t in client.list_tunnels()}
     for key, p in list(probation.items()):
-        ms, status, answered = measure_urls(p["urls"], 1)
+        m = measure_urls(p["urls"], 1)
+        ms, status = m["ms"], m["status"]
         bad = ms is None or ms > MAX_LATENCY_MS
         p["bad"], p["good"] = (p["bad"] + 1, 0) if bad else (0, p["good"] + 1)
         name = key.split(":", 1)[1]
@@ -1667,9 +1999,7 @@ def scheduled_compare():
         due -= 86400
     if scheduled_last() >= due:
         return
-    groups = service_groups(ROUTES["whitelist"])
-    auto = auto_route_domains()
-    keys = sorted(auto_group_keys(groups) | {k for k in auto if k.startswith("app:") and k[4:] in configured_apps()})
+    keys = sorted(auto_keys(service_groups(ROUTES["whitelist"])))
     if keys and not start_compare(keys):
         return
     late = time.time() - due > 3 * 3600
@@ -1694,54 +2024,57 @@ def scheduled_last():
 
 
 GAIN_TRIED = {}  # auto-mode service -> when a comparison was last started because another tunnel looked faster
+BAD_TRIED = {}  # auto-mode service -> times of comparisons started within the hour because it worked badly
 
 
 def gain_compare():
-    """After a check: an auto-mode service whose ping is worse than another working tunnel's by the auto-move
-    thresholds, slower than MAX_LATENCY_MS or not answering is compared right away instead of waiting for the
-    daily comparison (its tunnel can be healthy: the tunnel only fails when all of its sites are slow).
-    The comparison measures the service itself in every tunnel and moves it only if that is really faster."""
-    if not AUTO_GAIN_RECHECK or COMPARE["running"] or STATUS.get("all_slow"):
+    """After a check: an auto-mode service that works badly in its tunnel (degraded()), or whose quality score is
+    worse than another working tunnel's by the hysteresis margin, is compared right away instead of waiting for
+    the daily comparison (its tunnel can be healthy: the tunnel only fails when most of its domains are bad).
+    The comparison measures the service itself in every tunnel and moves it only if that is really better.
+    A service is left alone for HOLD_DOWN seconds after a move, unless it stops answering at all."""
+    if COMPARE["running"] or STATUS.get("all_slow"):
         return
-    tunnels = {c: s["latency"] for c, s in STATUS["tunnels"].items()
-               if s.get("healthy") and not s.get("unchecked") and s.get("pool") and s.get("latency")}
-    if len(tunnels) < 2:
-        return
-    groups = service_groups(ROUTES["whitelist"])
-    current = {k: (r["tunnel"], r["latency"]) for k, r in SERVICE_RESULTS.items()}
-    current.update({"app:" + a: (r["tunnel"], r["latency"]) for a, r in APP_RESULTS.items()})
-    keys = auto_group_keys(groups) | {k for k in auto_route_domains() if k.startswith("app:") and k[4:] in configured_apps()}
+    with_nodes = {c for c, s in STATUS["tunnels"].items() if s.get("pool")}
+    scores = {c: TUNNEL_Q[c] for c, s in STATUS["tunnels"].items()
+              if s.get("healthy") and not s.get("unchecked") and s.get("pool") and TUNNEL_Q.get(c) is not None}
+    current = service_results(0)
     now, todo, why = time.time(), [], []
-    for k in sorted(keys):
-        if k not in current or k in AUTO_STATE.get("probation", {}) or now - GAIN_TRIED.get(k, 0) < AUTO_GAIN_RECHECK * 60:
+    for k in sorted(auto_keys(service_groups(ROUTES["whitelist"]))):
+        r = current.get(k)
+        if not r or r["silent"] or r["tunnel"] in (None, "split") or k in AUTO_STATE["probation"] or held(k, dead=not r["ok"]):
             continue
-        tunnel, lat = current[k]
-        others = {c: l for c, l in tunnels.items() if c != tunnel}
-        if not others or tunnel == "split":
+        others = {c: q for c, q in scores.items() if c != r["tunnel"]}
+        best = min(others, key=others.get) if others else None
+        bad_tries = [t for t in BAD_TRIED.get(k, []) if now - t < 3600]
+        if degraded(r) and with_nodes - {r["tunnel"]}:
+            if len(bad_tries) >= FAILOVER_LIMIT:
+                continue  # Compared that often within the hour and still bad: likely the site itself
+            BAD_TRIED[k] = bad_tries
+            wait, reason = HOLD_DOWN, why_bad(r)
+        elif best and AUTO_GAIN_RECHECK and r["q"] - others[best] >= AUTO_MIN_GAIN_MS \
+                and (r["q"] - others[best]) * 100 >= AUTO_MIN_GAIN_PCT * r["q"]:
+            wait, reason = AUTO_GAIN_RECHECK * 60, f"Q {r['q']:.0f}, в {best} Q {others[best]:.0f}"
+        else:
             continue
-        best = min(others, key=others.get)
-        if lat is None or lat > MAX_LATENCY_MS or (lat - others[best] >= AUTO_MIN_GAIN_MS and (lat - others[best]) * 100 >= AUTO_MIN_GAIN_PCT * lat):
+        if now - GAIN_TRIED.get(k, 0) >= wait:
             todo.append(k)
-            why.append(f"{k.split(':', 1)[1]} ({tunnel} {fmt_ms(lat) if lat else 'нет ответа'}"
-                       f"{' — медленно' if lat and lat > MAX_LATENCY_MS else ''}, {best} {fmt_ms(others[best])})")
+            why.append(f"{k.split(':', 1)[1]} ({r['tunnel']}: {reason})")
     if todo and start_compare(todo):
         for k in todo:
             GAIN_TRIED[k] = now
-        logger.info(f"Авторежим: другой туннель быстрее, сравниваю: {', '.join(why)}")
-        log_event("info", f"Авто: сервис медленный или в другом туннеле быстрее, сравниваю: {', '.join(why)}")
-
-
-def auto_group_keys(groups):
-    """Services in auto mode: "group:<name>", or (older settings) any domain of the group."""
-    auto = auto_route_domains()
-    return {g["key"] for g in groups if g["key"] in auto or any(d["domain"] in auto for d in g["domains"])}
+            if k in BAD_TRIED:
+                BAD_TRIED[k].append(now)
+        logger.info(f"Авторежим: сравниваю {', '.join(why)}")
+        log_event("info", f"Авто: сервис работает плохо или в другом туннеле лучше, сравниваю: {', '.join(why)}")
 
 
 def unite_auto_groups():
     """Starts a comparison for auto-mode services whose domains ended up in different countries:
-    it measures them and puts every domain where the average ping is lowest."""
-    split = sorted(g["key"] for g in service_groups(ROUTES["whitelist"])
-                   if g["split"] and g["key"] in auto_group_keys([g]))
+    it measures them and puts every domain where the quality is best."""
+    groups = service_groups(ROUTES["whitelist"])
+    auto = auto_keys(groups)
+    split = sorted(g["key"] for g in groups if g["split"] and g["key"] in auto)
     if split and start_compare(split):
         logger.info(f"Авторежим: домены в разных странах, собираю: {', '.join(k[6:] for k in split)}")
 
@@ -1770,59 +2103,85 @@ def start_compare(domains):
     return True
 
 
+SWITCHES = {}  # code -> node switches done in the current outage
+REBUILD_SPACING = 600  # Seconds between any two automatic rebuilds: Deeper rebuilds tunnels slowly
+REBUILD_LOCK = threading.Lock()  # One automatic rebuild at a time: a rebuilt tunnel takes long to get its nodes
+
+
+def movable_services(client, code):
+    """Services in the tunnel the watchdog may move away (all but manual ones)."""
+    return [k for k, _ in tunnel_services(client, code) if service_mode(k) != "manual"]
+
+
+def rebuild_blocker(client, code, tunnels=None):
+    """Why the tunnel mustn't be rebuilt now, or None. A rebuild drops every node and takes long to get them back,
+    so it is the last resort: only with nothing left to cut off (unless there is nowhere to move services to),
+    at most once per REBUILD_EVERY_HOURS per tunnel, one tunnel at a time."""
+    if not REBUILD_ENABLED:
+        return "перестроение выключено в настройках"
+    since = time.time() - AUTO_STATE["rebuilt_at"].get(code, 0)
+    if since < REBUILD_EVERY_HOURS * 3600:
+        return f"перестраивался {span(int(since // 60) * 60 or 60)} назад, не чаще раза в {REBUILD_EVERY_HOURS} ч"
+    if REBUILD_LOCK.locked():
+        return "сейчас перестраивается другой туннель"
+    last = time.time() - max(AUTO_STATE["rebuilt_at"].values(), default=0)
+    if last < REBUILD_SPACING:
+        return f"другой туннель перестраивался {span(int(last // 60) * 60 or 60)} назад, между перестроениями не меньше {span(REBUILD_SPACING)}"
+    tunnels = tunnels if tunnels is not None else client.list_tunnels()
+    elsewhere = any(t.get("activeNum", 0) > 0 and t.get("tunnelCode") != code for t in tunnels)
+    left = movable_services(client, code) if elsewhere else []
+    if left:
+        return f"через него ещё идут сервисы: {', '.join(k.split(':', 1)[1] for k in left)}"
+    return None
+
+
+def rebuild_tunnel(client, code, country, active_ip, active_num):
+    """An automatic rebuild, remembered for the REBUILD_EVERY_HOURS limit. Returns (success, new_ip, new_pool),
+    or None if another one is running."""
+    if not REBUILD_LOCK.acquire(blocking=False):
+        return None
+    try:
+        with STATE_LOCK:
+            AUTO_STATE["rebuilt_at"][code] = time.time()
+        save_auto_state()
+        result = refresh_and_wait(client, code, country, active_ip, active_num)
+        reset_quality(code)
+        return result
+    finally:
+        REBUILD_LOCK.release()
+
+
 def recover_tunnel(client, code, country, active_ip, active_num, canaries, max_latency_ms):
-    """Runs the configured recovery action. Returns (success, new_ip, new_pool, action_taken, steps)."""
-    new_pool = active_num
-    new_ip = "не изменился"
-    success = False
-    steps = []
-    if RECOVERY_ACTION == "smart":
-        # Switch node up to SWITCH_ATTEMPTS times, verifying each one; rebuild if none helps.
-        # Never more switches than other nodes in the pool, so we don't come back to the bad one.
-        current_ip = active_ip
-        attempts = min(SWITCH_ATTEMPTS, max(0, active_num - 1))
-        for n in range(1, attempts + 1):
-            set_action(code, f"Смена ноды {n} из {attempts}…")
-            res = client.switch_node(code, current_ip)
-            logger.info(f"Смена ноды {n}/{attempts}: {res}")
-            if not (isinstance(res, dict) and res.get("success")):
-                steps.append(f"Смена ноды {n}: ошибка ({res})")
-                break
-            time.sleep(VERIFY_PAUSE)
-            match = get_tunnel(client, code) or {}
-            current_ip = match.get("activeIp") or res.get("activeIp") or current_ip
-            if match:
-                live_pool(code, match)
-            set_action(code, f"Проверка новой ноды {current_ip} ({n} из {attempts})…")
-            ok, summary = verify_tunnel(code, canaries, max_latency_ms)
-            steps.append(f"Смена ноды {n}: IP {current_ip}, {summary}")
-            if ok:
-                success, new_ip = True, current_ip
-                new_pool = match.get("activeNum", active_num)
-                action_taken = f"Смена ноды в пуле (помогла попытка {n} из {attempts})"
-                break
-        if not success:
-            reason = "в пуле одна нода" if attempts == 0 else f"смена ноды не помогла (попыток: {len(steps)})"
-            logger.warning(f"Туннель [{code} - {country}]: {reason}, перестроение туннеля...")
-            success, new_ip, new_pool = refresh_and_wait(client, code, country, current_ip, active_num)
-            success = success and bool(new_pool)  # Rebuilt into an empty pool: didn't help
-            action_taken = f"Перестроение туннеля (rebuild tunnel), так как {reason}"
-            steps.append(f"Перестроение туннеля: {'успешно' if success else 'ошибка'}, новый IP {new_ip}")
-    elif RECOVERY_ACTION == "switch" and active_num > 1:
-        set_action(code, "Смена ноды…")
+    """A tunnel that keeps failing after its services left: first a node switch (quick, keeps the pool), up to
+    SWITCH_ATTEMPTS per outage, then a rebuild as the last resort (rebuild_blocker).
+    Returns (success, new_ip, new_pool, action_taken, steps); action_taken is None when nothing could be done now."""
+    done = SWITCHES.get(code, 0)
+    if active_num > 1 and done < SWITCH_ATTEMPTS:
+        SWITCHES[code] = done + 1
+        set_action(code, f"Смена ноды {done + 1} из {SWITCH_ATTEMPTS}…")
         res = client.switch_node(code, active_ip)
-        logger.info(f"Результат switch_node: {res}")
-        action_taken = "Переключение на следующий узел в пуле (switch node)"
-        if isinstance(res, dict) and res.get("success"):
-            success = True
-            new_ip = res.get("activeIp", "новый IP")
-    else:
-        # По умолчанию: полное перестроение пула (refresh/rebuild tunnel)
-        # При этом в веб-интерфейсе Deeper Connect туннель сбрасывается до 0 и строится заново
-        success, new_ip, new_pool = refresh_and_wait(client, code, country, active_ip, active_num)
-        success = success and bool(new_pool)
-        action_taken = "Полный перезапуск и перестроение туннеля (rebuild tunnel)"
-    return success, new_ip, new_pool, action_taken, steps
+        logger.info(f"Смена ноды {done + 1}/{SWITCH_ATTEMPTS}: {res}")
+        action = f"Смена ноды ({done + 1} из {SWITCH_ATTEMPTS})"
+        if not (isinstance(res, dict) and res.get("success")):
+            return False, "не изменился", active_num, action, [f"Deeper не сменил ноду: {res}"]
+        time.sleep(VERIFY_PAUSE)
+        reset_quality(code)
+        match = get_tunnel(client, code) or {}
+        if match:
+            live_pool(code, match)
+        new_ip = match.get("activeIp") or res.get("activeIp") or active_ip
+        set_action(code, f"Проверка новой ноды {new_ip}…")
+        ok, summary = verify_tunnel(code, canaries, max_latency_ms)
+        return ok, new_ip, match.get("activeNum", active_num), action, [f"IP {new_ip}, {summary}"]
+    why = rebuild_blocker(client, code)
+    if why:
+        return False, "не изменился", active_num, None, [why]
+    result = rebuild_tunnel(client, code, country, active_ip, active_num)
+    if result is None:
+        return False, "не изменился", active_num, None, ["сейчас перестраивается другой туннель"]
+    success, new_ip, new_pool = result
+    reason = "в пуле одна нода" if active_num <= 1 else f"смена ноды не помогла (попыток: {done})"
+    return success and bool(new_pool), new_ip, new_pool, f"Перестроение туннеля, так как {reason}", []
 
 
 def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
@@ -1854,6 +2213,10 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
         failover_empty_tunnels(client, tunnels)
     except Exception as e:
         logger.error(f"Ошибка переноса из пустого туннеля: {e}")
+    try:
+        ensure_beacons(client, tunnels)
+    except Exception as e:
+        logger.error(f"Ошибка маячков туннелей: {e}")
     routed_domains = client.get_routed_domains()  # After failover: rules may have moved
 
     # A tunnel added in Deeper joins monitoring by itself, also when the monitored list is set explicitly
@@ -1880,20 +2243,34 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
 
     ROUTES["tunnels"] = [t.get("tunnelCode") for t in active_tunnels]
     SITE_RESULTS.clear()
+    started = time.time()
     # Each test site tests the tunnel its domain goes through right now (Smart Route or App Relocator)
     site_routes = {}
-    for url in test_sites():
-        host = urllib.parse.urlparse(url).hostname
+
+    def route_of(host):
         if host and host not in site_routes:
             try:
                 site_routes[host] = client.get_domain_route(host)
             except Exception:
                 site_routes[host] = None
+        return site_routes.get(host)
+
+    for url in test_sites() + [u for urls in CANARIES.values() for u in urls]:
+        route_of(host_of(url))
+    for code, urls in routed_domains.items():
+        for u in urls:
+            site_routes.setdefault(host_of(u), code)  # A rule's own domain goes through its tunnel
     try:
         apps_now = client.get_apps()
     except Exception:
         apps_now = {}
-    auto_sites = {}
+    # An app's website tests its tunnel only if Deeper routes the website's domain there too
+    app_sites = {}
+    for a in configured_apps():
+        info = apps_now.get(a) or {}
+        if info.get("website") and info.get("tunnel") and route_of(host_of(info["website"])) == info["tunnel"]:
+            app_sites.setdefault(info["tunnel"], []).append(info["website"])
+    ROUTES["site_routes"] = site_routes
     tunnel_status = {}
     fails_before = dict(fails)
     checked = []  # Measured tunnels: (code, country, ip, nodes, test sites, details), recovered after all are measured
@@ -1907,40 +2284,30 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
         if active_num == 0:
             logger.warning(f"  [NO NODES] [{code} - {country}] нет активных нод")
             fails[code] = 0
+            GREEN_SINCE.pop(code, None)
             tunnel_status[code] = {"country": country, "ip": active_ip, "pool": 0, "healthy": False,
                                    "latency": 0, "details": "Нет активных нод", "fails": 0}
             publish_tunnel(code, tunnel_status[code])
             continue
 
-        # Test sites going through this tunnel; without any, older per-tunnel settings or its own domains
-        own = [u for u in test_sites() if site_routes.get(urllib.parse.urlparse(u).hostname) == code]
-        canaries = list(own or CANARIES.get(code) or [])
-        # One site says little: temporary ones top the tunnel up to SITES_PER_TUNNEL
-        if len(canaries) < SITES_PER_TUNNEL:
-            used = {(urllib.parse.urlparse(u).hostname or "").removeprefix("www.") for u in canaries}
-            extra = own_domain_sites(client, code, routed_domains, site_routes, apps_now,
-                                     limit=SITES_PER_TUNNEL - len(canaries), skip=used)
-            if extra:
-                auto_sites[code] = extra
-                canaries += extra
-
-        # Which tunnel each test site really goes through, so the UI can warn about mismatches
-        for ep in canaries:
-            host = urllib.parse.urlparse(ep).hostname
-            if host and host not in site_routes:
-                try:
-                    site_routes[host] = client.get_domain_route(host)
-                except Exception:
-                    site_routes[host] = None
-            if host and site_routes[host] and site_routes[host] != code:
-                logger.warning(f"  Тестовый сайт {host} идёт через {site_routes[host]}, а не через {code}")
-        ROUTES["site_routes"] = site_routes
+        # Every domain going through the tunnel: the user's test sites, older per-tunnel ones, all of its
+        # Smart Route rules and its apps' websites. One per site: www.x and x are the same
+        candidates = [u for u in test_sites() if site_routes.get(host_of(u)) == code] \
+            + [u for u in CANARIES.get(code, []) if site_routes.get(host_of(u)) in (code, None)] \
+            + routed_domains.get(code, []) + app_sites.get(code, [])
+        canaries, hosts = [], set()
+        for u in candidates:
+            h = host_of(u).removeprefix("www.")
+            if h and h not in hosts:
+                hosts.add(h)
+                canaries.append(u)
 
         # Default test sites that all go through other tunnels say nothing about this one (e.g. a new tunnel
         # without any service in it): it isn't failed or rebuilt for their sake
         if not canaries:
-            logger.info(f"  [SKIP] [{code} - {country}] через туннель не идёт ни один тестовый сайт, проверка пропущена")
+            logger.info(f"  [SKIP] [{code} - {country}] через туннель не идёт ни один домен, проверка пропущена")
             fails[code] = 0
+            GREEN_SINCE.setdefault(code, time.time())
             tunnel_status[code] = {"country": country, "ip": active_ip, "pool": active_num, "healthy": True,
                                    "unchecked": True, "latency": 0, "details": "", "fails": 0}
             publish_tunnel(code, tunnel_status[code])
@@ -1951,6 +2318,15 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
             healthy, lat, details = check_tunnel_health(code, canaries=canaries, max_latency_ms=max_latency_ms)
         finally:
             set_action(code)
+        if not LAST_CHECK.get(code, {}).get("counted", 1):
+            # Only domains that don't resolve go through it: nothing to judge the node by
+            logger.info(f"  [SKIP] [{code} - {country}] {details}, проверка пропущена")
+            fails[code] = 0
+            GREEN_SINCE.setdefault(code, time.time())
+            tunnel_status[code] = {"country": country, "ip": active_ip, "pool": active_num, "healthy": True,
+                                   "unchecked": True, "latency": 0, "details": "", "fails": 0}
+            publish_tunnel(code, tunnel_status[code])
+            continue
         was = (STATUS["tunnels"].get(code) or {}).get("healthy")
         if was is True and not healthy:
             log_event("warn", f"{code}: проверка не прошла ({fmt_ms(lat) if lat else 'нет ответа'})", mail="check")
@@ -1959,7 +2335,9 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
         if healthy:
             logger.info(f"  [PASS] [{code} - {country}] (IP: {active_ip}, Pool: {active_num}) -> {details}")
             fails[code] = 0
+            GREEN_SINCE.setdefault(code, time.time())
         else:
+            GREEN_SINCE.pop(code, None)
             # Extra checks (a manual one, nodes coming back) don't bring a recovery closer: fails count
             # at most once per check interval, so FAIL_THRESHOLD means minutes, not seconds
             if time.time() - LAST_FAIL_AT.get(code, 0) >= CHECK_INTERVAL * 0.75:
@@ -1970,8 +2348,9 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
         tunnel_status[code] = {
             "country": country, "ip": active_ip, "pool": active_num,
             "healthy": healthy, "latency": lat, "details": details, "fails": fails.get(code, 0),
-            "sites": [{k: r[k] for k in ("url", "latency", "status")} for r in
-                      (SITE_RESULTS.get(f"{code} {ep}") for ep in canaries) if r],
+            "q": TUNNEL_Q.get(code), **LAST_CHECK.get(code, {}),
+            "sites": [dict({k: r[k] for k in ("url", "latency", "status", "counted")}, beacon=host_of(r["url"]) in beacon_domains())
+                      for r in (SITE_RESULTS.get(f"{code} {ep}") for ep in canaries) if r],
         }
         publish_tunnel(code, tunnel_status[code])
         checked.append((code, country, active_ip, active_num, canaries, details))
@@ -1994,74 +2373,97 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
 
     for code, country, active_ip, active_num, canaries, details in ([] if all_slow else checked):
         healthy = tunnel_status[code]["healthy"]
-        # Trigger recovery on FAIL_THRESHOLD consecutive failed runs
-        if not healthy and fails.get(code, 0) >= FAIL_THRESHOLD:
-            logger.warning(f"Туннель [{code} - {country}] деградировал (сбоев подряд: {fails[code]}). Запуск восстановления...")
-            set_action(code, "Восстановление…")
-            try:
-                success, new_ip, new_pool, action_taken, steps = recover_tunnel(
-                    client, code, country, active_ip, active_num, canaries, max_latency_ms)
-            except Exception as e:
-                logger.error(f"Ошибка восстановления туннеля [{code} - {country}]: {e}")
-                success, new_ip, new_pool, action_taken, steps = False, "не изменился", active_num, f"Ошибка восстановления: {e}", []
-            finally:
-                set_action(code)
-            if new_ip != "не изменился":
-                tunnel_status[code]["ip"] = new_ip
-            tunnel_status[code]["pool"] = new_pool
-
-            tunnel_status[code]["details"] += f" → {action_taken}: {'успешно' if success else 'ошибка'}"
+        if healthy:
+            NO_REBUILD_NOTED.discard(code)
+            SWITCHES.pop(code, None)
+            continue
+        # 1. Services leave the failing tunnel: they work again right away, whatever happens to the tunnel
+        if fails.get(code, 0) >= EVACUATE_AFTER and movable_services(client, code):
+            moved = evacuate(client, code, why="не проходит проверку", mail="failover")
+            if moved:
+                tunnel_status[code]["details"] += f" → сервисы перенесены: {', '.join(moved)}"
+                publish_tunnel(code, tunnel_status[code])
+        if fails.get(code, 0) < FAIL_THRESHOLD:
+            continue
+        # 2. A node switch, 3. a rebuild as the last resort
+        logger.warning(f"Туннель [{code} - {country}] не проходит проверку (сбоев подряд: {fails[code]}), восстановление...")
+        set_action(code, "Восстановление…")
+        try:
+            success, new_ip, new_pool, action_taken, steps = recover_tunnel(
+                client, code, country, active_ip, active_num, canaries, max_latency_ms)
+        except Exception as e:
+            logger.error(f"Ошибка восстановления туннеля [{code} - {country}]: {e}")
+            success, new_ip, new_pool, action_taken, steps = False, "не изменился", active_num, f"Ошибка восстановления: {e}", []
+        finally:
+            set_action(code)
+        if action_taken is None:
+            # Nothing to do now: said once per outage, the next check tries again
+            if code not in NO_REBUILD_NOTED:
+                NO_REBUILD_NOTED.add(code)
+                log_event("warn", f"{code}: не проходит проверку, смена нод не помогла, перестроение отложено: {steps[0]}",
+                          mail="recovery")
+            tunnel_status[code]["details"] += f" → перестроение отложено: {steps[0]}"
             publish_tunnel(code, tunnel_status[code])
-            log_event("ok" if success else "bad",
-                      f"{code}: {action_taken.split(' (')[0].lower()}, {'успешно' if success else 'не помогло'}. IP {active_ip} → {new_ip}")
-            steps_text = "".join(f"  - {s}\n" for s in steps)
-
-            # Send email notification
-            now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-            subject = f"[Deeper Connect] Туннель \"{country}\" перезапущен / перестроен"
-            body = (
-                f"Уведомление Deeper Connect Watchdog\n\n"
-                f"Туннель: {country} ({code})\n"
-                f"Действие: {action_taken}\n"
-                f"Статус: {'Успешно' if success else 'Ошибка'}\n"
-                f"Старый IP: {active_ip}\n"
-                f"Новый IP: {new_ip}\n"
-                f"Размер пула нод: {new_pool}\n"
-                f"Причина: сбоев проверки подряд — {fails[code]} ({details})\n"
-                + (f"Ход восстановления:\n{steps_text}" if steps else "")
-                + f"Время события: {now_str}\n"
-            )
-            notify("recovery", subject, body)
-
+            continue
+        if new_ip != "не изменился":
+            tunnel_status[code]["ip"] = new_ip
+        tunnel_status[code]["pool"] = new_pool
+        tunnel_status[code]["details"] += f" → {action_taken}: {'успешно' if success else 'не помогло'}"
+        publish_tunnel(code, tunnel_status[code])
+        log_event("ok" if success else "bad",
+                  f"{code}: {action_taken.split(' (')[0].lower()}, {'успешно' if success else 'не помогло'}. IP {active_ip} → {new_ip}")
+        steps_text = "".join(f"  - {s}\n" for s in steps)
+        notify("recovery", f"[Deeper Connect] {country}: {action_taken.split(' (')[0].split(',')[0].lower()}",
+               f"Уведомление Deeper Connect Watchdog\n\n"
+               f"Туннель: {country} ({code})\n"
+               f"Действие: {action_taken}\n"
+               f"Статус: {'Успешно' if success else 'Не помогло'}\n"
+               f"Старый IP: {active_ip}\n"
+               f"Новый IP: {new_ip}\n"
+               f"Размер пула нод: {new_pool}\n"
+               f"Причина: сбоев проверки подряд — {fails[code]} ({details})\n"
+               + (f"Ход восстановления:\n{steps_text}" if steps else "")
+               + f"Время события: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        # Didn't help: the next check goes on to the next step instead of counting failures from scratch
+        if success:
             fails[code] = 0
+            SWITCHES.pop(code, None)
 
     STATUS["tunnels"] = tunnel_status
-    ROUTES["auto_sites"] = auto_sites
     record_history(tunnel_status)
 
-    # App Relocator apps: current tunnel and ping via their website
+    # App Relocator apps: current tunnel and quality via their website (already probed if it tests the tunnel)
     try:
         client.refresh_apps_cache(tunnels)
         apps = [a for a in ROUTES["apps"] if a["website"]]
-        if apps:
-            with ThreadPoolExecutor(max_workers=len(apps)) as pool:
-                rounds = [list(pool.map(lambda a: test_url_latency(a["website"], timeout=LATENCY_TIMEOUT), apps))
-                          for _ in range(2)]
-            measured = best_of(*rounds)  # The same way as the tunnels' sites, so the numbers compare
-            APP_RESULTS.clear()
-            for a, (lat, status) in zip(apps, measured):
-                APP_RESULTS[a["app"]] = {"tunnel": a["tunnel"], "latency": lat, "status": status, "ok": lat is not None}
+        todo = [a for a in apps if (QUALITY.get(f"{a['tunnel'] or 'ZZ'} {host_of(a['website'])}") or {}).get("at", 0) < started]
+        probes = probe_all(list(dict.fromkeys(a["website"] for a in todo)))
+        for a in todo:
+            record_quality(a["tunnel"] or "ZZ", a["website"], probes[a["website"]])
+        APP_RESULTS.clear()
+        for a in apps:
+            r = QUALITY.get(f"{a['tunnel'] or 'ZZ'} {host_of(a['website'])}")
+            if r:
+                APP_RESULTS[a["app"]] = {"tunnel": a["tunnel"], "latency": r["lat"], "status": r["status"],
+                                         "ok": r["lat"] is not None, "q": r["q"], "loss": r["loss"]}
     except Exception as e:
         logger.warning(f"Не удалось получить приложения App Relocator: {e}")
 
-    # Rollbacks and returns first, so the service statuses show where services really are
+    # Every service from the probes of all its domains, then what to do about the ones that work badly
+    current = service_results(started)
+    # A tunnel rebuilt in this check starts its history anew: its services keep their last status meanwhile
+    keys = {g["key"] for g in service_groups(ROUTES["whitelist"])}
+    for k in [k for k in SERVICE_RESULTS if k not in keys]:
+        del SERVICE_RESULTS[k]
+    SERVICE_RESULTS.update({k: r for k, r in current.items() if k.startswith("group:")})
     try:
         check_probation(client)
-        return_evacuated(client)
-        enforce_preferred(client, {t.get("tunnelCode") for t in client.list_tunnels() if t.get("activeNum", 0) > 0})
+        if not all_slow:
+            decide_services(client, current)
+        enforce_preferred(client, dict(GREEN_SINCE))
     except Exception as e:
-        logger.error(f"Ошибка проверки автопереносов: {e}")
-    measure_services()
+        logger.error(f"Ошибка решений по сервисам: {e}")
+    save_auto_state()
 
     try:
         state_dir = os.path.dirname(state_file)
@@ -2249,6 +2651,19 @@ a.btn{text-decoration:none}
 .sitelist li{display:flex;align-items:center;gap:8px;font-size:13px;padding:3px 0}
 .sitelist .h{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sitelist .v{font-variant-numeric:tabular-nums;color:var(--muted);font-weight:500}
+.sitelist .via{font-size:11.5px;color:var(--orange-text,var(--muted));white-space:nowrap}
+details.foldlist{margin-top:4px}
+details.foldlist>summary{cursor:pointer;color:var(--accent-text);font-weight:550;font-size:13px;list-style:none;display:inline-flex;align-items:center;gap:4px;padding:3px 0}
+details.foldlist>summary::-webkit-details-marker,details.tgroup>summary::-webkit-details-marker{display:none}
+details.foldlist>summary::after,details.tgroup .chev{content:"";width:6px;height:6px;border:solid currentColor;border-width:0 1.8px 1.8px 0;transform:rotate(-45deg);transition:transform .25s var(--spring);margin-left:2px}
+details.foldlist[open]>summary::after,details.tgroup[open] .chev{transform:rotate(45deg) translate(-2px,-1px)}
+details.foldlist>.sitelist{margin:2px 0 0;padding:0;border-top:0}
+details.tgroup{position:relative}
+details.tgroup+details.tgroup::before{content:"";position:absolute;top:0;left:72px;right:0;border-top:.5px solid var(--sep)}
+details.tgroup>summary{list-style:none;cursor:pointer;-webkit-tap-highlight-color:transparent}
+details.tgroup>summary .tright{display:inline-flex;align-items:center;gap:10px;color:var(--muted);font-weight:600;font-variant-numeric:tabular-nums}
+details.tgroup .chev{display:inline-block;color:var(--muted)}
+details.tgroup>.sitelist{margin:0 16px 0 72px;padding:6px 0 12px}
 .tact{display:flex;align-items:center;gap:10px;margin-top:14px;padding:10px 12px;border-radius:12px;background:var(--accent-soft);color:var(--accent-text);font-size:13px;font-weight:600}
 .tact .sec{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-weight:500}
 .spin{width:16px;height:16px;flex:none;border-radius:50%;border:2.2px solid currentColor;border-right-color:transparent;animation:spin .75s linear infinite}
@@ -2525,12 +2940,12 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
  <div class="grab" aria-hidden="true"></div>
  <div class="sheet-h"><h2 id="routesTitle">Пинг и рекомендации</h2><button class="btn sm primary" id="closeRoutes" type="button">Готово</button></div>
  <div class="sheet-b">
-  <div class="ghead">Тестовые сайты · последняя проверка</div>
+  <div class="ghead">Домены по туннелям · последняя проверка</div>
   <div class="card list" id="rtTests"></div>
   <div class="ghead">Сайты и приложения</div>
   <div class="card" style="padding:14px 16px">
    <div class="small muted">Сравнение меряет все сервисы там, где они сейчас, затем по очереди переносит их все в каждый туннель и меряет разом, а в конце возвращает обратно. Во время сравнения сайты могут подтормаживать.
-   Пинг сервиса считается как средний по его доменам. Справа у каждого сервиса выбирается режим. «Авто»: сервис держится в одной стране и сам переезжает туда, где пинг меньше. Туннель (📌): предпочтительный, сервис всегда в нём; если там пропали ноды, сервис временно переезжает в работающий туннель и обязательно возвращается, когда ноды появятся. «Вручную»: ничего не переносится само, туннель выбирается кнопками рядом с сервисом.</div>
+   Пинг сервиса считается как средний по его доменам. Справа у каждого сервиса выбирается режим. «Авто» (по умолчанию): сервис держится в одной стране и сам переезжает туда, где качество лучше хотя бы на 30%, не чаще раза в 5 минут. «Вручную»: никогда не переносится сам, даже из туннеля без нод, при сбое приходит письмо. «Sticky»: при сбое уходит в лучший работающий туннель и остаётся там, пока тот сам не сломается. Туннель (📌): предпочтительный; при сбое сервис временно уходит и возвращается, когда туннель 5 минут подряд в норме.</div>
    <div class="toolbar">
     <label class="selall"><input type="checkbox" class="check" id="selAll">Выбрать все</label>
     <input class="field" id="rtFilter" type="search" placeholder="Поиск" aria-label="Поиск сайта">
@@ -2571,49 +2986,23 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
 
 <script>
 const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые сайты":["globe","#30b0c7"],"Приложения":["grid","#5856d6"],
- "Восстановление при сбое":["refresh","#ff9500"],"Туннель без нод":["bolt","#ff3b30"],"Сравнение туннелей для сайтов":["chart","#34c759"],
+ "Перестроение туннелей":["refresh","#ff9500"],
  "Резервные копии и перенос":["archive","#8e8e93"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
- {title:"Проверка",fields:[
-  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Туннель не прошёл проверку, если медленнее все его сайты. Медленный сервис с «Авто» сравнивается с другими туннелями сразу"],
-  ["FAIL_THRESHOLD","number","Сбоев подряд до восстановления","Сколько неудачных проверок подряд нужно для восстановления"],
-  ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"],
-  ["LATENCY_TIMEOUT","number","Таймаут запроса, сек","Сколько ждать ответа тестового сайта"],
-  ["MONITOR_TUNNELS","text","Туннели","Коды через запятую, например US,GB,NL. Пусто: все активные"]]},
- {title:"Тестовые сайты",foot:"Каждый сайт сам проверяет тот туннель, через который сейчас идёт его домен: перенесли сервис в другую страну — сайт начнёт проверять её. Пинг туннеля считается как среднее время ответа его сайтов. Если через туннель идёт меньше сайтов из списка, чем «Сайтов на туннель», он добирает сайты своих приложений и домены из Smart Route.",fields:[
-  ["TEST_SITES","canaries"],
-  ["SITES_PER_TUNNEL","number","Сайтов на туннель","Если через туннель идёт меньше сайтов из списка, добавляются временные: сайты его приложений и домены Smart Route. Больше сайтов — точнее пинг"]]},
+ {title:"Проверка",foot:"Каждый туннель проверяется по всем своим доменам, сайтам приложений и маячкам (Википедия, python.org и т. п.), так что проверяется даже туннель без сервисов. Сервис работает плохо, если не отвечает, теряет запросы, отдаёт ошибки или медленнее допустимого пинга: тогда он переезжает туда, где лучше, не чаще раза в 5 минут.",fields:[
+  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сайт медленнее этого считается плохим"],
+  ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"]]},
+ {title:"Тестовые сайты",foot:"Необязательно: туннели и так проверяются по своим доменам. Сайт из списка проверяет тот туннель, через который сейчас идёт его домен.",fields:[
+  ["TEST_SITES","canaries"]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
   ["APPS","text","Приложения","Коды через запятую"]]},
- {title:"Восстановление при сбое",fields:[
-  ["RECOVERY_ACTION","segmented","Действие при сбое","",[["refresh","Перестроить"],["switch","Сменить ноду"],["smart","Smart"]]],
-  ["SWITCH_ATTEMPTS","number","Смен ноды до перестроения","Сколько раз менять ноду, прежде чем перестроить туннель"],
-  ["VERIFY_CHECKS","number","Проверок после смены ноды","Нода хорошая, если успешно больше половины проверок"],
-  ["VERIFY_PAUSE","number","Пауза между проверками, сек","И пауза после смены ноды перед первой проверкой"],
-  ["REBUILD_WAIT","number","Ожидание перестроения, сек","Сколько ждать новый IP после перестроения"],
-  ["SKIP_ALL_SLOW","switch","Не восстанавливать, если медленные все туннели","Если проверку не прошли все туннели сразу, виновата скорее сеть или сам Deeper: смена нод и перестроение только оборвут связь"]]},
- {title:"Туннель без нод",foot:"Число нод проверяется каждые 10 секунд. Сервисы переезжают в работающий туннель с наименьшим пингом.",fields:[
-  ["FAILOVER_EMPTY","switch","Уводить сервисы из туннеля без нод","Если в туннеле 0 нод дольше времени ожидания, все его сервисы и приложения переезжают туда, где ноды есть"],
-  ["FAILOVER_WAIT","number","Ожидание нод, сек","Сколько ждать появления нод, прежде чем переносить"],
-  ["EMPTY_REBUILD_AFTER","number","Перестроить без нод через, сек","Если в туннеле 0 нод дольше этого, он перестраивается. 0: выключено"],
-  ["EMPTY_REBUILD_EVERY","number","Повторять перестроение, сек","Если нод так и нет, следующая попытка не раньше чем через столько"],
-  ["ALL_EMPTY_REBUILD_EVERY","number","Нет нод нигде: перестраивать все, сек","Если нод нет ни в одном туннеле, все туннели перестраиваются с этой периодичностью, затем запускается проверка. 0: выключено"],
-  ["FAILOVER_RETURN","switch","Возвращать обратно","Когда в туннеле снова появятся ноды и проверка пройдёт"],
-  ["FAILOVER_PRIORITY","services","Приоритетные сервисы","Если после перестроения туннеля нод нет дольше времени ожидания, эти сервисы переезжают сразу, не дожидаясь следующей проверки"]]},
- {title:"Сравнение туннелей для сайтов",fields:[
-  ["AUTO_MIN_GAIN_PCT","number","Быстрее хотя бы на, %","Авторежим переносит сайт, только если выигрыш не меньше этого…"],
-  ["AUTO_MIN_GAIN_MS","number","…и хотя бы на, мс","…и одновременно не меньше этого"],
-  ["AUTO_GAIN_RECHECK","number","Сравнить сразу, не чаще раза в, мин","Если сервис с «Авто» после проверки заметно медленнее, чем другой туннель (по порогам выше), он сравнивается сразу, а не ночью. Не чаще этого. 0: выключено"],
-  ["COMPARE_SAMPLES","number","Замеров на туннель","По каждому домену берётся медиана, по сервису — среднее"],
-  ["ROUTE_SETTLE","number","Пауза после переключения, сек","Время, чтобы Deeper применил новый маршрут"],
-  ["AUTO_COMPARE_HOUR","number","Плановое сравнение, час","Каждый день в этот час (0–23) сервисы с «Авто» сравниваются заново. Если сервер в это время был выключен, сравнение пройдёт сразу после включения. −1: выключено"],
-  ["AUTO_ROLLBACK","switch","Откат неудачных переносов","Если после автопереноса сервис не отвечает 2 проверки подряд, он возвращается обратно, и эта страна сутки для него не используется"]]},
+ {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку, сначала из него уезжают сервисы — они сразу снова работают. Потом меняется нода (до 2 раз). Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
+  ["REBUILD_ENABLED","switch","Перестраивать в крайнем случае","Выключено: watchdog сам никогда не перестраивает туннели, только переносит сервисы и меняет ноды. Кнопка «Перестроить» в меню туннеля работает всегда"],
+  ["REBUILD_EVERY_HOURS","number","Не чаще раза в, ч","Для каждого туннеля, считая и ручные перестроения"]]},
  {title:"Резервные копии и перенос",foot:"Копия правил Deeper сохраняется сама перед каждым изменением: переносом, добавлением и удалением доменов, сравнением. Хранятся последние 30. Файл содержит правила, приложения и настройки без паролей; при загрузке файла домены только добавляются и переносятся, лишние не удаляются.",fields:[
   ["BACKUPS","backups"]]},
- {title:"Журнал",fields:[
-  ["SHOW_EVENTS","switch","Показывать журнал","Журнал событий внизу обзора"],
-  ["EVENTS_DAYS","number","Хранить, дней","Записи старше удаляются сами. 0: хранить, пока не наберётся 2000 записей"],
+ {title:"Журнал",foot:"Записи старше 3 дней удаляются сами.",fields:[
   ["CLEAR_EVENTS","clearlog","Очистить журнал","Удалить все записи сейчас"]]},
  {title:"Почта",fields:[
   ["SMTP_ENABLED","switch","Письма-отчёты","О событиях, отмеченных ниже"],
@@ -2631,8 +3020,7 @@ const GROUPS=[
   ["DEEPER_PASS","password","Пароль"]]}];
 // Fields hidden unless the given setting has one of the values
 const SHOW_IF={
- FAILOVER_RETURN:["FAILOVER_EMPTY",[true]],
- SWITCH_ATTEMPTS:["RECOVERY_ACTION",["smart"]],VERIFY_CHECKS:["RECOVERY_ACTION",["smart"]],VERIFY_PAUSE:["RECOVERY_ACTION",["smart"]],
+ REBUILD_EVERY_HOURS:["REBUILD_ENABLED",[true]],
  SMTP_TO:["SMTP_ENABLED",[true]],SMTP_HOST:["SMTP_ENABLED",[true]],SMTP_PORT:["SMTP_ENABLED",[true]],SMTP_USE_SSL:["SMTP_ENABLED",[true]],
  SMTP_USER:["SMTP_ENABLED",[true]],SMTP_PASS:["SMTP_ENABLED",[true]],SMTP_FROM:["SMTP_ENABLED",[true]],EMAIL_EVENTS:["SMTP_ENABLED",[true]]};
 // Email categories: [key, title, what it covers]
@@ -2644,6 +3032,8 @@ const MAIL_CATS=[
  ["nodes_back","Ноды появились","Туннель снова с нодами, сервисы вернулись"],
  ["all_empty","Нет нод ни в одном туннеле","И результат перестроения всех туннелей"],
  ["auto","Автоперенос","Сервис с «Авто» переехал туда, где быстрее"],
+ ["failover","Переезд при сбое","Сервис 📌 или «Sticky» ушёл из туннеля, где плохо работал"],
+ ["service","Сервис «Вручную» не работает","Сам он не переносится, и когда он снова в норме"],
  ["rollback","Откат автопереноса","На новом месте сервис не заработал и возвращён, ошибки возврата"],
  ["errors","Deeper Connect недоступен","Не удаётся связаться с устройством, и когда связь восстановлена"],
  ["changes","Изменения","Настройки, ручные переносы, смена ноды и перестроение вручную, новые туннели"]];
@@ -2673,6 +3063,7 @@ const ICONS={
  more:'<circle cx="5.5" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.4" fill="currentColor" stroke="none"/>',
  updown:'<path d="m8 9.5 4-4 4 4M8 14.5l4 4 4-4"/>',
  pin:'<path d="M12 21s-6.5-5.6-6.5-11a6.5 6.5 0 0 1 13 0c0 5.4-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.3"/>',
+ lock:'<rect x="5" y="10.5" width="14" height="10" rx="2.5"/><path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3"/>',
  sparkle:'<path d="M12 3.5 13.9 9 19.5 11l-5.6 2L12 18.5 10.1 13 4.5 11l5.6-2z"/><path d="M19 3.5v3M17.5 5h3"/>',
  hand:'<path d="M7 12.5V7.8a1.4 1.4 0 0 1 2.8 0V11M9.8 10.5V5.4a1.4 1.4 0 0 1 2.8 0v5M12.6 10.5V6.4a1.4 1.4 0 0 1 2.8 0V12M15.4 11V9a1.4 1.4 0 0 1 2.8 0v5a7 7 0 0 1-7 7h-.4A6.6 6.6 0 0 1 5 16.2l-.9-2.1a1.4 1.4 0 0 1 2.5-1.2l.4.6"/>',
  swap:'<path d="M5 8h13l-3.5-3.5M19 16H6l3.5 3.5"/>',
@@ -2865,20 +3256,20 @@ const inputs=[...document.querySelectorAll("[data-key]")];
 function val(key){const i=$(key);return i.type==="checkbox"?i.checked:i.value}
 function updateVisibility(){
  for(const k in SHOW_IF){const [dep,vals]=SHOW_IF[k];document.querySelector(`[data-field="${k}"]`).hidden=!vals.includes(val(dep))}
- $("modeHelp").textContent=MODE_HELP[val("RECOVERY_ACTION")]||""}
+}
 async function loadSettings(){
  const s=await api("/api/settings");
  for(const i of inputs){const k=i.dataset.key;
   if(i.type==="checkbox")i.checked=!!s[k];
   else if(i.type==="password"){i.value="";i.placeholder=s[k+"_SET"]?"Задан":"Не задан"}
   else i.value=s[k]??""}
- canaryDefaults=s.DEFAULT_CANARIES||{};countryNames=s.COUNTRY_NAMES||{};testSites=(s.TEST_SITES||"").split(",").map(u=>u.trim()).filter(Boolean);renderPriority();
+ countryNames=s.COUNTRY_NAMES||{};testSites=(s.TEST_SITES||"").split(",").map(u=>u.trim()).filter(Boolean);renderPriority();
  const cats=new Set($("EMAIL_EVENTS").value.split(",").map(x=>x.trim()));
  for(const c of document.querySelectorAll("#mailcats [data-cat]"))c.checked=cats.has(c.dataset.cat);
- syncSeg("RECOVERY_ACTION");renderCanaries();updateVisibility()}
+ renderCanaries();updateVisibility()}
 
 // Test sites. Stored in CANARIES as "CODE=url1,url2" lines; tunnels without one use defaults
-let testSites=[],canaryDefaults={},statusTunnels=[];
+let testSites=[],statusTunnels=[];
 function normUrl(v){v=v.trim();if(!v||/[,\s=]/.test(v))return null;if(!/^https?:\/\//i.test(v))v="https://"+v;
  try{return new URL(v).hostname.includes(".")?v:null}catch(e){return null}}
 // Priority services: toggles for every service and app; the value is "app:x,group:Y"
@@ -2899,20 +3290,14 @@ function renderCanaries(focus){
    el("div",{class:"cn-r"},el("span",{class:"tch",style:"cursor:default","aria-pressed":String(!!tunnel),
     title:tunnel?`Сейчас идёт через ${tname(real)} и проверяет его`:"",
     text:tunnel?`проверяет ${real}`:real?"идёт напрямую, туннели не проверяет":"страна определится при проверке"}),x)))}
- if(!testSites.length)box.append(el("div",{class:"tag",style:"padding:8px 0",text:"Список пуст: каждому туннелю сайты подбираются автоматически"}));
+ if(!testSites.length)box.append(el("div",{class:"tag",style:"padding:8px 0",text:"Список пуст: туннели проверяются по своим доменам Smart Route и сайтам приложений"}));
  const inp=el("input",{type:"url",class:"field",placeholder:"Добавить сайт, например example.com","aria-label":"Новый тестовый сайт",inputmode:"url",autocapitalize:"off"});
  const btn=el("button",{type:"button",class:"btn"},icon("plus"),"Добавить");
  const doAdd=()=>{const u=normUrl(inp.value);if(!u){toast("Неверный адрес сайта",true);return}
   if(!testSites.some(v=>hostOf(v)===hostOf(u)))testSites.push(u);renderCanaries(true)};
  btn.onclick=doAdd;inp.onkeydown=e=>{if(e.key==="Enter"){e.preventDefault();doAdd()}};
  box.append(el("div",{class:"add",style:"margin-top:10px"},inp,btn));
- const monitored=$("MONITOR_TUNNELS").value.split(",").map(t=>t.trim().toUpperCase()).filter(Boolean);
- // Tunnels topped up with temporary sites, and tunnels without any site of the list
- const rest=(monitored.length?monitored:statusTunnels).filter(c=>(canaryDefaults[c]||[]).length||!used.has(c));
- if(rest.length)box.append(el("div",{class:"autosites"},el("div",{text:`Добавлены автоматически, чтобы у туннеля было до ${$("SITES_PER_TUNNEL").value||3} сайтов:`}),
-  ...rest.map(c=>el("div",{},el("b",{text:`${flag(c)} ${c}`}),"  "+((canaryDefaults[c]||[]).length?canaryDefaults[c].map(hostOf).join(", "):used.has(c)?"":!(c in canaryDefaults)?"определится при проверке":"через него ничего не идёт, не проверяется")))));
  if(focus)box.querySelector("input").focus()}
-$("MONITOR_TUNNELS").oninput=()=>renderCanaries();
 
 $("save").onclick=async()=>{$("TEST_SITES").value=testSites.join(",");const body={};for(const i of inputs)body[i.dataset.key]=val(i.dataset.key);
  try{await api("/api/settings",body);toast("Сохранено");loadSettings();loadStatus()}catch(e){toast(e.message,true)}};
@@ -2926,7 +3311,7 @@ let lastStatus=null;
 async function loadStatus(){
  let st;try{st=await api("/api/status")}catch(e){setPill("bad","Нет связи с сервером");return}
  lastStatus=st;const codes=Object.keys(st.tunnels||{});$("eventsBlock").hidden=st.show_events===false;
- if(codes.join()!==statusTunnels.join()){statusTunnels=codes;if(!$("MONITOR_TUNNELS").value.trim())renderCanaries()}
+ if(codes.join()!==statusTunnels.join()){statusTunnels=codes;renderCanaries()}
  $("runInfo").textContent=st.last_run?`Последняя проверка ${st.last_run.slice(11)} · следующая ${st.next_run?st.next_run.slice(11):"—"}`:"Проверок ещё не было";
  $("alert").hidden=!st.error;$("alert").textContent=st.error||"";
  if(st.last_run!==lastRunSeen){const first=lastRunSeen===null;lastRunSeen=st.last_run;
@@ -2973,8 +3358,7 @@ function renderEvents(){const box=$("events");box.textContent="";const today=new
 $("eventsMore").onclick=()=>{showAllEvents=!showAllEvents;renderEvents()};
 // A slow service in manual mode doesn't move by itself: the overview suggests comparing it
 function slowManual(key,x,d){if(x.tunnel==="split"||(x.latency!=null&&x.latency<=d.max_latency))return false;
- const g=(d.groups||[]).find(g=>g.key===key),auto=new Set(d.auto);
- return !auto.has(key)&&!(g&&g.domains.some(m=>auto.has(m.domain)))&&!(d.preferred||{})[key]}
+ return (d.modes||{})[key]==="manual"}
 function renderServices(){const d=routesData;if(!d)return;
  const list=Object.entries(d.services||{}).sort((a,b)=>(a[1].ok-b[1].ok)||a[1].name.localeCompare(b[1].name));
  $("svcBlock").hidden=!list.length;const box=$("svcList");box.textContent="";
@@ -2999,16 +3383,29 @@ async function importFile(input){const f=input.files[0];input.value="";if(!f)ret
  loadBackups();loadRoutes();loadEvents()}
 // Green: answered, yellow: slower than the threshold, red: no answer
 function pingKind(latency){const max=(routesData&&routesData.max_latency)||Infinity;return latency==null?"bad":latency>max?"warn":"ok"}
+const openSites=new Set();
 function siteList(tunnel,x){
  const sites=x&&x.sites&&x.sites.length?x.sites:routesData?Object.values(routesData.sites).filter(s=>s.tunnel===tunnel):[];
  if(!sites.length)return null;
- return el("ul",{class:"sitelist"},...sites.map(s=>el("li",{},el("span",{class:"dot "+pingKind(s.latency)}),
-  el("span",{class:"h",text:hostOf(s.url)}),el("span",{class:"v",text:s.latency!=null?Math.round(s.latency)+" мс":"нет ответа"}))))}
+ // Domains that count first, the worst of them on top; ones that don't answer anywhere last
+ const max=(routesData&&routesData.max_latency)||Infinity,bad=s=>s.latency==null||s.latency>max,cnt=s=>s.counted!==false;
+ const sorted=[...sites].sort((a,b)=>cnt(b)-cnt(a)||bad(b)-bad(a)||(b.latency??1e9)-(a.latency??1e9));
+ const row=s=>el("li",{class:cnt(s)?"":"muted"},el("span",{class:"dot "+(cnt(s)?pingKind(s.latency):"")}),
+  el("span",{class:"h",text:hostOf(s.url)+(s.beacon?" · маячок":"")}),el("span",{class:"v",title:s.status!=null?String(s.status):"",
+   text:!cnt(s)?"не в счёт":s.latency!=null?Math.round(s.latency)+" мс":"нет ответа"}));
+ const head=x&&x.counted?el("li",{class:"muted"},`В норме ${x.counted-x.bad} из ${x.counted} ${plural(x.counted,"домена","доменов","доменов")}`
+  +(x.silent?`, ещё ${x.silent} не отвечают нигде`:"")+(x.q!=null?` · Q ${Math.round(x.q)}`:"")):null;
+ const list=el("ul",{class:"sitelist"},head,...sorted.slice(0,5).map(row));
+ if(sorted.length<=5)return list;
+ const det=el("details",{class:"foldlist"},el("summary",{text:`Остальные домены (${sorted.length-5})`}),el("ul",{class:"sitelist"},...sorted.slice(5).map(row)));
+ det.open=openSites.has(tunnel);det.ontoggle=()=>det.open?openSites.add(tunnel):openSites.delete(tunnel);
+ return el("div",{},list,det)}
 // Check details are for the log; the card says the same in plain words when there is no site list
 function plainDetails(x){const d=x.details||"";if(!d)return "";
- if(/^All canaries failed/.test(d))return "Тестовые сайты не ответили";
+ if(/^All canaries failed/.test(d))return "Домены туннеля не ответили";
+ if(/^Degraded/.test(d))return `Плохо работает большинство доменов: ${x.bad} из ${x.counted}`;
  if(/^High latency/.test(d))return `Все сайты медленнее допустимого, лучший — ${Math.round(x.latency)} мс`;
- if(/^OK/.test(d))return "Тестовые сайты отвечают";
+ if(/^OK/.test(d))return "Домены туннеля отвечают";
  return d.replace(/ \(HTTP \d+\)/g,"")}
 function renderTunnels(){
  const st=lastStatus;if(!st)return;const codes=Object.keys(st.tunnels||{});
@@ -3099,7 +3496,7 @@ $("checkNow").onclick=async()=>{const btn=$("checkNow"),before=lastStatus&&lastS
  btn.disabled=false;setBtn(btn,"refresh","Проверить сейчас")};
 
 // Ping & recommendations sheet
-let routesData=null,routesTimer=null,wasRunning=false;const selected=new Set(),openDoms=new Set();
+let routesData=null,routesTimer=null,wasRunning=false;const selected=new Set(),openDoms=new Set(),openTests=new Set();
 async function loadRoutes(){
  try{routesData=await api("/api/routes")}catch(e){return}
  countryNames=routesData.country_names||countryNames;
@@ -3114,17 +3511,27 @@ function renderRoutes(){
  const d=routesData,c=d.compare,results={};for(const r of c.results)results[r.domain]=r;
  // Test sites
  const tb=$("rtTests");tb.textContent="";
- // One row per site: the ping through every tunnel that tested it, side by side
- const byHost={};for(const x of Object.values(d.sites))(byHost[hostOf(x.url)]=byHost[hostOf(x.url)]||[]).push(x);
- const hosts=Object.keys(byHost).sort();
- if(!hosts.length)tb.append(el("div",{class:"empty",text:"Проверок ещё не было"}));
- for(const h of hosts){const real=d.site_routes[h],list=byHost[h].sort((a,b)=>a.tunnel.localeCompare(b.tunnel));
-  const foreign=real&&list.some(x=>x.tunnel!==real);
-  tb.append(el("div",{class:"li noselect tsite"},
-   el("div",{class:"li-main"},el("span",{class:"li-title",text:h}),
-    el("span",{class:"chip"+(foreign?" bad":""),title:foreign?`Сайт идёт через ${real}, поэтому в других туннелях он на самом деле проверяет ${real}`:"",text:real?"через "+real:"маршрут неизвестен"})),
-   el("div",{class:"tpings"},...list.map(x=>el("span",{class:"tp",title:`${x.tunnel}: ${ms(x.latency)}${x.status!=null?" ("+x.status+")":""}`},
-    el("span",{class:"dot "+pingKind(x.latency)}),el("b",{text:x.tunnel}),x.latency!=null?String(Math.round(x.latency)):"—")))))}
+ // One folded group per tunnel: tap it to see its domains
+ const byTunnel={};for(const x of Object.values(d.sites))(byTunnel[x.tunnel]=byTunnel[x.tunnel]||[]).push(x);
+ const codes=Object.keys(byTunnel).sort();
+ if(!codes.length)tb.append(el("div",{class:"empty",text:"Проверок ещё не было"}));
+ const max=d.max_latency||Infinity,cnt=s=>s.counted!==false,bad=s=>s.latency==null||s.latency>max;
+ for(const c of codes){const list=byTunnel[c].sort((a,b)=>cnt(b)-cnt(a)||bad(b)-bad(a)||hostOf(a.url).localeCompare(hostOf(b.url)));
+  const counted=list.filter(cnt),good=counted.filter(s=>!bad(s)).length;
+  const lats=counted.filter(s=>s.latency!=null).map(s=>s.latency).sort((a,b)=>a-b);
+  const med=lats.length?lats[Math.floor(lats.length/2)]:null;
+  const rows=list.map(x=>{const h=hostOf(x.url),real=d.site_routes[h];
+   return el("li",{class:cnt(x)?"":"muted"},el("span",{class:"dot "+(cnt(x)?pingKind(x.latency):"")}),
+    el("span",{class:"h",title:`${h}: ${ms(x.latency)}${x.status!=null?" ("+x.status+")":""}`,text:h+(x.beacon?" · маячок":"")}),
+    real&&real!==c?el("span",{class:"via",title:`Сайт идёт через ${real}, поэтому здесь он на самом деле проверяет ${real}`,text:"через "+real}):null,
+    el("span",{class:"v",text:!cnt(x)?"не в счёт":x.latency!=null?Math.round(x.latency)+" мс":"нет ответа"}))});
+  const det=el("details",{class:"tgroup"},
+   el("summary",{class:"li"},codeBadge(c),
+    el("div",{class:"li-main"},el("div",{class:"li-title",text:tname(c)}),
+     el("div",{class:"small "+(counted.length&&good<counted.length/2?"bad":"muted"),text:`В норме ${good} из ${counted.length} ${plural(counted.length,"домена","доменов","доменов")}`+(list.length>counted.length?`, ещё ${list.length-counted.length} не в счёт`:"")})),
+    el("span",{class:"tright"},el("span",{class:"dot "+(med!=null?pingKind(med):"bad")}),med!=null?Math.round(med)+" мс":"—",el("span",{class:"chev"}))),
+   el("ul",{class:"sitelist"},...rows));
+  det.open=openTests.has(c);det.ontoggle=()=>det.open?openTests.add(c):openTests.delete(c);tb.append(det)}
  // Compare controls
  const allKeys=allItemKeys();
  $("compareBtn").disabled=c.running||!allKeys.length;
@@ -3156,22 +3563,24 @@ function renderItems(box,items,results,auto,d){box.textContent="";
  for(const {key,tunnel,group} of items){const res=results[key],name=group?group.name:itemName(key);
   const sel=el("input",{type:"checkbox",class:"check","aria-label":"Выбрать "+name});sel.checked=selected.has(key);
   sel.onchange=()=>{sel.checked?selected.add(key):selected.delete(key);renderRoutes()};
-  const pin=(d.preferred||{})[key]||"",mode=auto.has(key)?"auto":pin,ev=(d.evacuated||{})[key];
-  const sw=el("select",{class:"mini","aria-label":"Режим для "+name,title:"«Авто», предпочтительный туннель или вручную"});
-  sw.append(el("option",{value:"","data-ic":"hand","data-sub":"Туннель выбираете вы, кнопками рядом",text:"Вручную"}),
-   el("option",{value:"auto","data-ic":"sparkle","data-sub":"Сам переезжает туда, где пинг меньше",text:"Авто"}));
+  const pin=(d.preferred||{})[key]||"",mode=(d.modes||{})[key]||"auto",ev=(d.evacuated||{})[key],hold=(d.hold_down||{})[key];
+  const sw=el("select",{class:"mini","aria-label":"Режим для "+name,title:"«Авто», «Вручную», «Sticky» или предпочтительный туннель"});
+  sw.append(el("option",{value:"auto","data-ic":"sparkle","data-sub":"Сам переезжает туда, где качество лучше",text:"Авто"}),
+   el("option",{value:"manual","data-ic":"hand","data-sub":"Никогда не переносится сам, только письмо при сбое",text:"Вручную"}),
+   el("option",{value:"sticky","data-ic":"lock","data-sub":"При сбое уходит в лучший туннель и остаётся там",text:"Sticky"}));
   const pg=el("optgroup",{label:"Предпочтительный туннель"});
   const tl=[...d.all_tunnels];if(pin&&!tl.some(t=>t.code===pin))tl.push({code:pin,nodes:0});
   for(const t of tl)pg.append(el("option",{value:t.code,"data-ic":"pin","data-short":`${flag(t.code)} ${t.code}`,"data-menu":`${flag(t.code)} ${t.code} · ${tname(t.code)}`,
    "data-sub":t.nodes?`${t.nodes} ${plural(t.nodes,"нода","ноды","нод")}`:"сейчас нет нод",text:t.code}));
-  sw.append(pg);sw.dataset.tone=mode==="auto"?"on":pin?"pin":"";
+  sw.append(pg);sw.dataset.tone=mode==="auto"?"on":pin?"pin":mode==="sticky"?"pin":"";
   sw.value=mode;sw.onchange=()=>saveMode(key,sw.value,sw,mode);
   const tchip=group&&group.split
    ?el("span",{class:"chip bad",text:"⚠ "+Object.entries(group.tunnels).map(([t,n])=>`${t} ${n}`).join(" · ")})
    :el("span",{class:"chip",text:tunnelLabel(tunnel)});
   const main=el("div",{class:"li-main"},el("div",{class:"li-title"},name,tchip));
-  if(pin&&ev&&ev.from===pin)main.append(el("div",{class:"warnline"},icon("clock"),`Временно в ${ev.to}: в ${pin} нет нод. Вернётся, как только они появятся`));
-  else if(pin&&tunnel&&tunnel!==pin&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("pin"),`Вернётся в ${pin}, когда там будут ноды`));
+  if(pin&&ev&&ev.from===pin)main.append(el("div",{class:"warnline"},icon("clock"),`Временно в ${ev.to}: в ${pin} был сбой. Вернётся, когда ${pin} ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`));
+  else if(pin&&tunnel&&tunnel!==pin&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("pin"),`Вернётся в ${pin}, когда он будет в норме`));
+  if(hold&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("clock"),`Удержание после переезда ещё ${Math.max(1,Math.round((hold-Date.now()/1000)/60))} мин`));
   if(group){const n=group.domains.length,del=el("button",{type:"button",class:"btn sm danger"},icon("trash"),n>1?"Удалить все домены":"Удалить домен");
    del.onclick=()=>deleteDomains([key],`${name}: удалить ${n} ${plural(n,"домен","домена","доменов")} из Smart Route?`,del);
    const det=el("details",{class:"doms"},el("summary",{text:`${n} ${plural(n,"домен","домена","доменов")}`}),
@@ -3195,7 +3604,7 @@ function renderItems(box,items,results,auto,d){box.textContent="";
    main.append(rec)}
   else if(group&&group.split)main.append(moveButtons(key,"Домены в разных странах. Собрать в:",null));
   const right=el("div",{class:"li-right"},sw);
-  if(!mode&&!(group&&group.split)){right.classList.add("inline");right.prepend(tunnelSeg(key,tunnel,d))}
+  if((mode==="manual"||mode==="sticky")&&!(group&&group.split)){right.classList.add("inline");right.prepend(tunnelSeg(key,tunnel,d))}
   box.append(el("div",{class:"li"},sel,main,right))}}
 // Manual mode: the service's tunnel is picked right in the row
 function tunnelSeg(key,tunnel,d){const s=el("div",{class:"seg tseg accent",role:"radiogroup","aria-label":"Туннель для "+itemName(key)});
@@ -3208,7 +3617,7 @@ function tunnelSeg(key,tunnel,d){const s=el("div",{class:"seg tseg accent",role:
  requestAnimationFrame(()=>thumb(s));return s}
 async function saveMode(key,mode,sw,was){const n=itemName(key);sw.disabled=true;
  try{const r=await api("/api/pin",{key,mode});
-  toast(r.note||(mode==="auto"?`Авто включено для ${n}`:mode?`${n}: предпочтительный туннель ${mode}`:`${n}: вручную`),!!r.note);
+  toast(r.note||(mode==="auto"?`Авто включено для ${n}`:mode==="manual"?`${n}: вручную`:mode==="sticky"?`${n}: Sticky, при сбое уходит и остаётся`:`${n}: предпочтительный туннель ${mode}`),!!r.note);
   if(mode==="auto")wasRunning=true}
  catch(e){sw.value=was;toast(e.message,true)}sw.disabled=false;loadRoutes()}
 async function moveDomain(domain,to,btn){btn.disabled=true;
@@ -3304,7 +3713,10 @@ class SettingsHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # The browser went away (closed tab, reload): nothing to answer
 
     def _check_auth(self):
         if not WEB_PASSWORD:
@@ -3370,7 +3782,6 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 if kind == "secret":
                     settings[key + "_SET"] = bool(settings[key])
                     settings[key] = ""
-            settings["DEFAULT_CANARIES"] = ROUTES.get("auto_sites", {})
             settings["COUNTRY_NAMES"] = COUNTRY_NAMES
             self._send(200, settings)
         elif self.path == "/api/routes":
@@ -3378,7 +3789,10 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "whitelist": ROUTES["whitelist"], "tunnels": ROUTES["tunnels"], "site_routes": ROUTES["site_routes"],
                 # Copies: the check and comparison threads may be changing these right now
                 "sites": dict(SITE_RESULTS), "compare": dict(COMPARE, results=list(COMPARE["results"])),
-                "auto": sorted(auto_route_domains()),
+                "auto": sorted(auto_keys(service_groups(ROUTES["whitelist"]))),
+                "modes": {k: service_mode(k) for k in [g["key"] for g in service_groups(ROUTES["whitelist"])]
+                          + ["app:" + a["app"] for a in ROUTES["apps"]]},
+                "hold_down": {k: int(t + HOLD_DOWN) for k, t in AUTO_STATE["moved_at"].items() if t + HOLD_DOWN > time.time()},
                 "country_names": COUNTRY_NAMES,
                 "apps": ROUTES["apps"], "app_results": dict(APP_RESULTS), "all_tunnels": ROUTES["all_tunnels"],
                 "max_latency": MAX_LATENCY_MS,
@@ -3421,11 +3835,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
             logger.info("Настройки обновлены через веб-интерфейс")
             if "TEST_SITES" in body:
                 CHECK_NOW.set()  # New test sites: find out which tunnels they test right away
-            changed = [k for k in changed if k != "AUTO_ROUTE_DOMAINS"]
             if changed:
                 log_event("info", "Изменены настройки: " + ", ".join(changed), mail="changes")
-            if "AUTO_ROUTE_DOMAINS" in body:
-                unite_auto_groups()
             self._send(200, {"ok": True})
         elif self.path == "/api/test-email":
             ok = send_email_notification(
@@ -3487,6 +3898,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 if r["domain"] == domain:
                     r["final"] = to
             end_probation(domain)
+            mark_moved(domain)
             prefs = preferred_tunnels()
             if domain in prefs and prefs[domain] != to:
                 prefs[domain] = to  # Otherwise the watchdog would move it straight back
@@ -3495,32 +3907,38 @@ class SettingsHandler(BaseHTTPRequestHandler):
                       + (", теперь это его предпочтительный туннель" if domain in prefs else ""), mail="changes")
             self._send(200, {"ok": True})
         elif self.path == "/api/pin":
-            # mode: "" (nothing), "auto" (auto mode) or a tunnel code (preferred tunnel). One excludes the other:
-            # auto mode moves a service to the fastest tunnel, a preferred tunnel keeps it in one place
+            # mode: "auto", "manual", "sticky" or a tunnel code (preferred tunnel); "" from older pages is manual
             key, mode = (body.get("key"), body.get("mode")) if isinstance(body, dict) else (None, None)
             codes = {t["code"] for t in ROUTES["all_tunnels"]} | set(ROUTES["tunnels"])
             if not isinstance(key, str) or not key or "=" in key or "\n" in key or "," in key \
-                    or not isinstance(mode, str) or (mode not in ("", "auto") and mode not in codes):
+                    or not isinstance(mode, str) or (mode not in MODE_NAMES and mode not in codes):
                 return self._send(400, {"error": "Неверный сервис или туннель"})
-            auto, prefs = auto_route_domains(), preferred_tunnels()
-            was = "auto" if key in auto else prefs.get(key, "")
-            auto.discard(key)
+            mode = mode or "manual"
+            was = service_mode(key)
+            manual, sticky, prefs = listed(MANUAL_SERVICES), listed(STICKY_SERVICES), preferred_tunnels()
+            manual.discard(key)
+            sticky.discard(key)
             prefs.pop(key, None)
-            if mode == "auto":
-                auto.add(key)
-            elif mode:
+            if mode == "manual":
+                manual.add(key)
+            elif mode == "sticky":
+                sticky.add(key)
+            elif mode != "auto":
                 prefs[key] = mode
-            errors = save_settings({"AUTO_ROUTE_DOMAINS": ",".join(sorted(auto)), "PREFERRED_TUNNELS": preferred_setting(prefs)})
+            errors = save_settings({"MANUAL_SERVICES": ",".join(sorted(manual)), "STICKY_SERVICES": ",".join(sorted(sticky)),
+                                    "PREFERRED_TUNNELS": preferred_setting(prefs)})
             if errors:
                 return self._send(400, {"errors": errors})
             end_probation(key)
+            MANUAL_ALERTED.discard(key)
             name = key.split(":", 1)[-1]
             note = None
+            label = lambda m: MODE_NAMES.get(m) or f"📌 {m}"
+            if was != mode:
+                log_event("info", f"{name}: режим {label(mode)} вместо {label(was)}")
             if mode == "auto":
-                log_event("info", f"{name}: включено «Авто»" + (f", предпочтительный туннель {was} снят" if was not in ("", "auto") else ""))
                 unite_auto_groups()
-            elif mode:
-                log_event("info", f"{name}: предпочтительный туннель {mode}" + (", «Авто» выключено" if was == "auto" else ""))
+            elif mode not in MODE_NAMES:
                 nodes = {t["code"]: t["nodes"] for t in ROUTES["all_tunnels"]}
                 if not nodes.get(mode):
                     note = f"В {mode} сейчас нет нод: {name} переедет туда, когда они появятся"
@@ -3528,15 +3946,13 @@ class SettingsHandler(BaseHTTPRequestHandler):
                     try:
                         client = shared_client()
                         PIN_FAILED.pop(key, None)
-                        enforce_preferred(client, {mode}, only={key})
+                        enforce_preferred(client, {mode: 0}, only={key})
                     except Exception as e:
                         note = f"Не удалось перенести сейчас: {e}"
                     finally:
                         ROUTE_LOCK.release()
                 else:
                     note = f"Идёт проверка или сравнение: {name} переедет в {mode} в течение минуты"
-            elif was:
-                log_event("info", f"{name}: " + ("«Авто» выключено" if was == "auto" else f"предпочтительный туннель {was} снят"))
             self._send(200, {"ok": True, "note": note})
         elif self.path in ("/api/add-domains", "/api/delete-domains"):
             body = body if isinstance(body, dict) else {}
@@ -3637,6 +4053,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
             try:
                 client = shared_client()
                 before = get_tunnel(client, tunnel) or {}
+                with STATE_LOCK:
+                    AUTO_STATE["rebuilt_at"][tunnel] = time.time()  # Counts towards the limit of automatic ones
                 ok, new_ip, new_pool = refresh_and_wait(client, tunnel, COUNTRY_NAMES.get(tunnel, tunnel),
                                                         before.get("activeIp"), before.get("activeNum", 0))
                 client.refresh_apps_cache()
@@ -3700,10 +4118,10 @@ class SettingsHandler(BaseHTTPRequestHandler):
             logger.info("Журнал очищен через веб-интерфейс")
             self._send(200, {"ok": True})
         elif self.path == "/api/reset":
-            # Service groups and auto-mode ticks are set from the routes window, not .env: they survive a reset
+            # Service groups and modes are set from the routes window, not .env: they survive a reset
             with SETTINGS_LOCK:
                 kept = {k: v for k, v in load_saved_settings().items()
-                        if k in ("SERVICE_GROUPS", "AUTO_ROUTE_DOMAINS", "PREFERRED_TUNNELS")}
+                        if k in ("SERVICE_GROUPS", "MANUAL_SERVICES", "STICKY_SERVICES", "PREFERRED_TUNNELS")}
                 try:
                     os.remove(SETTINGS_FILE)
                 except FileNotFoundError:
@@ -3744,27 +4162,24 @@ def watch_nodes_once(client, tunnels):
                              for t in tunnels]
     for t in tunnels:
         code = t.get("tunnelCode")
-        if code and t.get("activeNum", 0) > 0:
-            NODES_SINCE.setdefault(code, now)
+        # Green: has nodes and its last check passed. A tunnel whose nodes just came back stays not green until
+        # the check they trigger passes
+        if code and t.get("activeNum", 0) > 0 and (STATUS["tunnels"].get(code) or {}).get("healthy", True):
+            GREEN_SINCE.setdefault(code, now)
         else:
-            NODES_SINCE.pop(code, None)
-    # Back to the preferred tunnel once it has had nodes for NODES_STABLE seconds, so a flapping tunnel
+            GREEN_SINCE.pop(code, None)
+    # Back to the preferred tunnel once it has been green long enough (enforce_preferred), so a flapping tunnel
     # doesn't bounce services back and forth
-    ready = {c for c, since in NODES_SINCE.items() if now - since >= NODES_STABLE}
-    global ENFORCED_AT, READY_SEEN
-    READY_SEEN &= ready
-    fresh = ready - READY_SEEN  # A preferred tunnel that just got its nodes back: return right away
-    if not prefs:
-        READY_SEEN = ready
-    elif ready and (fresh or now - ENFORCED_AT >= 30) and MOVE_LOCK.acquire(blocking=False):
+    global ENFORCED_AT
+    if prefs and GREEN_SINCE and now - ENFORCED_AT >= 30 and MOVE_LOCK.acquire(blocking=False):
         try:
-            ENFORCED_AT, READY_SEEN = now, ready  # Busy lock: stays fresh and is retried next tick
-            enforce_preferred(client, ready)
+            ENFORCED_AT = now
+            enforce_preferred(client, dict(GREEN_SINCE))
         except Exception as e:
             logger.error(f"Ошибка возврата в предпочтительный туннель: {e}")
         finally:
             MOVE_LOCK.release()
-    all_empty = rebuild_all_if_empty(client, tunnels, now)
+    note_all_empty(tunnels, now)
     for t in tunnels:
         code = t.get("tunnelCode")
         if not code:
@@ -3797,20 +4212,25 @@ def watch_nodes_once(client, tunnels):
                 logger.error(f"Ошибка переноса из пустого туннеля {code}: {e}")
             finally:
                 MOVE_LOCK.release()
-        # A rebuild moves no routes, so it doesn't wait for a check or recovery of another tunnel to finish
-        if EMPTY_REBUILD_AFTER and empty_for >= EMPTY_REBUILD_AFTER and code not in ACTIONS and not all_empty \
-                and now - EMPTY_REBUILT.get(code, 0) >= EMPTY_REBUILD_EVERY:
+        # Deeper finds nodes by itself and a rebuild drops the pool it is collecting, so only after an hour
+        # without nodes, and under the same limits as any automatic rebuild (rebuild_blocker)
+        if EMPTY_REBUILD_AFTER and empty_for >= EMPTY_REBUILD_AFTER and code not in ACTIONS:
             try:
-                EMPTY_REBUILT[code] = now
-                logger.warning(f"В туннеле {code} нет нод {int(empty_for)} с, перестраиваю...")
-                log_event("warn", f"{code}: нет нод {int(empty_for)} с, перестраиваю туннель")
-                ok, new_ip, new_pool = refresh_and_wait(client, code, COUNTRY_NAMES.get(code, code), t.get("activeIp"), 0)
+                if rebuild_blocker(client, code, tunnels):
+                    continue
+                logger.warning(f"В туннеле {code} нет нод {span(int(empty_for // 60) * 60)}, перестраиваю...")
+                log_event("warn", f"{code}: нет нод {span(int(empty_for // 60) * 60)}, перестраиваю туннель")
+                result = rebuild_tunnel(client, code, COUNTRY_NAMES.get(code, code), t.get("activeIp"), 0)
+                if result is None:
+                    continue
+                ok, new_ip, new_pool = result
                 if not ok:
                     log_event("bad", f"{code}: Deeper не перестроил туннель", mail="no_nodes")
                 elif new_pool:
                     log_event("ok", f"{code}: туннель перестроен, нод {new_pool}, IP {new_ip}", mail="nodes_back")
                 else:
-                    log_event("bad", f"{code}: после перестроения нод нет, повтор через {EMPTY_REBUILD_EVERY // 60} мин", mail="no_nodes")
+                    log_event("bad", f"{code}: после перестроения нод нет, следующая попытка не раньше чем через "
+                                     f"{REBUILD_EVERY_HOURS} ч", mail="no_nodes")
             except Exception as e:
                 logger.error(f"Ошибка перестроения пустого туннеля {code}: {e}")
 
@@ -3819,54 +4239,18 @@ def span(sec):
     return f"{sec // 60} мин" if sec >= 60 and sec % 60 == 0 else f"{sec} с"
 
 
-def rebuild_all_if_empty(client, tunnels, now):
-    """No nodes in any monitored tunnel: every ALL_EMPTY_REBUILD_EVERY seconds all of them are rebuilt at once
-    and checked again. Returns True while all tunnels are empty and this is on (single rebuilds then wait)."""
-    global ALL_EMPTY_SINCE, ALL_EMPTY_REBUILT
+def note_all_empty(tunnels, now):
+    """Reports once when no monitored tunnel has nodes. Nothing is rebuilt all at once: each tunnel without nodes
+    is rebuilt on its own, one at a time, under the usual limits."""
+    global ALL_EMPTY_SINCE
     watched = [t for t in tunnels if t.get("tunnelCode") and (not MONITOR_TUNNELS or t.get("tunnelCode") in MONITOR_TUNNELS)]
     if not watched or any(t.get("activeNum", 0) > 0 for t in watched):
         ALL_EMPTY_SINCE = 0  # Each tunnel reports its own nodes coming back
-        return False
-    if not ALL_EMPTY_SINCE:
+    elif not ALL_EMPTY_SINCE:
         ALL_EMPTY_SINCE = now
-        log_event("bad", "Нет нод ни в одном туннеле"
-                  + (f": через {span(ALL_EMPTY_REBUILD_EVERY)} перестрою все туннели" if ALL_EMPTY_REBUILD_EVERY else ""),
-                  mail="all_empty")
-    if not ALL_EMPTY_REBUILD_EVERY:
-        return False
-    if now - max(ALL_EMPTY_SINCE, ALL_EMPTY_REBUILT) < ALL_EMPTY_REBUILD_EVERY or COMPARE["running"]:
-        return True
-    todo = [t for t in watched if t.get("tunnelCode") not in ACTIONS]
-    if not todo:
-        return True
-    ALL_EMPTY_REBUILT = now
-    codes = [t.get("tunnelCode") for t in todo]
-    logger.warning(f"Нет нод ни в одном туннеле {int(now - ALL_EMPTY_SINCE)} с, перестраиваю все: {', '.join(codes)}")
-    log_event("warn", f"Нет нод ни в одном туннеле {int(now - ALL_EMPTY_SINCE)} с, перестраиваю все туннели: {', '.join(codes)}")
-    results = {}
-
-    def rebuild(t):
-        code = t.get("tunnelCode")
-        EMPTY_REBUILT[code] = now
-        try:
-            results[code] = refresh_and_wait(client, code, COUNTRY_NAMES.get(code, code), t.get("activeIp"), 0)
-        except Exception as e:
-            logger.error(f"Ошибка перестроения туннеля {code}: {e}")
-            results[code] = (False, None, 0)
-
-    threads = [threading.Thread(target=rebuild, args=(t,), daemon=True) for t in todo]
-    for th in threads:
-        th.start()
-    for th in threads:
-        th.join()
-    got = [f"{c} {r[2]}" for c, r in results.items() if r[0] and r[2]]
-    failed = [c for c, r in results.items() if not r[0]]
-    log_event("ok" if got else "bad",
-              (f"Все туннели перестроены, ноды: {', '.join(got)}" if got
-               else f"Все туннели перестроены, нод по-прежнему нет. Повтор через {span(ALL_EMPTY_REBUILD_EVERY)}")
-              + (f". Deeper не перестроил: {', '.join(failed)}" if failed else ""), mail="all_empty")
-    CHECK_NOW.set()  # Check everything again right away
-    return True
+        log_event("bad", "Нет нод ни в одном туннеле" + (
+            f": туннели будут перестраиваться по одному, если нод не будет {span(EMPTY_REBUILD_AFTER)}"
+            if REBUILD_ENABLED else ""), mail="all_empty")
 
 
 def watch_nodes():
