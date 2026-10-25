@@ -1247,7 +1247,8 @@ def note_bad_ip(key, code, tunnels):
 
 
 def bad_ips(key, code):
-    """Nodes of the tunnel the service had to leave within BAD_IP_HOURS."""
+    """Nodes of the tunnel the service had to leave within BAD_IP_HOURS: it doesn't go back to them, the tunnel
+    is worth a try again only on another node."""
     now = time.time()
     return {ip for ip, t in AUTO_STATE["bad_ips"].get(key, {}).get(code, {}).items() if now - t < BAD_IP_HOURS * 3600}
 
@@ -1770,9 +1771,11 @@ def decide_services(client, current):
             continue
         tour = AUTO_STATE["tours"].get(key)
         if tour:
-            # A tunnel tried on a node it no longer has is worth another try: its new node may be good
+            # A tunnel tried on a node it no longer has is worth another try: its new node may be good. Unless the
+            # new one is a node the service already had to leave (bad_ips): it is the IP that failed, not the country
             ips = {t["code"]: t.get("ip") for t in ROUTES["all_tunnels"] if t.get("nodes")}
-            renewed = [c for c in tour["tried"] if ips.get(c) and ips[c] != tour.get("ips", {}).get(c)]
+            renewed = [c for c in tour["tried"] if ips.get(c) and ips[c] != tour.get("ips", {}).get(c)
+                       and ips[c] not in bad_ips(key, c)]
             if renewed:
                 with STATE_LOCK:
                     for c in renewed:
@@ -1811,9 +1814,9 @@ def decide_services(client, current):
                 tour["tried"][cur] = stay_score(key)
                 tour.setdefault("ips", {})[cur] = next((t.get("activeIp") for t in tunnels if t.get("tunnelCode") == cur), None)
                 tour["at"] = now
-            skip = set(tour["tried"])
-            if not stays and tunnel_ip(mode) in bad_ips(key, mode):
-                skip.add(mode)  # Its preferred tunnel is still on the node it had to leave: enforce_preferred decides
+            # Never onto a node it already had to leave (its preferred tunnel included: enforce_preferred decides)
+            skip = set(tour["tried"]) | {t.get("tunnelCode") for t in tunnels
+                                         if t.get("activeIp") and t["activeIp"] in bad_ips(key, t.get("tunnelCode"))}
             target = failover_target(key, skip, tunnels)
             settle = target is None
             if settle:
@@ -3223,11 +3226,11 @@ setInterval(()=>{const old=Date.now()-CARD_OPEN_MS;let changed=emptyOpen&&emptyO
  if(changed)renderTunnels()},15000);
 function renderTunnels(){
  const st=lastStatus;if(!st)return;
- // Working tunnels first, then the other ones with nodes, each by node count; without nodes folded at the end
- const all=Object.keys(st.tunnels||{}).map((c,i)=>[c,i]);
- const working=c=>{const x=st.tunnels[c];return x.healthy&&!x.unchecked?0:1};
- const codes=all.filter(([c])=>st.tunnels[c].pool>0).sort((a,b)=>working(a[0])-working(b[0])||st.tunnels[b[0]].pool-st.tunnels[a[0]].pool||a[1]-b[1]).map(a=>a[0]);
- const empty=all.filter(([c])=>!(st.tunnels[c].pool>0)).map(a=>a[0]);
+ // Tunnels with nodes by country name, so a card stays where it was; without nodes folded at the end
+ const byName=(a,b)=>(st.tunnels[a].country||a).localeCompare(st.tunnels[b].country||b,"ru");
+ const all=Object.keys(st.tunnels||{});
+ const codes=all.filter(c=>st.tunnels[c].pool>0).sort(byName);
+ const empty=all.filter(c=>!(st.tunnels[c].pool>0)).sort(byName);
  const box=$("tunnels");box.textContent="";
  const card=c=>{const x=st.tunnels[c],noNodes=x.pool===0,open=openCards.has(c);
   const action=(x.details||"").split(" → ")[1];
