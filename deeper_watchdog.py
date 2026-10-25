@@ -2447,8 +2447,9 @@ a.btn{text-decoration:none}
 .tsub{flex-wrap:nowrap;overflow:hidden;white-space:nowrap}
 .tsub>span{flex:none}.tsub.tflags{display:block;overflow:hidden;text-overflow:ellipsis}
 .tcard.tempty .code{background:var(--orange-soft)}.tsub .tdoing{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:var(--accent-text);font-weight:550}
-.tcard{padding:18px 20px 18px;position:relative;transition:transform .35s var(--spring),box-shadow .35s var(--spring);display:flex;flex-direction:column}
-@media (hover:hover){.tcard:hover{box-shadow:var(--shadow-lift);transform:translateY(-2px)}}
+.tcard{padding:18px 20px 18px;position:relative;display:flex;flex-direction:column}
+/* No lift or transition on hover: the cards are redrawn with every status update, and each redraw replayed it */
+@media (hover:hover){.tcard:hover{box-shadow:var(--shadow-lift)}}
 .thead{display:flex;align-items:center;gap:12px}
 .thead>div:nth-child(2){flex:1;min-width:0}
 .code{width:44px;height:44px;border-radius:50%;background:var(--fill);display:grid;place-items:center;font-weight:650;font-size:13px;flex:none;letter-spacing:0;position:relative}
