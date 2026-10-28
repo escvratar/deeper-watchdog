@@ -185,6 +185,78 @@ def set_action(code, text=None):
 def publish_tunnel(code, status):
     """Shows one tunnel's fresh status right away instead of at the end of the whole check."""
     STATUS["tunnels"] = {**STATUS["tunnels"], code: status}
+
+
+# Queue of actions: a check, a comparison and the user's actions (move, node switch, rebuild...) never run at the
+# same time. Whatever holds ROUTE_LOCK goes first; the user's actions wait their turn here, one after another,
+# and each starts by itself as soon as the one before it is over
+BUSY = {"text": None, "since": None}  # What holds ROUTE_LOCK now, for the web UI
+QUEUE = []  # Actions waiting or running, in order: {"id", "text", "tunnel", "state", "added", "fn", "done", "result"}
+QUEUE_DONE = []  # Recently finished ones, for the web UI: {"id", "text", "ok", "message", "at"}
+QUEUE_LOCK = threading.Lock()
+QUEUE_WAKE = threading.Event()
+QUEUE_WAIT = 20  # Seconds a web request waits for its action before answering that it is queued
+QUEUE_DONE_KEEP = 600  # Seconds a finished action stays in QUEUE_DONE
+QUEUE_SEQ = [0]
+
+
+class route_turn:
+    """`with route_turn(text):` holds ROUTE_LOCK and shows `text` as what is being done now."""
+
+    def __init__(self, text):
+        self.text = text
+
+    def __enter__(self):
+        ROUTE_LOCK.acquire()
+        BUSY.update(text=self.text, since=int(time.time()))
+
+    def __exit__(self, *exc):
+        BUSY.update(text=None, since=None)
+        ROUTE_LOCK.release()
+
+
+def queue_action(text, fn, tunnel=None):
+    """Puts an action in the queue. `fn()` runs under ROUTE_LOCK and returns (http_code, body); the job's "done"
+    event is set once it has run."""
+    with QUEUE_LOCK:
+        QUEUE_SEQ[0] += 1
+        job = {"id": QUEUE_SEQ[0], "text": text, "tunnel": tunnel, "state": "waiting", "added": int(time.time()),
+               "fn": fn, "done": threading.Event(), "result": None}
+        QUEUE.append(job)
+    QUEUE_WAKE.set()
+    return job
+
+
+def queue_view():
+    """The queue for the web UI: what runs now and what waits."""
+    now = time.time()
+    with QUEUE_LOCK:
+        QUEUE_DONE[:] = [d for d in QUEUE_DONE if now - d["at"] < QUEUE_DONE_KEEP]
+        return ([{k: j[k] for k in ("id", "text", "tunnel", "state", "added")} for j in QUEUE], list(QUEUE_DONE))
+
+
+def queue_worker():
+    while True:
+        QUEUE_WAKE.wait()
+        with QUEUE_LOCK:
+            job = QUEUE[0] if QUEUE else None
+            if job is None:
+                QUEUE_WAKE.clear()
+                continue
+        with route_turn(job["text"]):
+            job["state"] = "running"
+            try:
+                result = job["fn"]()
+            except Exception as e:
+                logger.error(f"Ошибка действия «{job['text']}»: {e}")
+                result = (502, {"error": str(e)})
+        job["result"] = result
+        ok = result[0] < 300
+        with QUEUE_LOCK:
+            QUEUE.remove(job)
+            QUEUE_DONE.append({"id": job["id"], "text": job["text"], "ok": ok, "at": time.time(),
+                               "message": result[1].get("message") if ok else result[1].get("error")})
+        job["done"].set()
 COMPARE_START_LOCK = threading.Lock()
 # Sites measured in parallel during a comparison (each one moves only its own route)
 COMPARE_MEASURE_WORKERS = 32  # Services measured at once in one tunnel during a comparison
@@ -521,6 +593,7 @@ AUTO_STATE.setdefault("moved_at", {})  # key -> when the watchdog last moved it 
 AUTO_STATE.setdefault("returned", {})  # key -> {"at", "wait"}: last return to the preferred tunnel
 AUTO_STATE.setdefault("rebuilt_at", {})  # code -> when the watchdog (or the user) last rebuilt the tunnel
 AUTO_STATE.setdefault("tours", {})  # key -> {"tried": {code: score}, "at", "settled"}: tunnels tried while it worked badly
+AUTO_STATE.setdefault("manual_away", {})  # key -> {"to", "at"}: preferred services the user moved elsewhere by hand
 AUTO_STATE.setdefault("bad_ips", {})  # key -> {code: {ip: when}}: nodes a service had to leave for working badly
 AUTO_STATE.setdefault("hosts", {})  # host -> {"seen": last answer through any tunnel, "good": last non-error status}
 # Only preferred services come back; auto ones stay where a failover took them
@@ -1278,6 +1351,7 @@ def prune_cache():
 
 def note_evacuated(key, from_code, to_code):
     """A preferred service left its tunnel: remembers it so it comes back. Under STATE_LOCK."""
+    AUTO_STATE["manual_away"].pop(key, None)  # Moved by the watchdog: no longer where the user put it
     AUTO_STATE["evacuated"][key] = {"from": from_code, "to": to_code, "since": time.strftime("%Y-%m-%d %H:%M:%S"),
                                     "at": time.time(), "wait": return_wait(key)}
 
@@ -1382,6 +1456,8 @@ def enforce_preferred(client, green_since, only=None):
     for k, c in preferred_tunnels().items():
         if c not in green_since or (only is not None and k not in only):
             continue
+        if k in AUTO_STATE["manual_away"] and only is None:
+            continue  # The user moved it elsewhere by hand: it stays there
         evac = AUTO_STATE["evacuated"].get(k)
         if evac and evac.get("from") == c:
             # Back only to another node: the one it left worked badly for it
@@ -1754,12 +1830,79 @@ def switch_pending(code):
         and SWITCHES.get(code, 0) < SWITCH_ATTEMPTS and not STATUS.get("all_slow")
 
 
+SVC_SWITCHES = {}  # code -> {"n", "at"}: node switches because services worked badly in the tunnel
+SVC_SWITCH_RESET = 3600  # Seconds after the last such switch before the count starts anew
+
+
+def fresh_node(client, code, keys=None):
+    """After a node switch: the tunnel's quality and its services' bad checks start anew, so they are judged by
+    the new node. `keys`: its services (default: all that go through it now)."""
+    reset_quality(code)
+    for key in keys if keys is not None else [k for k, _ in tunnel_services(client, code)]:
+        BAD_STREAK.pop(key, None)
+        STAY_PINGS.pop(key, None)
+
+
+def node_switch_first(client, current):
+    """Services working badly in a tunnel that passes its checks as a whole (a few bad sites don't fail a tunnel):
+    when the tunnel has another node, the node is switched first, up to SWITCH_ATTEMPTS times per
+    SVC_SWITCH_RESET seconds, and the services leave only if that didn't help. Not for manual services, silent ones
+    or ones bad in every tunnel, and not when every tunnel is slow. Returns the keys that wait for the new node."""
+    if STATUS.get("all_slow"):
+        return set()
+    troubled = {}
+    for key, r in current.items():
+        code = r["tunnel"]
+        if code in (None, "split", "ZZ", "LL") or r.get("silent") or not degraded(r) or service_mode(key) == "manual":
+            continue
+        if not (STATUS["tunnels"].get(code) or {}).get("healthy", True):
+            continue  # The tunnel fails as a whole: recover_tunnel switches its node, its services wait for that
+        if (AUTO_STATE["tours"].get(key) or {}).get("settled"):
+            continue
+        troubled.setdefault(code, []).append(key)
+    if not troubled:
+        return set()
+    now, waiting = time.time(), set()
+    tunnels = {t.get("tunnelCode"): t for t in client.list_tunnels()}
+    for code, keys in troubled.items():
+        t = tunnels.get(code) or {}
+        if now - SVC_SWITCHES.get(code, {}).get("at", 0) >= SVC_SWITCH_RESET:
+            SVC_SWITCHES.pop(code, None)
+        n = SVC_SWITCHES.get(code, {}).get("n", 0) + 1
+        if t.get("activeNum", 0) < 2 or n > SWITCH_ATTEMPTS:
+            continue
+        SVC_SWITCHES[code] = {"n": n, "at": now}
+        names = ", ".join(k.split(":", 1)[1] for k in keys)
+        old_ip = t.get("activeIp")
+        set_action(code, f"Смена ноды {n} из {SWITCH_ATTEMPTS}…")
+        try:
+            res = client.switch_node(code, old_ip or "")
+            if not (isinstance(res, dict) and res.get("success")):
+                log_event("bad", f"{code}: плохо работают {names}, но Deeper не сменил ноду: {res}", mail="recovery")
+                continue
+            time.sleep(VERIFY_PAUSE)
+            match = get_tunnel(client, code) or {}
+            if match:
+                live_pool(code, match)
+            new_ip = match.get("activeIp") or res.get("activeIp") or old_ip
+        finally:
+            set_action(code)
+        fresh_node(client, code)
+        waiting |= set(keys)
+        text = (f"{code}: плохо работают {names}, нода сменена ({n} из {SWITCH_ATTEMPTS}), IP {old_ip} → {new_ip}. "
+                f"Сервисы переедут, только если новая нода не поможет")
+        logger.warning(text)
+        log_event("warn", text, mail="recovery")
+    return waiting
+
+
 def decide_services(client, current):
     """Per-service decisions after a check. A service moves only when it works badly in its tunnel, and only to a
     tunnel that has nodes: auto ones stay where they landed, preferred ones come back in
     enforce_preferred; manual ones are only reported. Never a move just because another tunnel looks faster.
     `current`: service_results()."""
     now, todo = time.time(), []
+    waiting = node_switch_first(client, current)
     for key, r in current.items():
         mode = service_mode(key)
         # A service that hasn't answered anywhere lately doesn't count for its tunnel's health, but it is still
@@ -1795,8 +1938,8 @@ def decide_services(client, current):
                 continue
         if not bad:
             continue
-        if switch_pending(r["tunnel"]):
-            continue  # Its tunnel fails as a whole and has another node: the node switch comes first
+        if switch_pending(r["tunnel"]) or key in waiting:
+            continue  # Its tunnel has another node: the node switch comes first
         if tour and tour.get("settled") and (r["ok"] or r["silent"]):
             # Bad everywhere, left in the best tunnel until a new node shows up, unless it stops answering. One that
             # answers nowhere just stays: a new tour would only move it around
@@ -1873,6 +2016,59 @@ def service_movers(client):
     return movers
 
 
+def move_job(domain, to):
+    """The user moves a service, an app or a rule to another tunnel (an action of the queue). A preferred service
+    keeps its preferred tunnel: it stays where the user put it (manual_away) until moved back or its mode changes."""
+    client = shared_client()
+    name = domain.split(":", 1)[-1]
+    backup_rules(client, f"перед переносом {name} в {to}")
+    ok, error = False, None
+    try:
+        # Current tunnel from Deeper itself: the cached one may be stale
+        if domain.startswith("group:"):
+            # The whole service goes to one tunnel
+            rules = [{"domain": i.get("domainName"), "tunnel": i.get("tunnelCode")} for i in client.get_whitelist_domains()]
+            group = next((g for g in service_groups(rules) if g["key"] == domain), None)
+            if group is None:
+                error = f"{name} не найден в правилах Deeper"
+            else:
+                ok = group_mover(client, group)[0](to)
+                if not ok:
+                    error = f"Deeper перенёс не все домены {name}"
+        else:
+            if domain.startswith("app:"):
+                current = (client.get_apps().get(name) or {}).get("tunnel")
+            else:
+                current = next((i.get("tunnelCode") for i in client.get_whitelist_domains() if i.get("domainName") == domain), None)
+            if current is None:
+                error = f"{domain} не найден в Deeper"
+            else:
+                ok = current == to or client.move_item(domain, current, to)
+        client.get_routed_domains()
+        client.refresh_apps_cache()
+    except Exception as e:
+        error = str(e)
+        logger.error(f"Ошибка переноса {domain}: {e}")
+    if not ok:
+        return 502, {"error": error or f"Deeper не перенёс {name}"}
+    for r in COMPARE["results"]:
+        if r["domain"] == domain:
+            r["final"] = to
+    forget_service(domain)
+    mark_moved(domain)
+    pref = preferred_tunnels().get(domain)
+    with STATE_LOCK:
+        if pref and pref != to:
+            AUTO_STATE["manual_away"][domain] = {"to": to, "at": time.time()}
+        else:
+            AUTO_STATE["manual_away"].pop(domain, None)
+    save_auto_state()
+    log_event("info", f"{name}: перенесён в {to} вручную"
+              + (f", предпочтительный туннель остаётся {pref}" if pref and pref != to else ""), mail="changes")
+    CHECK_NOW.set()  # The tunnels it left and went to are checked right away: the overview shows them as they are
+    return 200, {"ok": True, "message": f"{name} теперь через {to}"}
+
+
 def forget_service(key):
     """A manual move or a mode change: the user decides. The watchdog forgets its moves of this service (a return
     to the preferred tunnel it waits for, a tour of the tunnels) and starts afresh."""
@@ -1892,7 +2088,7 @@ def start_compare(domains):
 
     def job():
         try:
-            with ROUTE_LOCK:
+            with route_turn("Сравнение туннелей"):
                 client = shared_client()
                 backup_rules(client, "перед сравнением туннелей")
                 compare_routes(client, domains)
@@ -1968,7 +2164,7 @@ def recover_tunnel(client, code, country, active_ip, active_num, canaries, max_l
         if not (isinstance(res, dict) and res.get("success")):
             return False, "не изменился", active_num, action, [f"Deeper не сменил ноду: {res}"]
         time.sleep(VERIFY_PAUSE)
-        reset_quality(code)
+        fresh_node(client, code)
         match = get_tunnel(client, code) or {}
         if match:
             live_pool(code, match)
@@ -2425,6 +2621,10 @@ a.btn{text-decoration:none}
 .hero-t{flex:1 1 220px;min-width:0}
 .hero-t b{display:block;font-size:20px;font-weight:700;letter-spacing:-.02em;line-height:1.2}
 .hero-t span{display:block;color:var(--muted);font-size:14px;margin-top:3px}
+.hero-t .queue{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.hero-t .queue>span{display:inline-flex;align-items:center;gap:6px;margin:0;padding:3px 10px;border-radius:999px;background:var(--fill);font-size:12.5px;font-weight:550;color:var(--text);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hero-t .queue>span.now{background:var(--orange-soft);color:var(--orange)}
+.hero-t .queue .spin{display:inline-block;width:11px;height:11px;border-width:2px;margin:0;padding:0;flex:none}
 .hero .actions{flex:0 1 auto}
 @media (max-width:700px){.hero{padding:18px}.hero .actions{width:100%}.hero .actions .btn{flex:1}}
 
@@ -2734,7 +2934,7 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
  <div id="alert" class="card alert" hidden></div>
  <div class="card hero">
   <div class="hero-ic" id="heroIc"><i data-ic="shield"></i></div>
-  <div class="hero-t"><b id="heroTitle">Загрузка…</b><span id="runInfo"></span><span class="small muted" id="emailInfo"></span></div>
+  <div class="hero-t"><b id="heroTitle">Загрузка…</b><span id="runInfo"></span><span class="small muted" id="emailInfo"></span><span class="queue" id="queueInfo" hidden></span></div>
   <div class="actions">
    <button class="btn primary" id="checkNow" type="button"><i data-ic="refresh"></i><span>Проверить сейчас</span></button>
    <button class="btn gray" id="openRoutes" type="button"><i data-ic="chart"></i><span>Пинг и рекомендации</span></button>
@@ -3015,7 +3215,13 @@ function toast(text,bad){const t=$("toast");t.textContent="";t.append(el("span",
 async function api(path,body){
  const r=await fetch(path,body===undefined?{cache:"no-store"}:{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
  const d=await r.json().catch(()=>({}));if(r.status===401){location.reload();throw new Error("Нужно войти")}
- if(!r.ok)throw new Error((d.errors||[d.error||r.statusText]).join("; "));return d}
+ if(!r.ok)throw new Error((d.errors||[d.error||r.statusText]).join("; "));
+ // Actions wait their turn: the answer comes later, as a toast from the queue (see watchQueue)
+ if(d.queued){const e=new Error(d.running?`${d.text}: выполняется, результат появится позже`:`${d.text}: в очереди`+(d.after?`, начнётся после: ${d.after.toLowerCase()}`:""));
+  e.queued=true;queueAsked.add(d.id);setTimeout(loadStatus,300);throw e}
+ return d}
+// A queued action isn't an error: an ordinary toast, not a red one
+function toastErr(e){toast(e.message,!e.queued)}
 const ms=v=>v!=null?Math.round(v)+" мс":"нет ответа";
 const hostOf=u=>{try{return new URL(u).hostname}catch(e){return u}};
 let countryNames={};const tname=c=>countryNames[c]||c;
@@ -3064,7 +3270,7 @@ GROUPS.forEach((g,gi)=>{
    card.append(el("div",{class:"row block","data-field":key},el("div",{class:"row-text"},el("label",{text:label})),list,input));continue}
   if(type==="webauth"){const inp=el("input",{type:"password",class:"field",placeholder:"Новый пароль",autocomplete:"new-password","aria-label":"Новый пароль"});
    const set=el("button",{type:"button",class:"btn"},"Сменить"),out=el("button",{type:"button",class:"btn danger"},"Выйти везде");
-   set.onclick=async()=>{try{await api("/api/password",{password:inp.value});inp.value="";toast("Пароль изменён, остальные устройства вышли")}catch(e){toast(e.message,true)}};
+   set.onclick=async()=>{try{await api("/api/password",{password:inp.value});inp.value="";toast("Пароль изменён, остальные устройства вышли")}catch(e){toastErr(e)}};
    out.onclick=async()=>{if(!await ask("Выйти на всех устройствах?","Пароль спросят заново везде, и на этом устройстве тоже.",{ok:"Выйти",danger:true}))return;
     try{await api("/api/logout",{everywhere:true})}catch(e){}location.reload()};
    fetch("api/auth",{cache:"no-store"}).then(r=>r.json()).then(d=>{if(d.from_env){inp.disabled=set.disabled=true;inp.placeholder="Задан в .env (WEB_PASSWORD)"}}).catch(()=>{});
@@ -3072,7 +3278,7 @@ GROUPS.forEach((g,gi)=>{
     el("div",{class:"row"},el("div",{class:"row-text"},el("label",{text:"Выйти на всех устройствах"}),el("div",{class:"help",text:"Включая это"})),el("div",{class:"row-ctl"},out)));continue}
   if(type==="clearlog"){const b=el("button",{type:"button",class:"btn danger"},icon("trash"),"Очистить");
    b.onclick=async()=>{if(!await ask("Очистить журнал?","Все записи журнала будут удалены.",{ok:"Очистить",danger:true}))return;
-    try{await api("/api/events/clear",{});toast("Журнал очищен");loadEvents()}catch(e){toast(e.message,true)}};
+    try{await api("/api/events/clear",{});toast("Журнал очищен");loadEvents()}catch(e){toastErr(e)}};
    card.append(el("div",{class:"row"},el("div",{class:"row-text"},el("label",{text:label}),el("div",{class:"help",text:help})),el("div",{class:"row-ctl"},b)));continue}
   const row=el("div",{class:"row","data-field":key}),text=el("div",{class:"row-text"}),ctl=el("div",{class:"row-ctl"});let input;
   text.append(el("label",{for:key,text:label}));if(help)text.append(el("div",{class:"help",text:help}));
@@ -3111,11 +3317,11 @@ async function loadSettings(){
 
 let statusTunnels=[];
 $("save").onclick=async()=>{const body={};for(const i of inputs)body[i.dataset.key]=val(i.dataset.key);
- try{await api("/api/settings",body);toast("Сохранено");loadSettings();loadStatus()}catch(e){toast(e.message,true)}};
+ try{await api("/api/settings",body);toast("Сохранено");loadSettings();loadStatus()}catch(e){toastErr(e)}};
 $("testEmail").onclick=async()=>{toast("Отправка с сохранёнными настройками…");
- try{const d=await api("/api/test-email",{});toast(d.ok?"Тестовое письмо отправлено":"Ошибка: "+d.error,!d.ok)}catch(e){toast(e.message,true)}loadStatus()};
+ try{const d=await api("/api/test-email",{});toast(d.ok?"Тестовое письмо отправлено":"Ошибка: "+d.error,!d.ok)}catch(e){toastErr(e)}loadStatus()};
 $("reset").onclick=async()=>{if(!await ask("Сбросить настройки?","Все изменения, сделанные в веб-интерфейсе, удалятся, и вернутся исходные значения из файла .env. Сервисы, «Авто» и предпочтительные туннели сохранятся.",{ok:"Сбросить",danger:true}))return;
- try{await api("/api/reset",{});toast("Настройки сброшены");loadSettings()}catch(e){toast(e.message,true)}};
+ try{await api("/api/reset",{});toast("Настройки сброшены");loadSettings()}catch(e){toastErr(e)}};
 
 // Overview
 let lastStatus=null;
@@ -3130,17 +3336,22 @@ async function loadStatus(){
  else if(st.events_at!==eventsSeen)loadEvents();
  eventsSeen=st.events_at;
  renderTunnels();
+ watchQueue(st);
  const em=st.last_email;$("emailInfo").textContent=em?`Последнее письмо ${em.time.slice(11)}: ${em.ok?"отправлено":"ошибка, "+em.error}`:"";
  $("emailInfo").className="small "+(em&&!em.ok?"bad":"muted");
  updatePill()}
 // Ping history sparkline: one series, so no legend; failed checks are red ticks on the baseline
 let historyData=null,eventsData=[],showAllEvents=false,lastRunSeen=null,eventsSeen=null;
-function spark(code){
- const pts=historyData&&historyData.tunnels[code];if(!pts||pts.length<2)return null;
- const W=300,H=56,now=Date.now()/1000,t0=now-historyData.hours*3600,max=historyData.max_latency;
+function spark(code){if(!historyData)return null;
+ // The server's clock, not this device's: a clock that is off would shift the points out of the card
+ const W=300,H=56,now=historyData.now||Date.now()/1000,t0=now-historyData.hours*3600,max=historyData.max_latency;
+ // Only the last N hours: older points (left from before a pause in the checks) would be drawn outside the card
+ const pts=((historyData&&historyData.tunnels[code])||[]).filter(p=>p[0]>=t0&&p[0]<=now+60);if(pts.length<2)return null;
+ const gap=Math.max(3*(historyData.interval||180),900);
  const vals=pts.filter(p=>p[1]!=null).map(p=>p[1]);if(!vals.length)return null;
  const top=Math.max(...vals)*1.15||1,x=t=>(t-t0)/(now-t0)*W,y=v=>H-2-Math.min(v,top)/top*(H-6);
- let d="",pen=false;for(const [t,v] of pts){if(v==null){pen=false;continue}d+=(pen?"L":"M")+x(t).toFixed(1)+" "+y(v).toFixed(1);pen=true}
+ // No line across a pause in the checks: it would draw pings nobody measured
+ let d="",pen=false,last=0;for(const [t,v] of pts){if(v==null||t-last>gap)pen=false;last=t;if(v==null)continue;d+=(pen?"L":"M")+Math.min(W,Math.max(0,x(t))).toFixed(1)+" "+y(v).toFixed(1);pen=true}
  const NS="http://www.w3.org/2000/svg",mk=(tag,a)=>{const e=document.createElementNS(NS,tag);for(const k in a)e.setAttribute(k,a[k]);return e};
  const svg=mk("svg",{viewBox:`0 0 ${W} ${H}`,preserveAspectRatio:"none",role:"img","aria-label":`Пинг ${code} за ${historyData.hours} ч`});
  if(max<top)svg.append(mk("line",{x1:0,x2:W,y1:y(max),y2:y(max),stroke:"var(--muted)","stroke-width":1,"stroke-dasharray":"3 3",opacity:.6,"vector-effect":"non-scaling-stroke"}));
@@ -3187,13 +3398,13 @@ async function loadBackups(){const box=$("backupList");if(!box)return;let list;
  box.textContent="";if(!list.length){box.append(el("div",{class:"small muted",text:"Копий пока нет: первая появится перед первым изменением правил"}));return}
  for(const b of list){const r=el("button",{type:"button",class:"btn sm",text:"Восстановить"});
   r.onclick=async()=>{if(!await ask(`Восстановить копию от ${b.time}?`,`Доменов в копии: ${b.rules}. Домены, которых в копии нет, будут удалены. Текущие правила сначала сохранятся в новую копию.`,{ok:"Восстановить",danger:true}))return;
-   r.disabled=true;try{const x=await api("/api/restore",{id:b.id});toast(`Восстановлено, изменено: ${x.changed.length}`)}catch(e){toast(e.message,true)}loadBackups();loadRoutes();loadEvents()};
+   r.disabled=true;try{const x=await api("/api/restore",{id:b.id});toast(`Восстановлено, изменено: ${x.changed.length}`)}catch(e){toastErr(e)}loadBackups();loadRoutes();loadEvents()};
   box.append(el("div",{class:"bk"},el("div",{class:"bk-t"},b.time,el("small",{text:`${b.reason||""} · доменов ${b.rules}`})),r))}}
 async function importFile(input){const f=input.files[0];input.value="";if(!f)return;let data;
  try{data=JSON.parse(await f.text())}catch(e){toast("Файл не читается как JSON",true);return}
  if(data.app!=="deeper-watchdog"){toast("Это не файл Deeper Watchdog",true);return}
  if(!await ask(`Загрузить ${f.name}?`,`Доменов: ${(data.rules||[]).length}, файл от ${data.exported||"?"}. Настройки (кроме паролей и адреса Deeper) заменятся, домены добавятся или перенесутся в страны из файла.`,{ok:"Загрузить"}))return;
- try{const x=await api("/api/import",{data});toast(`Загружено, изменено правил: ${x.changed.length}`);await loadSettings()}catch(e){toast(e.message,true)}
+ try{const x=await api("/api/import",{data});toast(`Загружено, изменено правил: ${x.changed.length}`);await loadSettings()}catch(e){toastErr(e)}
  loadBackups();loadRoutes();loadEvents()}
 // Green: answered, yellow: slower than the threshold, red: no answer
 function pingKind(latency){const max=(routesData&&routesData.max_latency)||Infinity;return latency==null?"bad":latency>max?"warn":"ok"}
@@ -3272,9 +3483,25 @@ function renderTunnels(){
 function codeBadge(c){const f=flag(c);return f?el("span",{class:"code",title:tname(c)},el("span",{class:"fw"},el("span",{class:"flag",text:f})),el("span",{class:"cc",text:c})):el("span",{class:"code",text:c})}
 function tmeta(x,threshold){return el("div",{class:"meta"},el("span",{},icon("server"),x.ip||"—"),el("span",{},icon("nodes"),`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`),
  threshold!=null?el("span",{class:x.fails?"warn":""},icon("tri"),`сбоев ${x.fails} из ${threshold}`):null)}
+// The queue of actions: what runs now (a check, a comparison or an action) and what waits after it
+const queueAsked=new Set();let queueSeen=null;
+function watchQueue(st){
+ const box=$("queueInfo"),q=st.queue||[],busy=st.busy&&st.busy.text,items=[];
+ if(busy)items.push(el("span",{class:"now"},el("span",{class:"spin"}),busy));
+ if(st.check_waiting&&busy!=="Проверка туннелей")items.push(el("span",{text:"Проверка туннелей"}));
+ for(const j of q)if(j.state!=="running")items.push(el("span",{title:"В очереди",text:j.text}));
+ box.textContent="";box.append(...items);box.hidden=!items.length||(items.length===1&&busy==="Проверка туннелей");
+ // Results of actions asked from this page that finished after their request had answered "in the queue"
+ const done=st.queue_done||[];
+ if(queueSeen===null){queueSeen=new Set(done.map(d=>d.id));return}
+ let changed=false;
+ for(const d of done)if(!queueSeen.has(d.id)){queueSeen.add(d.id);
+  if(queueAsked.has(d.id)){queueAsked.delete(d.id);changed=true;toast(d.ok?(d.message||d.text+": готово"):`${d.text}: ${d.message||"не удалось"}`,!d.ok)}}
+ if(changed){loadRoutes();loadEvents()}}
+const queuedFor=c=>((lastStatus&&lastStatus.queue)||[]).find(j=>j.tunnel===c);
 // Actions of a tunnel live in its "⋯" menu, like on Apple platforms
-function tunnelButtons(c,x){const busy=!!(lastStatus&&(lastStatus.actions||{})[c]);
- const b=el("button",{type:"button",class:"btn icon tmore","aria-label":"Действия с туннелем "+c,"aria-haspopup":"menu",title:busy?"Туннель сейчас занят":"Действия"},icon("more"));
+function tunnelButtons(c,x){const busy=!!(lastStatus&&((lastStatus.actions||{})[c]||queuedFor(c)));
+ const b=el("button",{type:"button",class:"btn icon tmore","aria-label":"Действия с туннелем "+c,"aria-haspopup":"menu",title:busy?(queuedFor(c)?"В очереди: "+queuedFor(c).text:"Туннель сейчас занят"):"Действия"},icon("more"));
  b.disabled=busy;
  b.onclick=()=>showMenu(b,[{header:`${flag(c)} ${tname(c)} · ${x.ip||"—"}`},
   {text:"Сменить ноду",icon:"swap",sub:(x.pool||0)<2?"В пуле одна нода":"Другая нода из пула",disabled:(x.pool||0)<2,onSelect:()=>switchNode(c,b)},
@@ -3304,7 +3531,7 @@ function renderApps(){
   const seg=el("div",{class:"seg accent",role:"radiogroup","aria-label":"Страна для "+appName(a.app)});
   for(const t of usable){const b=el("button",{type:"button","aria-pressed":String(t.code===a.tunnel),title:tname(t.code),text:t.code});
    b.onclick=async()=>{if(t.code===a.tunnel)return;for(const x of seg.children){x.disabled=true;x.setAttribute("aria-pressed",String(x===b))}thumb(seg);
-    try{await api("/api/move",{domain:key,to:t.code});toast(`${appName(a.app)} теперь через ${tname(t.code)}`)}catch(e){toast(e.message,true)}loadRoutes()};
+    try{await api("/api/move",{domain:key,to:t.code});toast(`${appName(a.app)} теперь через ${tname(t.code)}`)}catch(e){toastErr(e)}loadRoutes()};
    seg.append(b)}
   const cur=usable.find(t=>t.code===a.tunnel);
   box.append(el("div",{class:"card tcard"},
@@ -3317,18 +3544,18 @@ function renderApps(){
  requestAnimationFrame(thumbAll)}
 async function refreshTunnel(tunnel,btn){
  btn.disabled=true;toast(`Перестраиваю ${tunnel}…`);
- try{const r=await api("/api/refresh-tunnel",{tunnel});toast(`Туннель ${tunnel} перестроен: ${r.old_ip} → ${r.new_ip}, нод в пуле ${r.pool}`)}catch(e){toast(e.message,true)}
+ try{const r=await api("/api/refresh-tunnel",{tunnel});toast(`Туннель ${tunnel} перестроен: ${r.old_ip} → ${r.new_ip}, нод в пуле ${r.pool}`)}catch(e){toastErr(e)}
  btn.disabled=false;loadRoutes();setTimeout(loadStatus,4000)}
 async function switchNode(tunnel,btn){
  btn.disabled=true;toast(`Меняю ноду ${tunnel}…`);
- try{const r=await api("/api/switch-node",{tunnel});toast(`Нода ${tunnel}: ${r.old_ip} → ${r.new_ip}`)}catch(e){toast(e.message,true)}
+ try{const r=await api("/api/switch-node",{tunnel});toast(`Нода ${tunnel}: ${r.old_ip} → ${r.new_ip}`)}catch(e){toastErr(e)}
  btn.disabled=false;loadRoutes();loadStatus()}
 
 $("checkNow").onclick=async()=>{const btn=$("checkNow"),before=lastStatus&&lastStatus.last_run;btn.disabled=true;setBtn(btn,"spin","Проверяем…");
  try{await api("/api/check-now",{});
   for(let i=0;i<60;i++){await new Promise(r=>setTimeout(r,2000));await loadStatus();if(lastStatus&&lastStatus.last_run!==before)break}
   if(lastStatus&&lastStatus.last_run!==before){await loadRoutes();toast("Проверка завершена")}else toast("Проверка ещё идёт, результат появится позже")}
- catch(e){toast(e.message,true)}
+ catch(e){toastErr(e)}
  btn.disabled=false;setBtn(btn,"refresh","Проверить сейчас")};
 
 // Ping & recommendations sheet
@@ -3459,9 +3686,9 @@ async function saveMode(key,mode,sw,was){const n=itemName(key);sw.disabled=true;
   if(mode==="auto")wasRunning=true}
  catch(e){sw.value=was;toast(e.message,true)}sw.disabled=false;loadRoutes()}
 async function moveDomain(domain,to,btn){btn.disabled=true;
- try{await api("/api/move",{domain,to});toast(`${itemName(domain)} перенесён в ${to}`)}catch(e){toast(e.message,true);btn.disabled=false}loadRoutes()}
+ try{await api("/api/move",{domain,to});toast(`${itemName(domain)} перенесён в ${to}`)}catch(e){toastErr(e);btn.disabled=false}loadRoutes()}
 $("compareBtn").onclick=async()=>{
- try{await api("/api/compare",{domains:[...selected]});wasRunning=true;toast("Сравнение запущено")}catch(e){toast(e.message,true)}loadRoutes()};
+ try{await api("/api/compare",{domains:[...selected]});wasRunning=true;toast("Сравнение запущено")}catch(e){toastErr(e)}loadRoutes()};
 const plural=(n,a,b,c)=>{const m=n%10,h=n%100;return m===1&&h!==11?a:m>=2&&m<=4&&(h<12||h>14)?b:c};
 function fillTunnels(sel){const v=sel.value;sel.textContent="";
  for(const t of routesData.all_tunnels.filter(t=>t.nodes>0))sel.append(el("option",{value:t.code,"data-short":`${flag(t.code)} ${t.code}`,"data-sub":`${t.nodes} ${plural(t.nodes,"нода","ноды","нод")}`,text:`${flag(t.code)} ${t.code} · ${tname(t.code)}`}));
@@ -3479,7 +3706,7 @@ function renderCatalog(){const d=routesData,pick=$("svcPick"),v=pick.value;pick.
 $("svcPick").onchange=$("svcTun").onchange=()=>renderCatalog();
 $("svcAdd").onclick=async()=>{const b=$("svcAdd"),service=$("svcPick").value,to=$("svcTun").value;b.disabled=true;
  try{const r=await api("/api/add-domains",{service,to});toast(r.done.length?`${service}: ${r.done.length} ${plural(r.done.length,"домен","домена","доменов")} теперь через ${to}`:"Ничего менять не нужно")}
- catch(e){toast(e.message,true)}loadRoutes()};
+ catch(e){toastErr(e)}loadRoutes()};
 // Moves an already added domain into another service (it also goes to that service's country)
 function regroupSelect(m,group){
  const sel=el("select",{class:"mini","aria-label":"Перенести "+m.domain+" в другой сервис",title:"Перенести в другой сервис"});
@@ -3491,7 +3718,7 @@ function regroupSelect(m,group){
   if(name==="=new"){name=(await ask("Новый сервис",`Как назвать сервис для ${m.domain}?`,{ok:"Создать",input:{placeholder:"Название"}}))||"";if(!name){sel.value="";return}}
   const target=routesData.groups.find(g=>g.name===name),to=target?target.main:m.tunnel;sel.disabled=true;
   try{await api("/api/add-domains",{domains:[m.domain],to,group:name});toast(`${m.domain} теперь в сервисе ${name}`+(to!==m.tunnel?`, через ${to}`:""))}
-  catch(e){toast(e.message,true)}loadRoutes()};
+  catch(e){toastErr(e)}loadRoutes()};
  return sel}
 const splitDomains=v=>v.split(/[\s,;]+/).filter(Boolean);
 function addToGroupRow(group){
@@ -3500,7 +3727,7 @@ function addToGroupRow(group){
  b.onclick=async()=>{const domains=splitDomains(inp.value);if(!domains.length){toast("Введите домен",true);return}b.disabled=true;
   try{const r=await api("/api/add-domains",{domains,to:group.main,group:group.name});
    toast(`${group.name}: ${r.done.length?"добавлено "+r.done.join(", ")+" через "+group.main:"домены уже в сервисе"}`)}
-  catch(e){toast(e.message,true);b.disabled=false}loadRoutes()};
+  catch(e){toastErr(e);b.disabled=false}loadRoutes()};
  inp.onkeydown=e=>{if(e.key==="Enter")b.click()};
  return el("div",{class:"addrow"},inp,b)}
 function fillGroups(){const sel=$("domGroup"),v=sel.value;sel.textContent="";
@@ -3512,11 +3739,11 @@ $("domGroup").onchange=()=>{const g=routesData.groups.find(x=>x.name===$("domGro
 $("domAdd").onclick=async()=>{const b=$("domAdd"),domains=splitDomains($("domInput").value),to=$("domTun").value,group=$("domGroup").value;
  if(!domains.length){toast("Введите домен",true);return}b.disabled=true;
  try{const r=await api("/api/add-domains",group?{domains,to,group}:{domains,to});$("domInput").value="";toast(r.done.length?`Добавлено через ${to}: ${r.done.join(", ")}`:"Эти домены уже есть в "+to)}
- catch(e){toast(e.message,true)}b.disabled=false;loadRoutes()};
+ catch(e){toastErr(e)}b.disabled=false;loadRoutes()};
 $("domInput").onkeydown=e=>{if(e.key==="Enter")$("domAdd").click()};
 async function deleteDomains(domains,question,btn){if(!await ask(question,"Правила удалятся из Smart Route Deeper. Перед этим сохранится резервная копия.",{ok:"Удалить",danger:true}))return;btn.disabled=true;
  try{const r=await api("/api/delete-domains",{domains});toast(`Удалено: ${r.done.length} ${plural(r.done.length,"домен","домена","доменов")}`)}
- catch(e){toast(e.message,true);btn.disabled=false}loadRoutes()}
+ catch(e){toastErr(e);btn.disabled=false}loadRoutes()}
 function allItemKeys(){return [...routesData.apps.map(a=>"app:"+a.app),...routesData.groups.map(g=>g.key)]}
 $("selAll").onchange=()=>{if($("selAll").checked)for(const k of allItemKeys())selected.add(k);else selected.clear();renderRoutes()};
 $("openRoutes").onclick=async()=>{await loadRoutes();openSheet()};
@@ -3530,7 +3757,7 @@ loadSettings().catch(e=>toast("Не удалось загрузить настр
 loadRoutes();
 // Every 5 s, every 2 s while something is being done with a tunnel, rarely in a background tab
 (function statusLoop(){loadStatus().finally(()=>setTimeout(statusLoop,
- document.hidden?30000:Object.keys((lastStatus&&lastStatus.actions)||{}).length?2000:5000))})();
+ document.hidden?30000:Object.keys((lastStatus&&lastStatus.actions)||{}).length||((lastStatus&&lastStatus.queue)||[]).length?2000:5000))})();
 document.addEventListener("visibilitychange",()=>{if(!document.hidden)loadStatus()});
 </script></body></html>
 """
@@ -3658,6 +3885,14 @@ class SettingsHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         logger.debug("web: " + fmt % args)
 
+    def _queued(self, job):
+        """The action's own answer if it is done within QUEUE_WAIT seconds; otherwise that it is in the queue
+        (its result comes later in /api/status, queue_done)."""
+        if job["done"].wait(QUEUE_WAIT):
+            return self._send(*job["result"])
+        self._send(202, {"queued": True, "id": job["id"], "text": job["text"], "running": job["state"] == "running",
+                         "after": None if job["state"] == "running" else BUSY["text"]})
+
     def _send(self, code, body, ctype="application/json; charset=utf-8", headers=None):
         data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -3756,8 +3991,10 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 events = list(reversed(EVENTS))
             self._send(200, {"events": events})
         elif self.path == "/api/history":
-            self._send(200, {"hours": HISTORY_HOURS, "max_latency": MAX_LATENCY_MS,
-                             "tunnels": {c: list(p) for c, p in HISTORY.items()}})
+            now = int(time.time())
+            cutoff = now - HISTORY_HOURS * 3600  # Points are pruned only by a check: none may have run for a while
+            self._send(200, {"hours": HISTORY_HOURS, "max_latency": MAX_LATENCY_MS, "interval": CHECK_INTERVAL, "now": now,
+                             "tunnels": {c: [p for p in pts if p[0] >= cutoff] for c, pts in list(HISTORY.items())}})
         elif self.path == "/api/backups":
             self._send(200, {"backups": list_backups()})
         elif self.path == "/api/export":
@@ -3802,8 +4039,10 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "preferred": preferred_tunnels(),
             })
         elif self.path == "/api/status":
+            queue, done = queue_view()
             self._send(200, dict(STATUS, fail_threshold=FAIL_THRESHOLD, actions=ACTIONS, now=int(time.time()),
-                                 show_events=SHOW_EVENTS))
+                                 show_events=SHOW_EVENTS, busy=BUSY, queue=queue, queue_done=done,
+                                 check_waiting=CHECK_NOW.is_set() and bool(BUSY["text"])))
         else:
             self._send(404, {"error": "not found"})
 
@@ -3877,54 +4116,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
             is_app = isinstance(domain, str) and domain.startswith("app:")
             if not isinstance(domain, str) or to not in usable or (is_app and domain[4:] not in configured_apps()):
                 return self._send(400, {"error": "Неизвестный сайт, приложение или туннель"})
-            if not ROUTE_LOCK.acquire(timeout=2):
-                return self._send(409, {"error": "Идёт проверка или сравнение, попробуйте через минуту"})
-            ok, error = False, None
-            try:
-                client = shared_client()
-                backup_rules(client, f"перед переносом {domain.split(':', 1)[-1]} в {to}")
-                # Current tunnel from Deeper itself: the cached one may be stale
-                if domain.startswith("group:"):
-                    # The whole service goes to one tunnel
-                    rules = [{"domain": i.get("domainName"), "tunnel": i.get("tunnelCode")} for i in client.get_whitelist_domains()]
-                    group = next((g for g in service_groups(rules) if g["key"] == domain), None)
-                    if group is None:
-                        error = f"{domain[6:]} не найден в правилах Deeper"
-                    else:
-                        ok = group_mover(client, group)[0](to)
-                        if not ok:
-                            error = f"Deeper перенёс не все домены {domain[6:]}"
-                else:
-                    if is_app:
-                        current = (client.get_apps().get(domain[4:]) or {}).get("tunnel")
-                    else:
-                        current = next((i.get("tunnelCode") for i in client.get_whitelist_domains() if i.get("domainName") == domain), None)
-                    if current is None:
-                        error = f"{domain} не найден в Deeper"
-                    else:
-                        ok = current == to or client.move_item(domain, current, to)
-                client.get_routed_domains()
-                client.refresh_apps_cache()
-            except Exception as e:
-                error = str(e)
-                logger.error(f"Ошибка переноса {domain}: {e}")
-            finally:
-                ROUTE_LOCK.release()
-            if not ok:
-                return self._send(502, {"error": error or f"Deeper не перенёс {domain}"})
-            for r in COMPARE["results"]:
-                if r["domain"] == domain:
-                    r["final"] = to
-            forget_service(domain)
-            mark_moved(domain)
-            prefs = preferred_tunnels()
-            if domain in prefs and prefs[domain] != to:
-                prefs[domain] = to  # Otherwise the watchdog would move it straight back
-                save_settings({"PREFERRED_TUNNELS": preferred_setting(prefs)})
-            log_event("info", f"{domain.split(':', 1)[-1]}: перенесён в {to} вручную"
-                      + (", теперь это его предпочтительный туннель" if domain in prefs else ""), mail="changes")
-            CHECK_NOW.set()  # The tunnels it left and went to are checked right away: the overview shows them as they are
-            self._send(200, {"ok": True})
+            name = domain.split(":", 1)[-1]
+            self._queued(queue_action(f"Перенос {name} в {to}", lambda: move_job(domain, to)))
         elif self.path == "/api/pin":
             # mode: "auto", "manual" or a tunnel code (preferred tunnel); "" from older pages is manual
             key, mode = (body.get("key"), body.get("mode")) if isinstance(body, dict) else (None, None)
@@ -3946,6 +4139,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 return self._send(400, {"errors": errors})
             forget_service(key)
             MANUAL_ALERTED.discard(key)
+            with STATE_LOCK:
+                AUTO_STATE["manual_away"].pop(key, None)  # A new mode: the watchdog follows it again
             name = key.split(":", 1)[-1]
             note = None
             label = lambda m: MODE_NAMES.get(m) or f"📌 {m}"
@@ -3955,17 +4150,16 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 nodes = {t["code"]: t["nodes"] for t in ROUTES["all_tunnels"]}
                 if not nodes.get(mode):
                     note = f"В {mode} сейчас нет нод: {name} переедет туда, когда они появятся"
-                elif ROUTE_LOCK.acquire(timeout=2):
-                    try:
-                        client = shared_client()
-                        PIN_FAILED.pop(key, None)
-                        enforce_preferred(client, {mode: 0}, only={key})
-                    except Exception as e:
-                        note = f"Не удалось перенести сейчас: {e}"
-                    finally:
-                        ROUTE_LOCK.release()
                 else:
-                    note = f"Идёт проверка или сравнение: {name} переедет в {mode} в течение минуты"
+                    def pin_job(key=key, mode=mode, name=name):
+                        PIN_FAILED.pop(key, None)
+                        enforce_preferred(shared_client(), {mode: 0}, only={key})
+                        return 200, {"ok": True, "message": f"{name}: предпочтительный туннель {mode}"}
+                    job = queue_action(f"Перенос {name} в {mode}", pin_job)
+                    if not job["done"].wait(QUEUE_WAIT):
+                        note = f"{name} переедет в {mode} в свою очередь" + (f", после: {BUSY['text'].lower()}" if BUSY["text"] else "")
+                    elif job["result"][0] >= 300:
+                        note = f"Не удалось перенести сейчас: {job['result'][1].get('error')}"
             CHECK_NOW.set()
             self._send(200, {"ok": True, "note": note})
         elif self.path in ("/api/add-domains", "/api/delete-domains"):
@@ -3989,102 +4183,98 @@ class SettingsHandler(BaseHTTPRequestHandler):
             usable = {t["code"] for t in ROUTES["all_tunnels"] if t["nodes"] > 0} | set(ROUTES["tunnels"])
             if adding and to not in usable:
                 return self._send(400, {"error": "Неизвестный туннель"})
-            if not ROUTE_LOCK.acquire(timeout=2):
-                return self._send(409, {"error": "Идёт проверка или сравнение, попробуйте через минуту"})
-            done, failed, error = [], [], None
-            try:
-                client = shared_client()
-                backup_rules(client, "перед добавлением доменов" if adding else "перед удалением доменов")
-                current = {i.get("domainName"): i.get("tunnelCode") for i in client.get_whitelist_domains()}
-                if group:
-                    errors = add_to_service_group(group.strip(), list(dict.fromkeys(domains)),
-                                                  [{"domain": d, "tunnel": t} for d, t in current.items()])
-                    if errors:
-                        raise RuntimeError("; ".join(errors))
-                if adding:
-                    # One service = one country: rules already present elsewhere are moved
-                    for d in dict.fromkeys(domains):
-                        if current.get(d) == to:
-                            continue
-                        ok = client.move_domain(d, current[d], to) if d in current else client.add_domain(d, to)
-                        (done if ok else failed).append(d)
-                else:
-                    rules = [{"domain": d, "tunnel": t} for d, t in current.items()]
-                    for g in service_groups(rules):
-                        if g["key"] in group_keys:
-                            domains += [m["domain"] for m in g["domains"]]
-                    targets = [d for d in dict.fromkeys(domains) if d in current]
-                    if targets:
-                        (done if client.delete_domains(targets) else failed).extend(targets)
-                client.get_routed_domains()
-            except Exception as e:
-                error = str(e)
-                logger.error(f"Ошибка изменения правил: {e}")
-            finally:
-                ROUTE_LOCK.release()
-            if done:
-                what = f"добавлены в {to}" + (f" (сервис {group.strip()})" if group else "") if adding else "удалены"
-                log_event("info", f"Домены {what}: {', '.join(done[:8])}" + (f" и ещё {len(done) - 8}" if len(done) > 8 else ""))
-            if error or failed:
-                return self._send(502, {"error": error or f"Deeper не принял: {', '.join(failed)}", "done": done})
-            if done:
-                CHECK_NOW.set()
-            self._send(200, {"ok": True, "done": done})
+            def rules_job():
+                done, failed, error = [], [], None
+                try:
+                    client = shared_client()
+                    backup_rules(client, "перед добавлением доменов" if adding else "перед удалением доменов")
+                    current = {i.get("domainName"): i.get("tunnelCode") for i in client.get_whitelist_domains()}
+                    if group:
+                        errors = add_to_service_group(group.strip(), list(dict.fromkeys(domains)),
+                                                      [{"domain": d, "tunnel": t} for d, t in current.items()])
+                        if errors:
+                            raise RuntimeError("; ".join(errors))
+                    if adding:
+                        # One service = one country: rules already present elsewhere are moved
+                        for d in dict.fromkeys(domains):
+                            if current.get(d) == to:
+                                continue
+                            ok = client.move_domain(d, current[d], to) if d in current else client.add_domain(d, to)
+                            (done if ok else failed).append(d)
+                    else:
+                        rules = [{"domain": d, "tunnel": t} for d, t in current.items()]
+                        members = [m["domain"] for g in service_groups(rules) if g["key"] in group_keys for m in g["domains"]]
+                        targets = [d for d in dict.fromkeys(domains + members) if d in current]
+                        if targets:
+                            (done if client.delete_domains(targets) else failed).extend(targets)
+                    client.get_routed_domains()
+                except Exception as e:
+                    error = str(e)
+                    logger.error(f"Ошибка изменения правил: {e}")
+                if done:
+                    what = f"добавлены в {to}" + (f" (сервис {group.strip()})" if group else "") if adding else "удалены"
+                    log_event("info", f"Домены {what}: {', '.join(done[:8])}" + (f" и ещё {len(done) - 8}" if len(done) > 8 else ""))
+                if error or failed:
+                    return (502, {"error": error or f"Deeper не принял: {', '.join(failed)}", "done": done})
+                if done:
+                    CHECK_NOW.set()
+                return (200, {"ok": True, "done": done, "message": f"{'Добавлено' if adding else 'Удалено'} доменов: {len(done)}"})
+            self._queued(queue_action("Добавление доменов" if adding else "Удаление доменов", rules_job, tunnel=None))
         elif self.path == "/api/switch-node":
             tunnel = body.get("tunnel") if isinstance(body, dict) else None
             if tunnel not in {t["code"] for t in ROUTES["all_tunnels"]}:
                 return self._send(400, {"error": "Неизвестный туннель"})
-            if not ROUTE_LOCK.acquire(timeout=2):
-                return self._send(409, {"error": "Идёт проверка или сравнение, попробуйте через минуту"})
-            try:
-                client = shared_client()
-                before = get_tunnel(client, tunnel) or {}
-                if before.get("activeNum", 0) < 2:
-                    return self._send(409, {"error": f"В туннеле {tunnel} нет другой ноды для переключения"})
-                set_action(tunnel, "Смена ноды…")
-                res = client.switch_node(tunnel, before.get("activeIp") or "")
-                if not (isinstance(res, dict) and res.get("success")):
-                    return self._send(502, {"error": f"Deeper не сменил ноду: {res}"})
-                time.sleep(2)
-                after = get_tunnel(client, tunnel) or {}
-                if after:
-                    live_pool(tunnel, after)
-                client.refresh_apps_cache()
-            except Exception as e:
-                logger.error(f"Ошибка смены ноды {tunnel}: {e}")
-                return self._send(502, {"error": str(e)})
-            finally:
-                set_action(tunnel)
-                ROUTE_LOCK.release()
-            new_ip = after.get("activeIp") or res.get("activeIp")
-            logger.info(f"Нода туннеля {tunnel} сменена вручную: {before.get('activeIp')} -> {new_ip}")
-            log_event("info", f"{tunnel}: нода сменена вручную, IP {before.get('activeIp')} → {new_ip}", mail="changes")
-            self._send(200, {"ok": True, "old_ip": before.get("activeIp"), "new_ip": new_ip})
+            def switch_job():
+                try:
+                    client = shared_client()
+                    before = get_tunnel(client, tunnel) or {}
+                    if before.get("activeNum", 0) < 2:
+                        return (409, {"error": f"В туннеле {tunnel} нет другой ноды для переключения"})
+                    set_action(tunnel, "Смена ноды…")
+                    res = client.switch_node(tunnel, before.get("activeIp") or "")
+                    if not (isinstance(res, dict) and res.get("success")):
+                        return (502, {"error": f"Deeper не сменил ноду: {res}"})
+                    time.sleep(2)
+                    after = get_tunnel(client, tunnel) or {}
+                    if after:
+                        live_pool(tunnel, after)
+                    fresh_node(client, tunnel)
+                    client.refresh_apps_cache()
+                except Exception as e:
+                    logger.error(f"Ошибка смены ноды {tunnel}: {e}")
+                    return (502, {"error": str(e)})
+                finally:
+                    set_action(tunnel)
+                new_ip = after.get("activeIp") or res.get("activeIp")
+                logger.info(f"Нода туннеля {tunnel} сменена вручную: {before.get('activeIp')} -> {new_ip}")
+                log_event("info", f"{tunnel}: нода сменена вручную, IP {before.get('activeIp')} → {new_ip}", mail="changes")
+                return (200, {"ok": True, "old_ip": before.get("activeIp"), "new_ip": new_ip,
+                              "message": f"Нода {tunnel}: {before.get('activeIp')} → {new_ip}"})
+            self._queued(queue_action(f"Смена ноды {tunnel}", switch_job, tunnel=tunnel))
         elif self.path == "/api/refresh-tunnel":
             tunnel = body.get("tunnel") if isinstance(body, dict) else None
             if tunnel not in {t["code"] for t in ROUTES["all_tunnels"]}:
                 return self._send(400, {"error": "Неизвестный туннель"})
-            if not ROUTE_LOCK.acquire(timeout=2):
-                return self._send(409, {"error": "Идёт проверка или сравнение, попробуйте через минуту"})
-            try:
-                client = shared_client()
-                before = get_tunnel(client, tunnel) or {}
-                with STATE_LOCK:
-                    AUTO_STATE["rebuilt_at"][tunnel] = time.time()  # Counts towards the limit of automatic ones
-                ok, new_ip, new_pool = refresh_and_wait(client, tunnel, COUNTRY_NAMES.get(tunnel, tunnel),
-                                                        before.get("activeIp"), before.get("activeNum", 0))
-                client.refresh_apps_cache()
-            except Exception as e:
-                logger.error(f"Ошибка перестроения туннеля {tunnel}: {e}")
-                return self._send(502, {"error": str(e)})
-            finally:
-                ROUTE_LOCK.release()
-            if not ok:
-                return self._send(502, {"error": f"Deeper не перестроил туннель {tunnel}"})
-            logger.info(f"Туннель {tunnel} перестроен вручную: {before.get('activeIp')} -> {new_ip} (пул: {new_pool})")
-            log_event("info", f"{tunnel}: туннель перестроен вручную, IP {before.get('activeIp')} → {new_ip}", mail="changes")
-            CHECK_NOW.set()  # Re-check right away so the overview shows the new state
-            self._send(200, {"ok": True, "old_ip": before.get("activeIp"), "new_ip": new_ip, "pool": new_pool})
+            def refresh_job():
+                try:
+                    client = shared_client()
+                    before = get_tunnel(client, tunnel) or {}
+                    with STATE_LOCK:
+                        AUTO_STATE["rebuilt_at"][tunnel] = time.time()  # Counts towards the limit of automatic ones
+                    ok, new_ip, new_pool = refresh_and_wait(client, tunnel, COUNTRY_NAMES.get(tunnel, tunnel),
+                                                            before.get("activeIp"), before.get("activeNum", 0))
+                    client.refresh_apps_cache()
+                except Exception as e:
+                    logger.error(f"Ошибка перестроения туннеля {tunnel}: {e}")
+                    return (502, {"error": str(e)})
+                if not ok:
+                    return (502, {"error": f"Deeper не перестроил туннель {tunnel}"})
+                logger.info(f"Туннель {tunnel} перестроен вручную: {before.get('activeIp')} -> {new_ip} (пул: {new_pool})")
+                log_event("info", f"{tunnel}: туннель перестроен вручную, IP {before.get('activeIp')} → {new_ip}", mail="changes")
+                CHECK_NOW.set()  # Re-check right away so the overview shows the new state
+                return (200, {"ok": True, "old_ip": before.get("activeIp"), "new_ip": new_ip, "pool": new_pool,
+                              "message": f"Туннель {tunnel} перестроен: {before.get('activeIp')} → {new_ip}"})
+            self._queued(queue_action(f"Перестроение туннеля {tunnel}", refresh_job, tunnel=tunnel))
         elif self.path in ("/api/restore", "/api/import"):
             body = body if isinstance(body, dict) else {}
             restoring = self.path == "/api/restore"
@@ -4104,27 +4294,25 @@ class SettingsHandler(BaseHTTPRequestHandler):
                     errors = save_settings(imported)
                     if errors:
                         return self._send(400, {"errors": errors})
-            if not ROUTE_LOCK.acquire(timeout=2):
-                return self._send(409, {"error": "Идёт проверка или сравнение, попробуйте через минуту"})
-            changed, failed, error = [], [], None
-            try:
-                client = shared_client()
-                backup_rules(client, "перед восстановлением копии" if restoring else "перед загрузкой файла")
-                # Restore brings back exactly the saved rules; a file from elsewhere only adds and moves
-                changed, failed = apply_snapshot(client, snapshot, exact=restoring)
-                client.get_routed_domains()
-                client.refresh_apps_cache()
-            except Exception as e:
-                error = str(e)
-                logger.error(f"Ошибка восстановления правил: {e}")
-            finally:
-                ROUTE_LOCK.release()
-            what = f"Восстановлена копия от {snapshot.get('time')}" if restoring else "Загружен файл настроек и правил"
-            log_event("bad" if error or failed else "info",
-                      f"{what}: изменено {len(changed)}" + (f", не удалось {len(failed)}" if failed else "") + (f", ошибка: {error}" if error else ""))
-            if error or failed:
-                return self._send(502, {"error": error or f"Deeper не принял: {', '.join(failed[:10])}", "changed": changed})
-            self._send(200, {"ok": True, "changed": changed})
+            def restore_job():
+                changed, failed, error = [], [], None
+                try:
+                    client = shared_client()
+                    backup_rules(client, "перед восстановлением копии" if restoring else "перед загрузкой файла")
+                    # Restore brings back exactly the saved rules; a file from elsewhere only adds and moves
+                    changed, failed = apply_snapshot(client, snapshot, exact=restoring)
+                    client.get_routed_domains()
+                    client.refresh_apps_cache()
+                except Exception as e:
+                    error = str(e)
+                    logger.error(f"Ошибка восстановления правил: {e}")
+                what = f"Восстановлена копия от {snapshot.get('time')}" if restoring else "Загружен файл настроек и правил"
+                log_event("bad" if error or failed else "info",
+                          f"{what}: изменено {len(changed)}" + (f", не удалось {len(failed)}" if failed else "") + (f", ошибка: {error}" if error else ""))
+                if error or failed:
+                    return (502, {"error": error or f"Deeper не принял: {', '.join(failed[:10])}", "changed": changed})
+                return (200, {"ok": True, "changed": changed, "message": f"{what}: изменено {len(changed)}"})
+            self._queued(queue_action("Восстановление копии" if restoring else "Загрузка файла", restore_job, tunnel=None))
         elif self.path == "/api/check-now":
             CHECK_NOW.set()
             self._send(200, {"ok": True})
@@ -4298,6 +4486,7 @@ def start_web_server():
         logger.error(f"Не удалось запустить веб-интерфейс на порту {WEB_PORT}: {e}")
         return
     threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=queue_worker, daemon=True).start()  # The user's actions, one after another
     note = "" if password_is_set() else " (пароль ещё не задан: его попросит задать первая открытая страница)"
     logger.info(f"Веб-интерфейс настроек: http://<IP-сервера>:{WEB_PORT}/{note}")
 
@@ -4401,7 +4590,7 @@ def main():
                     logger.info(f"Параметры подключения к Deeper Connect изменены ({host}), переподключение...")
                     client = DeeperClient(host=host, username=user, password=password)
                 try:
-                    with ROUTE_LOCK:
+                    with route_turn("Проверка туннелей"):
                         run_watchdog_iteration(client, max_latency_ms=args.max_latency)
                 except Exception as e:
                     logger.error(f"Ошибка итерации: {e}")
