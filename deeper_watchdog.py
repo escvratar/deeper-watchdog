@@ -105,7 +105,8 @@ SETTINGS_SCHEMA = {
     # Service modes. Every service and app is in auto mode unless it is listed here ("group:<name>", "app:<name>")
     # Manual: never moved by the watchdog, even out of a tunnel without nodes; only reported
     "MANUAL_SERVICES": ("str", "", None, None),
-    # One "service_key=CODE" per line: preferred tunnel, left while it fails and returned to once it is green
+    # One "service_key=CODE1,CODE2,..." per line: preferred tunnels, the first one first. A service that works badly
+    # goes to the next of them, to other tunnels only when none of them works for it, and comes back up the list
     "PREFERRED_TUNNELS": ("text", "", None, None),
     # App Relocator apps shown in the web UI (Deeper app keys)
     "APPS": ("str", "instagram,telegram", None, None),
@@ -349,32 +350,60 @@ def _save_settings(values):
 
 apply_settings()
 
-# Country Names in Russian
+# Country names in Russian: every ISO 3166 country, then Deeper's regions that pool several countries
 COUNTRY_NAMES = {
-    "US": "США",
-    "GB": "Великобритания",
-    "NL": "Нидерланды",
-    "DE": "Германия",
-    "FR": "Франция",
-    "CA": "Канада",
-    "JP": "Япония",
-    "SG": "Сингапур",
-    "CN": "Китай",
-    "RU": "Россия",
-    "PL": "Польша",
-    "TR": "Турция",
-    "RS": "Сербия", "IT": "Италия", "ES": "Испания", "PT": "Португалия", "IE": "Ирландия", "BE": "Бельгия",
-    "LU": "Люксембург", "CH": "Швейцария", "AT": "Австрия", "CZ": "Чехия", "SK": "Словакия", "HU": "Венгрия",
-    "RO": "Румыния", "BG": "Болгария", "GR": "Греция", "CY": "Кипр", "HR": "Хорватия", "SI": "Словения",
-    "BA": "Босния и Герцеговина", "ME": "Черногория", "MK": "Северная Македония", "AL": "Албания",
-    "MD": "Молдова", "UA": "Украина", "BY": "Беларусь", "LT": "Литва", "LV": "Латвия", "EE": "Эстония",
-    "FI": "Финляндия", "SE": "Швеция", "NO": "Норвегия", "DK": "Дания", "IS": "Исландия",
-    "GE": "Грузия", "AM": "Армения", "AZ": "Азербайджан", "KZ": "Казахстан", "UZ": "Узбекистан",
-    "KG": "Киргизия", "IL": "Израиль", "AE": "ОАЭ", "SA": "Саудовская Аравия", "QA": "Катар", "EG": "Египет",
-    "IN": "Индия", "PK": "Пакистан", "HK": "Гонконг", "TW": "Тайвань", "KR": "Южная Корея", "TH": "Таиланд",
-    "VN": "Вьетнам", "MY": "Малайзия", "ID": "Индонезия", "PH": "Филиппины", "AU": "Австралия",
-    "NZ": "Новая Зеландия", "BR": "Бразилия", "AR": "Аргентина", "CL": "Чили", "CO": "Колумбия",
-    "MX": "Мексика", "PE": "Перу", "ZA": "ЮАР", "NG": "Нигерия", "KE": "Кения", "MA": "Марокко",
+    "AD": "Андорра", "AE": "ОАЭ", "AF": "Афганистан", "AG": "Антигуа и Барбуда", "AI": "Ангилья", "AL": "Албания",
+    "AM": "Армения", "AO": "Ангола", "AQ": "Антарктида", "AR": "Аргентина", "AS": "Американское Самоа",
+    "AT": "Австрия", "AU": "Австралия", "AW": "Аруба", "AX": "Аландские острова", "AZ": "Азербайджан",
+    "BA": "Босния и Герцеговина", "BB": "Барбадос", "BD": "Бангладеш", "BE": "Бельгия", "BF": "Буркина-Фасо",
+    "BG": "Болгария", "BH": "Бахрейн", "BI": "Бурунди", "BJ": "Бенин", "BL": "Сен-Бартелеми",
+    "BM": "Бермудские острова", "BN": "Бруней", "BO": "Боливия", "BQ": "Бонэйр, Синт-Эстатиус и Саба",
+    "BR": "Бразилия", "BS": "Багамы", "BT": "Бутан", "BV": "Остров Буве", "BW": "Ботсвана", "BY": "Беларусь",
+    "BZ": "Белиз", "CA": "Канада", "CC": "Кокосовые острова", "CD": "ДР Конго", "CF": "ЦАР", "CG": "Конго",
+    "CH": "Швейцария", "CI": "Кот-д’Ивуар", "CK": "Острова Кука", "CL": "Чили", "CM": "Камерун", "CN": "Китай",
+    "CO": "Колумбия", "CR": "Коста-Рика", "CU": "Куба", "CV": "Кабо-Верде", "CW": "Кюрасао", "CX": "Остров Рождества",
+    "CY": "Кипр", "CZ": "Чехия", "DE": "Германия", "DJ": "Джибути", "DK": "Дания", "DM": "Доминика",
+    "DO": "Доминиканская Республика", "DZ": "Алжир", "EC": "Эквадор", "EE": "Эстония", "EG": "Египет",
+    "EH": "Западная Сахара", "ER": "Эритрея", "ES": "Испания", "ET": "Эфиопия", "FI": "Финляндия", "FJ": "Фиджи",
+    "FK": "Фолклендские острова", "FM": "Федеративные Штаты Микронезии", "FO": "Фарерские острова", "FR": "Франция",
+    "GA": "Габон", "GB": "Великобритания", "GD": "Гренада", "GE": "Грузия", "GF": "Французская Гвиана",
+    "GG": "Гернси", "GH": "Гана", "GI": "Гибралтар", "GL": "Гренландия", "GM": "Гамбия", "GN": "Гвинея",
+    "GP": "Гваделупа", "GQ": "Экваториальная Гвинея", "GR": "Греция", "GS": "Южная Георгия", "GT": "Гватемала",
+    "GU": "Гуам", "GW": "Гвинея-Бисау", "GY": "Гайана", "HK": "Гонконг", "HM": "Острова Херд и Макдональд",
+    "HN": "Гондурас", "HR": "Хорватия", "HT": "Гаити", "HU": "Венгрия", "ID": "Индонезия", "IE": "Ирландия",
+    "IL": "Израиль", "IM": "Остров Мэн", "IN": "Индия", "IO": "Британская терр. в Индийском океане", "IQ": "Ирак",
+    "IR": "Иран", "IS": "Исландия", "IT": "Италия", "JE": "Джерси", "JM": "Ямайка", "JO": "Иордания", "JP": "Япония",
+    "KE": "Кения", "KG": "Киргизия", "KH": "Камбоджа", "KI": "Кирибати", "KM": "Коморы", "KN": "Сент-Китс и Невис",
+    "KP": "КНДР", "KR": "Южная Корея", "KW": "Кувейт", "KY": "Острова Кайман", "KZ": "Казахстан", "LA": "Лаос",
+    "LB": "Ливан", "LC": "Сент-Люсия", "LI": "Лихтенштейн", "LK": "Шри-Ланка", "LR": "Либерия", "LS": "Лесото",
+    "LT": "Литва", "LU": "Люксембург", "LV": "Латвия", "LY": "Ливия", "MA": "Марокко", "MC": "Монако",
+    "MD": "Молдова", "ME": "Черногория", "MF": "Сен-Мартен", "MG": "Мадагаскар", "MH": "Маршалловы острова",
+    "MK": "Северная Македония", "ML": "Мали", "MM": "Мьянма (Бирма)", "MN": "Монголия", "MO": "Макао",
+    "MP": "Северные Марианские острова", "MQ": "Мартиника", "MR": "Мавритания", "MS": "Монтсеррат", "MT": "Мальта",
+    "MU": "Маврикий", "MV": "Мальдивы", "MW": "Малави", "MX": "Мексика", "MY": "Малайзия", "MZ": "Мозамбик",
+    "NA": "Намибия", "NC": "Новая Каледония", "NE": "Нигер", "NF": "Остров Норфолк", "NG": "Нигерия",
+    "NI": "Никарагуа", "NL": "Нидерланды", "NO": "Норвегия", "NP": "Непал", "NR": "Науру", "NU": "Ниуэ",
+    "NZ": "Новая Зеландия", "OM": "Оман", "PA": "Панама", "PE": "Перу", "PF": "Французская Полинезия",
+    "PG": "Папуа — Новая Гвинея", "PH": "Филиппины", "PK": "Пакистан", "PL": "Польша", "PM": "Сен-Пьер и Микелон",
+    "PN": "Острова Питкэрн", "PR": "Пуэрто-Рико", "PS": "Палестина", "PT": "Португалия", "PW": "Палау",
+    "PY": "Парагвай", "QA": "Катар", "RE": "Реюньон", "RO": "Румыния", "RS": "Сербия", "RU": "Россия", "RW": "Руанда",
+    "SA": "Саудовская Аравия", "SB": "Соломоновы острова", "SC": "Сейшельские острова", "SD": "Судан", "SE": "Швеция",
+    "SG": "Сингапур", "SH": "Остров Св. Елены", "SI": "Словения", "SJ": "Шпицберген и Ян-Майен", "SK": "Словакия",
+    "SL": "Сьерра-Леоне", "SM": "Сан-Марино", "SN": "Сенегал", "SO": "Сомали", "SR": "Суринам", "SS": "Южный Судан",
+    "ST": "Сан-Томе и Принсипи", "SV": "Сальвадор", "SX": "Синт-Мартен", "SY": "Сирия", "SZ": "Эсватини",
+    "TC": "Тёркс и Кайкос", "TD": "Чад", "TF": "Французские Южные территории", "TG": "Того", "TH": "Таиланд",
+    "TJ": "Таджикистан", "TK": "Токелау", "TL": "Восточный Тимор", "TM": "Туркменистан", "TN": "Тунис", "TO": "Тонга",
+    "TR": "Турция", "TT": "Тринидад и Тобаго", "TV": "Тувалу", "TW": "Тайвань", "TZ": "Танзания", "UA": "Украина",
+    "UG": "Уганда", "UM": "Внешние о-ва США", "US": "США", "UY": "Уругвай", "UZ": "Узбекистан", "VA": "Ватикан",
+    "VC": "Сент-Винсент и Гренадины", "VE": "Венесуэла", "VG": "Виргинские острова (Великобритания)",
+    "VI": "Виргинские острова (США)", "VN": "Вьетнам", "VU": "Вануату", "WF": "Уоллис и Футуна", "WS": "Самоа",
+    "XK": "Косово", "YE": "Йемен", "YT": "Майотта", "ZA": "ЮАР", "ZM": "Замбия", "ZW": "Зимбабве",
+    "AFC": "Центральная Африка", "AFE": "Восточная Африка", "AFN": "Северная Африка", "AFS": "Южная Африка",
+    "AFW": "Западная Африка", "AMC": "Карибы", "AMM": "Центральная Америка", "AMN": "Северная Америка",
+    "AMS": "Южная Америка", "ASC": "Центральная Азия", "ASD": "Юго-Восточная Азия", "ASE": "Восточная Азия",
+    "ASS": "Южная Азия", "ASW": "Западная Азия", "EUE": "Восточная Европа", "EUN": "Северная Европа",
+    "EUS": "Южная Европа", "EUW": "Западная Европа", "OCA": "Австралия и Новая Зеландия", "OCM": "Меланезия",
+    "OCN": "Микронезия", "OCP": "Полинезия",
 }
 
 # AtomOS RSA Public Key
@@ -389,17 +418,23 @@ FwIDAQAB
 -----END PUBLIC KEY-----"""
 
 def preferred_tunnels():
+    """key -> its preferred tunnels in order (the first one is its home)."""
     result = {}
     for line in PREFERRED_TUNNELS.splitlines():
         if "=" in line:
-            key, code = line.rsplit("=", 1)
-            if key.strip() and code.strip():
-                result[key.strip()] = code.strip().upper()
+            key, codes = line.rsplit("=", 1)
+            codes = list(dict.fromkeys(c.strip().upper() for c in codes.split(",") if c.strip()))
+            if key.strip() and codes:
+                result[key.strip()] = codes
     return result
 
 
 def preferred_setting(prefs):
-    return "\n".join(f"{k}={v}" for k, v in sorted(prefs.items()))
+    return "\n".join(f"{k}={','.join(v)}" for k, v in sorted(prefs.items()))
+
+
+def pref_label(codes):
+    return " › ".join(codes)
 
 
 def listed(value):
@@ -410,10 +445,9 @@ MODE_NAMES = {"auto": "«Авто»", "manual": "«Вручную»", "": "«В�
 
 
 def service_mode(key):
-    """"auto", "manual" or the preferred tunnel's code."""
-    pref = preferred_tunnels().get(key)
-    if pref:
-        return pref
+    """"auto", "manual" or "preferred" (its tunnels: preferred_tunnels())."""
+    if key in preferred_tunnels():
+        return "preferred"
     return "manual" if key in listed(MANUAL_SERVICES) else "auto"
 
 
@@ -595,6 +629,7 @@ AUTO_STATE.setdefault("rebuilt_at", {})  # code -> when the watchdog (or the use
 AUTO_STATE.setdefault("tours", {})  # key -> {"tried": {code: score}, "at", "settled"}: tunnels tried while it worked badly
 AUTO_STATE.setdefault("manual_away", {})  # key -> {"to", "at"}: preferred services the user moved elsewhere by hand
 AUTO_STATE.setdefault("bad_ips", {})  # key -> {code: {ip: when}}: nodes a service had to leave for working badly
+AUTO_STATE.setdefault("node_bad", {})  # code -> {ip: when}: nodes the tunnel was switched away from (note_node_bad)
 AUTO_STATE.setdefault("hosts", {})  # host -> {"seen": last answer through any tunnel, "good": last non-error status}
 # Only preferred services come back; auto ones stay where a failover took them
 AUTO_STATE["evacuated"] = {k: e for k, e in AUTO_STATE["evacuated"].items() if k in preferred_tunnels()}
@@ -641,6 +676,47 @@ def prune_events(clear=False):
         save_json(EVENTS_FILE, EVENTS)
     except Exception as e:
         logger.debug(f"Could not save events: {e}")
+
+
+def event_codes():
+    """Every tunnel code the watchdog knows: they are what a log entry is searched for by tunnel."""
+    return {t["code"] for t in ROUTES["all_tunnels"]} | set(ROUTES["tunnels"]) | set(AUTO_STATE.get("seen_tunnels") or [])
+
+
+def mentions(text, code):
+    """The entry names this tunnel: the code as a word of its own (NL, "в NL", "NL → GB"), not a part of one."""
+    return re.search(rf"(?<![A-Za-z]){re.escape(code)}(?![A-Za-z])", text) is not None
+
+
+def event_tunnels(events):
+    """Tunnels mentioned in the log, the most mentioned first: the choices of the log's tunnel filter."""
+    counts = {}
+    for code in event_codes():
+        n = sum(mentions(e.get("text", ""), code) for e in events)
+        if n:
+            counts[code] = n
+    return sorted(counts, key=lambda c: (-counts[c], c))
+
+
+def filter_events(events, tunnel, text):
+    """Log entries about a tunnel and/or a domain or service. A domain finds the entries of the service it belongs
+    to (they are written by the service's name), and a service's name finds them as well."""
+    names = set()
+    if text:
+        for g in service_groups(ROUTES["whitelist"]):
+            if text in g["name"].lower() or any(text in d["domain"] for d in g["domains"]):
+                names.add(g["name"].lower())
+        names |= {a for a in configured_apps() if text in a.lower()}
+    result = []
+    for e in events:
+        t = e.get("text", "")
+        low = t.lower()
+        if tunnel and not mentions(t, tunnel):
+            continue
+        if text and text not in low and not any(n in low for n in names):
+            continue
+        result.append(e)
+    return result
 
 
 def save_auto_state():
@@ -1289,6 +1365,21 @@ def failover_target(key, exclude, tunnels):
     return best["tunnelCode"]
 
 
+def next_target(key, exclude, tunnels):
+    """Where a service leaving `exclude` (a code or a set of them) goes: the first of its preferred tunnels that has
+    nodes, passes its checks and isn't on a node the service already had to leave; only when none of them can take
+    it, any other tunnel (failover_target)."""
+    exclude = {exclude} if isinstance(exclude, str) else set(exclude)
+    by_code = {t.get("tunnelCode"): t for t in tunnels}
+    for c in preferred_tunnels().get(key, []):
+        t = by_code.get(c) or {}
+        if c in exclude or t.get("activeNum", 0) == 0 or t.get("activeIp") in bad_ips(key, c) \
+                or not (STATUS["tunnels"].get(c) or {}).get("healthy", True):
+            continue
+        return c
+    return failover_target(key, exclude, tunnels)
+
+
 def mark_moved(key):
     """Starts the hold-down: the service stays where it is for HOLD_DOWN seconds."""
     with STATE_LOCK:
@@ -1342,6 +1433,8 @@ def prune_cache():
             AUTO_STATE["bad_ips"][key] = per
         else:
             del AUTO_STATE["bad_ips"][key]
+    AUTO_STATE["node_bad"] = {c: v for c, v in ((c, {ip: t for ip, t in ips.items() if now - t < NODE_BAD_HOURS * 3600})
+                                                 for c, ips in AUTO_STATE["node_bad"].items()) if v}
     AUTO_STATE["hosts"] = {h: v for h, v in AUTO_STATE["hosts"].items() if keep(v.get("seen")) or keep(v.get("good"))}
     for name in ("moved_at", "rebuilt_at"):
         AUTO_STATE[name] = {k: t for k, t in AUTO_STATE[name].items() if keep(t)}
@@ -1350,10 +1443,21 @@ def prune_cache():
 
 
 def note_evacuated(key, from_code, to_code):
-    """A preferred service left its tunnel: remembers it so it comes back. Under STATE_LOCK."""
+    """The watchdog moved a preferred service from `from_code` to `to_code`: remembers which of its preferred tunnels
+    it had to leave and when, so it climbs back up its list (enforce_preferred). Under STATE_LOCK."""
     AUTO_STATE["manual_away"].pop(key, None)  # Moved by the watchdog: no longer where the user put it
-    AUTO_STATE["evacuated"][key] = {"from": from_code, "to": to_code, "since": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    "at": time.time(), "wait": return_wait(key)}
+    prefs = preferred_tunnels().get(key) or []
+    old = AUTO_STATE["evacuated"].get(key) or {}
+    left = {c: t for c, t in (old.get("left") or ({old["from"]: old.get("at", 0)} if old.get("from") else {})).items()
+            if c in prefs}
+    if from_code in prefs:
+        left[from_code] = time.time()
+    left.pop(to_code, None)
+    if not left or (prefs and to_code == prefs[0]):
+        AUTO_STATE["evacuated"].pop(key, None)  # At home, or never left one of its preferred tunnels
+        return
+    AUTO_STATE["evacuated"][key] = {"from": min(left, key=prefs.index), "to": to_code, "left": left,
+                                    "since": time.strftime("%Y-%m-%d %H:%M:%S"), "at": time.time(), "wait": return_wait(key)}
 
 
 def wait_for_nodes(client, code, seconds):
@@ -1391,7 +1495,7 @@ def _evacuate(client, code, only, reason, why, mail):
         if service_mode(key) == "manual":
             kept.append(name)  # Never moved by the watchdog
             continue
-        target = failover_target(key, code, tunnels)
+        target = next_target(key, code, tunnels)
         if target is None:
             failed.append(name)
             continue
@@ -1401,7 +1505,7 @@ def _evacuate(client, code, only, reason, why, mail):
                 note_bad_ip(key, code, tunnels)  # Only a tunnel with nodes has one: a failing one, not an empty one
                 # Only a preferred service comes back; auto ones stay where they landed
                 if key in prefs:
-                    note_evacuated(key, prefs[key], target)
+                    note_evacuated(key, code, target)
             moved.append(f"{name} → {target}")
         else:
             failed.append(name)
@@ -1448,67 +1552,90 @@ PIN_FAILED = {}  # key -> time of the last refused move back
 
 
 def enforce_preferred(client, green_since, only=None):
-    """Services with a preferred tunnel go back to it, whoever moved them away: a failover, a comparison that
-    couldn't restore, Deeper's own app. `green_since`: code -> since when the tunnel has nodes and passes its
-    checks. A service that left a failing tunnel returns once it has been green for return_wait() seconds
-    since it left; one moved away otherwise, after NODES_STABLE seconds."""
-    now, prefs = time.time(), {}
-    for k, c in preferred_tunnels().items():
-        if c not in green_since or (only is not None and k not in only):
+    """Services with preferred tunnels climb back up their list, whoever moved them away: a failover, a comparison
+    that couldn't restore, Deeper's own app. `green_since`: code -> since when the tunnel has nodes and passes its
+    checks. The target is the highest preferred tunnel that is ready: green, not on a node the service had to leave,
+    and green for return_wait() seconds since the service left it (one it never left: NODES_STABLE seconds). A
+    service moves only up its list: from a lower preferred tunnel or from any other one. `only`: the user just set
+    the mode of these services, they go to the first of their tunnels that has nodes right away."""
+    now, todo = time.time(), {}
+    for k, codes in preferred_tunnels().items():
+        if only is not None and k not in only:
             continue
         if k in AUTO_STATE["manual_away"] and only is None:
             continue  # The user moved it elsewhere by hand: it stays there
-        evac = AUTO_STATE["evacuated"].get(k)
-        if evac and evac.get("from") == c:
-            # Back only to another node: the one it left worked badly for it
-            ready = now - max(green_since[c], evac.get("at", 0)) >= evac.get("wait", PREFERRED_RETURN_AFTER) \
-                and tunnel_ip(c) not in bad_ips(k, c)
-        else:
-            ready = now - green_since[c] >= NODES_STABLE
-        if ready:
-            prefs[k] = c
-    if not prefs or COMPARE["running"]:
+        evac = AUTO_STATE["evacuated"].get(k) or {}
+        left = evac.get("left") or ({evac["from"]: evac.get("at", 0)} if evac.get("from") else {})
+        for c in codes:
+            if c not in green_since:
+                continue
+            if only is not None:
+                todo[k] = c
+                break
+            if tunnel_ip(c) in bad_ips(k, c):
+                continue  # Back only to another node: the one it left worked badly for it
+            if c in left:
+                ready = now - max(green_since[c], left[c]) >= evac.get("wait", PREFERRED_RETURN_AFTER)
+            else:
+                ready = now - green_since[c] >= NODES_STABLE
+            if ready:
+                todo[k] = c
+                break
+    if not todo or COMPARE["running"]:
         return
     with MOVE_LOCK:
-        _enforce_preferred(client, prefs)
+        _enforce_preferred(client, todo)
 
 
-def _enforce_preferred(client, prefs):
+def _enforce_preferred(client, todo):
     rules = [{"domain": i.get("domainName"), "tunnel": i.get("tunnelCode")} for i in client.get_whitelist_domains()]
     groups = {g["key"]: g for g in service_groups(rules)}
-    apps = client.get_apps() if any(k.startswith("app:") for k in prefs) else {}
+    apps = client.get_apps() if any(k.startswith("app:") for k in todo) else {}
+    prefs = preferred_tunnels()
     changed = False
-    for key, code in prefs.items():
+    for key, code in todo.items():
         name = key.split(":", 1)[-1]
+        codes = prefs.get(key) or [code]
+        rank = lambda c: codes.index(c) if c in codes else len(codes)
         if key.startswith("app:"):
             cur = (apps.get(name) or {}).get("tunnel")
-            if cur is None or cur == code:
+            if cur is None or rank(cur) <= rank(code):
                 continue
             move = lambda: client.set_app_tunnel(name, code)
         else:
             g = groups.get(key)
-            if g is None or (not g["split"] and g["main"] == code):
+            if g is None or (not g["split"] and rank(g["main"]) <= rank(code)):
                 continue
             cur = " / ".join(sorted(g["tunnels"]))
             move = lambda g=g: group_mover(client, g)[0](code)
         if time.time() - PIN_FAILED.get(key, 0) < PIN_RETRY:
             continue
-        evac = AUTO_STATE["evacuated"].get(key)
+        evac = AUTO_STATE["evacuated"].get(key) or {}
+        left = evac.get("left") or ({evac["from"]: evac.get("at", 0)} if evac.get("from") else {})
         if move():
             PIN_FAILED.pop(key, None)
             mark_moved(key)
             with STATE_LOCK:
-                AUTO_STATE["evacuated"].pop(key, None)
                 AUTO_STATE["tours"].pop(key, None)  # A new node: a fresh start
-                if evac and evac.get("from") == code:
+                if code == codes[0] or not left:
+                    AUTO_STATE["evacuated"].pop(key, None)
+                else:
+                    rest = {c: t for c, t in left.items() if rank(c) < rank(code)}
+                    if rest:
+                        AUTO_STATE["evacuated"][key] = dict(evac, left=rest, to=code, **{"from": min(rest, key=rank)})
+                    else:
+                        AUTO_STATE["evacuated"].pop(key, None)
+                if code in left:
                     AUTO_STATE["returned"][key] = {"at": time.time(), "wait": evac.get("wait", PREFERRED_RETURN_AFTER)}
             changed = True
-            logger.info(f"{name}: {cur} -> предпочтительный туннель {code}")
-            log_event("ok", f"{name}: вернулся из {cur} в {code}, он в норме {span(evac.get('wait', 0))}" if evac and evac.get("from") == code
-                      else f"{name}: перенесён из {cur} в предпочтительный туннель {code}", mail="nodes_back")
+            where = "в предпочтительный туннель" if len(codes) == 1 else \
+                "в главный предпочтительный туннель" if code == codes[0] else f"в предпочтительный туннель №{rank(code) + 1}"
+            logger.info(f"{name}: {cur} -> {where} {code}")
+            log_event("ok", f"{name}: вернулся из {cur} в {code}, он в норме {span(evac.get('wait', 0))}" if code in left
+                      else f"{name}: перенесён из {cur} {where} {code}", mail="nodes_back")
         else:
             PIN_FAILED[key] = time.time()
-            log_event("bad", f"{name}: не удалось вернуть в предпочтительный туннель {code}, повтор через {PIN_RETRY // 60} мин", mail="rollback")
+            log_event("bad", f"{name}: не удалось перенести в предпочтительный туннель {code}, повтор через {PIN_RETRY // 60} мин", mail="rollback")
     if changed:
         save_auto_state()
         client.get_routed_domains()
@@ -1832,6 +1959,72 @@ def switch_pending(code):
 
 SVC_SWITCHES = {}  # code -> {"n", "at"}: node switches because services worked badly in the tunnel
 SVC_SWITCH_RESET = 3600  # Seconds after the last such switch before the count starts anew
+# A node is to blame when at least this share of the tunnel's services works badly on it: then the node is switched
+# and they wait. Fewer bad ones: the node is fine for the rest, it is about those services (e.g. a site that blocks
+# the node's IP), so only they move and the others aren't cut off by a switch
+NODE_BAD_SHARE = 0.5
+NODE_VERDICT = {}  # code -> {"ok", "total"}: the last check found only a minority of its services bad
+NODE_BAD_HOURS = 3  # How long a node the tunnel was switched away from counts as bad for the tunnel
+RESWITCHES = {}  # code -> times the node watcher switched away from a bad node Deeper brought back
+RESWITCH_MAX = 4  # Such switches per hour; more means Deeper insists on its nodes: services move instead
+RESWITCH_NOTED = set()
+RECHECK_AFTER = 60  # Seconds after a node switch before an extra check judges the new node
+
+
+def note_node_bad(code, ip):
+    """The tunnel is switched away from this node for working badly. Deeper often brings a tunnel back to its old
+    node minutes later; the node watcher then switches away again (avoid_bad_node)."""
+    if ip:
+        with STATE_LOCK:
+            AUTO_STATE["node_bad"].setdefault(code, {})[ip] = time.time()
+
+
+def node_bad(code):
+    now = time.time()
+    return {ip for ip, t in AUTO_STATE["node_bad"].get(code, {}).items() if now - t < NODE_BAD_HOURS * 3600}
+
+
+def recheck_soon():
+    """An extra check soon after a node switch: the new node is judged in a minute, not after a whole interval."""
+    timer = threading.Timer(RECHECK_AFTER, CHECK_NOW.set)
+    timer.daemon = True
+    timer.start()
+
+
+def avoid_bad_node(client, t):
+    """Node watcher: Deeper brought the tunnel back to a node it was switched away from for working badly. It is
+    switched away again at once, up to RESWITCH_MAX times an hour; then the services that work badly move."""
+    code, ip = t.get("tunnelCode"), t.get("activeIp")
+    if not ip or t.get("activeNum", 0) < 2 or ip not in node_bad(code) or code in ACTIONS or STATUS.get("all_slow"):
+        return
+    now = time.time()
+    times = [x for x in RESWITCHES.get(code, []) if now - x < 3600]
+    RESWITCHES[code] = times
+    if len(times) >= RESWITCH_MAX:
+        if code not in RESWITCH_NOTED:
+            RESWITCH_NOTED.add(code)
+            log_event("warn", f"{code}: Deeper раз за разом возвращает туннель на плохую ноду {ip}. Больше не меняю её в этот час: "
+                              f"сервисы, которым плохо, переедут в другие туннели", mail="recovery")
+        return
+    RESWITCH_NOTED.discard(code)
+    times.append(now)
+    set_action(code, "Уход с плохой ноды…")
+    try:
+        res = client.switch_node(code, ip)
+        if not (isinstance(res, dict) and res.get("success")):
+            return
+        time.sleep(VERIFY_PAUSE)
+        match = get_tunnel(client, code) or {}
+        if match:
+            live_pool(code, match)
+        new_ip = match.get("activeIp") or res.get("activeIp")
+    finally:
+        set_action(code)
+    fresh_node(client, code)
+    recheck_soon()
+    text = f"{code}: Deeper вернул туннель на ноду {ip}, на которой было плохо. Нода сменена снова, IP {ip} → {new_ip}"
+    logger.warning(text)
+    log_event("warn", text)
 
 
 def fresh_node(client, code, keys=None):
@@ -1848,8 +2041,14 @@ def node_switch_first(client, current):
     when the tunnel has another node, the node is switched first, up to SWITCH_ATTEMPTS times per
     SVC_SWITCH_RESET seconds, and the services leave only if that didn't help. Not for manual services, silent ones
     or ones bad in every tunnel, and not when every tunnel is slow. Returns the keys that wait for the new node."""
+    NODE_VERDICT.clear()
     if STATUS.get("all_slow"):
         return set()
+    # Every service with something to judge counts (manual ones too): how many of the tunnel's services the node fails
+    votes = {}
+    for key, r in current.items():
+        if r["tunnel"] not in (None, "split", "ZZ", "LL") and not r.get("silent"):
+            votes.setdefault(r["tunnel"], []).append(degraded(r))
     troubled = {}
     for key, r in current.items():
         code = r["tunnel"]
@@ -1866,6 +2065,10 @@ def node_switch_first(client, current):
     tunnels = {t.get("tunnelCode"): t for t in client.list_tunnels()}
     for code, keys in troubled.items():
         t = tunnels.get(code) or {}
+        total, bad = len(votes.get(code, [])), sum(votes.get(code, []))
+        if total and bad < total * NODE_BAD_SHARE:
+            NODE_VERDICT[code] = {"ok": total - bad, "total": total}
+            continue  # Most services are fine on this node: only the bad ones move (decide_services)
         if now - SVC_SWITCHES.get(code, {}).get("at", 0) >= SVC_SWITCH_RESET:
             SVC_SWITCHES.pop(code, None)
         n = SVC_SWITCHES.get(code, {}).get("n", 0) + 1
@@ -1874,6 +2077,7 @@ def node_switch_first(client, current):
         SVC_SWITCHES[code] = {"n": n, "at": now}
         names = ", ".join(k.split(":", 1)[1] for k in keys)
         old_ip = t.get("activeIp")
+        note_node_bad(code, old_ip)
         set_action(code, f"Смена ноды {n} из {SWITCH_ATTEMPTS}…")
         try:
             res = client.switch_node(code, old_ip or "")
@@ -1888,8 +2092,10 @@ def node_switch_first(client, current):
         finally:
             set_action(code)
         fresh_node(client, code)
+        recheck_soon()
         waiting |= set(keys)
-        text = (f"{code}: плохо работают {names}, нода сменена ({n} из {SWITCH_ATTEMPTS}), IP {old_ip} → {new_ip}. "
+        share = f"{bad} из {total}" if total > 1 else "единственный сервис"
+        text = (f"{code}: плохо работают {names} ({share}), нода сменена ({n} из {SWITCH_ATTEMPTS}), IP {old_ip} → {new_ip}. "
                 f"Сервисы переедут, только если новая нода не поможет")
         logger.warning(text)
         log_event("warn", text, mail="recovery")
@@ -1957,6 +2163,7 @@ def decide_services(client, current):
             if move_to is None or cur != r["tunnel"]:
                 continue  # Moved meanwhile
             stays = mode == "auto"
+            prefs = preferred_tunnels().get(key) or []
             # A tour of the tunnels: each one with nodes it hasn't tried yet, in turn. Each stay is scored; once
             # all are tried and none was good, it goes back to the best one and stays there
             with STATE_LOCK:
@@ -1966,10 +2173,11 @@ def decide_services(client, current):
                 tour["tried"][cur] = stay_score(key)
                 tour.setdefault("ips", {})[cur] = next((t.get("activeIp") for t in tunnels if t.get("tunnelCode") == cur), None)
                 tour["at"] = now
-            # Never onto a node it already had to leave (its preferred tunnel included: enforce_preferred decides)
+            # Never onto a node it already had to leave (its preferred tunnels included: enforce_preferred decides).
+            # Its preferred tunnels first, in their order, then any other
             skip = set(tour["tried"]) | {t.get("tunnelCode") for t in tunnels
                                          if t.get("activeIp") and t["activeIp"] in bad_ips(key, t.get("tunnelCode"))}
-            target = failover_target(key, skip, tunnels)
+            target = next_target(key, skip, tunnels)
             settle = target is None
             if settle:
                 with_nodes = {t.get("tunnelCode") for t in tunnels if t.get("activeNum", 0) > 0}
@@ -1990,14 +2198,19 @@ def decide_services(client, current):
             with STATE_LOCK:
                 note_bad_ip(key, cur, tunnels)
                 if not stays:
-                    note_evacuated(key, mode, target)
-            if not stays and target == mode:
-                with STATE_LOCK:
-                    AUTO_STATE["evacuated"].pop(key, None)  # The best of all tunnels is its preferred one
-            wait = AUTO_STATE["evacuated"].get(key, {}).get("wait", PREFERRED_RETURN_AFTER)
+                    note_evacuated(key, cur, target)
+            evac = AUTO_STATE["evacuated"].get(key) or {}
+            wait = evac.get("wait", PREFERRED_RETURN_AFTER)
+            verdict = NODE_VERDICT.get(cur) or {}
+            why = f"{name}: в {cur} {why_bad(r)}" + (
+                f" (в {cur} в норме {verdict['ok']} из {verdict['total']} сервисов: дело не в ноде, она не менялась)"
+                if verdict.get("ok") else "")
             text = (f"{name}: плохо во всех туннелях ({scores}), переехал в лучший, {target}. Новая попытка, когда где-нибудь появится новая нода"
-                    if settle else f"{name}: в {cur} {why_bad(r)}, переехал в {target}") + (
-                "" if stays or settle or target == mode else f", вернётся в {mode}, когда он {span(wait)} подряд будет в норме")
+                    if settle else f"{why}, переехал в {target}" + (
+                        f" (предпочтительный №{prefs.index(target) + 1})" if target in prefs[1:] else
+                        " (в предпочтительных туннелях ему сейчас места нет)" if prefs and target not in prefs else "")) + (
+                f", вернётся в {evac['from']}, когда там будет другая нода и она {span(wait)} подряд будет в норме"
+                if evac.get("from") and not settle else "")
             logger.warning(text)
             log_event("warn", text, mail="failover")
         save_auto_state()
@@ -2056,15 +2269,15 @@ def move_job(domain, to):
             r["final"] = to
     forget_service(domain)
     mark_moved(domain)
-    pref = preferred_tunnels().get(domain)
+    prefs = preferred_tunnels().get(domain) or []
     with STATE_LOCK:
-        if pref and pref != to:
+        if prefs and prefs[0] != to:
             AUTO_STATE["manual_away"][domain] = {"to": to, "at": time.time()}
         else:
             AUTO_STATE["manual_away"].pop(domain, None)
     save_auto_state()
     log_event("info", f"{name}: перенесён в {to} вручную"
-              + (f", предпочтительный туннель остаётся {pref}" if pref and pref != to else ""), mail="changes")
+              + (f", предпочтительные туннели остаются {pref_label(prefs)}" if prefs and prefs[0] != to else ""), mail="changes")
     CHECK_NOW.set()  # The tunnels it left and went to are checked right away: the overview shows them as they are
     return 200, {"ok": True, "message": f"{name} теперь через {to}"}
 
@@ -2157,6 +2370,7 @@ def recover_tunnel(client, code, country, active_ip, active_num, canaries, max_l
     done = SWITCHES.get(code, 0)
     if active_num > 1 and done < SWITCH_ATTEMPTS:
         SWITCHES[code] = done + 1
+        note_node_bad(code, active_ip)
         set_action(code, f"Смена ноды {done + 1} из {SWITCH_ATTEMPTS}…")
         res = client.switch_node(code, active_ip)
         logger.info(f"Смена ноды {done + 1}/{SWITCH_ATTEMPTS}: {res}")
@@ -2165,6 +2379,7 @@ def recover_tunnel(client, code, country, active_ip, active_num, canaries, max_l
             return False, "не изменился", active_num, action, [f"Deeper не сменил ноду: {res}"]
         time.sleep(VERIFY_PAUSE)
         fresh_node(client, code)
+        recheck_soon()
         match = get_tunnel(client, code) or {}
         if match:
             live_pool(code, match)
@@ -2726,13 +2941,34 @@ details.tgroup>.sitelist{margin:0 16px 0 72px;padding:6px 0 12px}
 .li-title{font-weight:590;word-break:break-word;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .li-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;font-size:12px;color:var(--muted)}
 .li-right.inline{flex-direction:row;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}.li-right .tseg{color:var(--text)}.li-right .tseg button{padding:4px 10px;font-size:12px}
-@media (max-width:700px){.li:has(.tseg){grid-template-columns:auto 1fr}.li:has(.tseg) .li-right{grid-column:2;justify-content:flex-start}}
+@media (max-width:700px){.li:has(.tseg),.li:has(.tsel){grid-template-columns:auto 1fr}.li:has(.tseg) .li-right,.li:has(.tsel) .li-right{grid-column:2;justify-content:flex-start}}
 .chip{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;padding:2px 8px;border-radius:7px;background:var(--fill);color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
 .chip.best{background:var(--green-soft);color:var(--green)}
 .chip.bad{background:var(--red-soft);color:var(--red)}
 .chips{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
 .rec{font-size:13px;margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .events .li{grid-template-columns:auto 1fr auto;align-items:start;padding:11px 16px}
+.evfilter{display:flex;gap:8px;margin:-2px 0 10px}
+.evfilter .popup{flex:0 0 auto;min-width:150px;max-width:46%;background:var(--card)}
+.evfilter .field[type=search]{flex:1;min-width:0;background:var(--card);text-align:left}
+.evfilter .field[type=search]:focus{background:var(--card)}
+.evcount{font-size:13px;color:var(--muted);margin:-4px 4px 8px}
+dialog.prefd{width:min(400px,calc(100vw - 32px));text-align:left}
+.prefd .ab{padding:18px 16px 10px}
+.prefd h3{text-align:center}
+.prefd p{text-align:center;color:var(--muted)}
+.plist{margin:12px -4px 0;max-height:min(52vh,420px);overflow:auto;overscroll-behavior:contain}
+.prow{display:flex;align-items:center;gap:10px;width:100%;border:0;background:none;color:inherit;text-align:left;padding:8px 6px;border-radius:10px;cursor:pointer;min-height:44px}
+@media (hover:hover){.prow:hover{background:var(--fill)}}
+.prow .pn{flex:0 0 24px;height:24px;border-radius:50%;display:grid;place-items:center;font-size:12px;font-weight:700;background:var(--fill);color:var(--muted)}
+.prow.on .pn{background:var(--indigo);color:#fff}
+.prow .pt{flex:1;min-width:0}
+.prow .pt b{font-weight:600}
+.prow .pt small{display:block;color:var(--muted);font-size:12px}
+.prow .pm{display:flex;gap:4px}
+.prow .pm button{border:0;background:var(--fill);color:var(--text);width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:15px}
+.prow .pm button:disabled{opacity:.3;cursor:default}
+.psep{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin:12px 8px 4px}
 .events .li::before{left:56px!important}
 .events .tm{font-size:12px;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums;padding-top:2px}
 .events .tx{font-size:14px;line-height:1.38;padding-top:2px}
@@ -2890,6 +3126,8 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
 .tp{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:550;background:var(--fill);border-radius:7px;padding:3px 8px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .tp b{font-weight:700;color:var(--muted)}
 .warnline{font-size:13px;margin-top:5px;color:var(--orange);display:flex;gap:6px;align-items:center;font-weight:500}
+.tcard .tpick+.popup{width:100%;margin-top:16px}
+.li-right .tsel+.popup{max-width:230px;min-height:28px;padding:4px 8px 4px 11px;border-radius:999px;font-size:13px;font-weight:600}
 
 /* Test sites editor and backups */
 .sites{padding:4px 18px 16px}
@@ -2945,6 +3183,8 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
  <div id="appsBlock" hidden><div class="sect">Приложения</div><div class="tunnels" id="apps"></div></div>
  <div id="svcBlock" hidden><div class="sect">Сервисы</div><div class="card svcgrid" id="svcList"></div></div>
  <div id="eventsBlock"><div class="sect">Журнал</div>
+ <div class="evfilter"><select class="field tun" id="evTunnel" aria-label="Туннель"><option value="">Все туннели</option></select>
+  <input class="field" id="evQuery" type="search" placeholder="Домен или сервис" aria-label="Поиск в журнале по домену или сервису" autocapitalize="off" spellcheck="false"></div>
  <div class="card list events" id="events"></div>
  <button class="btn sm plain more" id="eventsMore" type="button" hidden>Показать все</button></div>
 </section>
@@ -2975,7 +3215,7 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
   <div class="ghead">Сайты и приложения</div>
   <div class="card" style="padding:14px 16px">
    <div class="small muted">Сравнение меряет все сервисы там, где они сейчас, затем по очереди переносит их все в каждый туннель и меряет разом, а в конце возвращает обратно. Во время сравнения сайты могут подтормаживать.
-   Пинг сервиса считается как средний по его доменам. Справа у каждого сервиса выбирается режим. «Авто» (по умолчанию): если в его туннеле плохая связь или нет нод, сервис переезжает в лучший туннель, где есть ноды, и остаётся там; просто потому, что где-то быстрее, не переезжает. «Вручную»: никогда не переносится сам, даже из туннеля без нод, при сбое приходит письмо. Туннель (📌): предпочтительный; при сбое сервис временно уходит и возвращается, когда туннель 5 минут подряд в норме.</div>
+   Пинг сервиса считается как средний по его доменам. Справа у каждого сервиса выбирается режим. «Авто» (по умолчанию): если в его туннеле плохая связь или нет нод, сервис переезжает в лучший туннель, где есть ноды, и остаётся там; просто потому, что где-то быстрее, не переезжает. «Вручную»: никогда не переносится сам, даже из туннеля без нод, при сбое приходит письмо. Предпочтительные туннели (📌): один или несколько по порядку. Если сервису плохо, сначала меняется нода, затем он уходит в следующий предпочтительный туннель, в остальные — только если не подошёл ни один; возвращается вверх по списку, когда там новая нода и она 5 минут подряд в норме.</div>
    <div class="toolbar">
     <label class="selall"><input type="checkbox" class="check" id="selAll">Выбрать все</label>
     <input class="field" id="rtFilter" type="search" placeholder="Поиск" aria-label="Поиск сайта">
@@ -3224,7 +3464,9 @@ async function api(path,body){
 function toastErr(e){toast(e.message,!e.queued)}
 const ms=v=>v!=null?Math.round(v)+" мс":"нет ответа";
 const hostOf=u=>{try{return new URL(u).hostname}catch(e){return u}};
-let countryNames={};const tname=c=>countryNames[c]||c;
+// Server names first; any other ISO code by the browser's own list, so a new tunnel never shows a bare code
+let countryNames={};const intlNames=(()=>{try{return new Intl.DisplayNames(["ru"],{type:"region"})}catch(e){return null}})();
+const tname=c=>{if(countryNames[c])return countryNames[c];try{const n=intlNames&&/^[A-Z]{2}$/.test(c)&&intlNames.of(c);if(n&&n!==c)return n}catch(e){}return c};
 const APP_NAMES={instagram:"Instagram",telegram:"Telegram",facebook:"Facebook",messenger:"Messenger",chatGpt:"ChatGPT",youtube:"YouTube",twitter:"X (Twitter)",whatsapp:"WhatsApp",tiktok:"TikTok",netflix:"Netflix",spotify:"Spotify",discord:"Discord",gemini:"Gemini",claude:"Claude"};
 const APP_COLORS={instagram:"linear-gradient(135deg,#feda75,#d62976 55%,#4f5bd5)",telegram:"#2aabee",facebook:"#1877f2",youtube:"#ff0000",chatGpt:"#10a37f"};
 const appName=a=>APP_NAMES[a]||a.charAt(0).toUpperCase()+a.slice(1);
@@ -3369,14 +3611,31 @@ function spark(code){if(!historyData)return null;
  wrap.append(svg,tip,el("div",{class:"cap"},el("span",{text:`${historyData.hours} ч · мин ${Math.min(...vals)} · макс ${Math.max(...vals)} мс`}),el("span",{class:fails?"bad":"",text:fails?`сбоев ${fails}`:"без сбоев"})));
  return wrap}
 async function loadHistory(){try{historyData=await api("/api/history")}catch(e){}}
-async function loadEvents(){try{eventsData=(await api("/api/events")).events}catch(e){return}renderEvents()}
+// The log's filter: by tunnel and by a domain or service (a domain finds its service's entries), done by the server
+const evFilter={tunnel:"",q:""};let evTimer,eventsTotal=0;
+async function loadEvents(){const p=new URLSearchParams();if(evFilter.tunnel)p.set("tunnel",evFilter.tunnel);if(evFilter.q)p.set("q",evFilter.q);
+ const asked=p.toString();let r;try{r=await api("/api/events"+(asked?"?"+asked:""))}catch(e){return}
+ const now=new URLSearchParams();if(evFilter.tunnel)now.set("tunnel",evFilter.tunnel);if(evFilter.q)now.set("q",evFilter.q);
+ if(now.toString()!==asked)return;  // The filter changed meanwhile: a newer request is on its way
+ eventsData=r.events;eventsTotal=r.total??r.events.length;fillEvTunnels(r.tunnels||[]);renderEvents()}
+function fillEvTunnels(codes){const sel=$("evTunnel"),v=evFilter.tunnel,want=["",...codes];if(v&&!codes.includes(v))want.push(v);
+ if([...sel.options].map(o=>o.value).join()===want.join())return;sel.textContent="";
+ sel.append(el("option",{value:"","data-ic":"globe",text:"Все туннели"}));
+ for(const c of want.slice(1))sel.append(el("option",{value:c,"data-short":`${flag(c)} ${c}`,"data-menu":`${flag(c)} ${c} · ${tname(c)}`,text:c}));
+ sel.value=v}
+$("evTunnel").onchange=()=>{evFilter.tunnel=$("evTunnel").value;loadEvents()};
+$("evQuery").oninput=()=>{clearTimeout(evTimer);evTimer=setTimeout(()=>{evFilter.q=$("evQuery").value.trim();loadEvents()},300)};
 function renderEvents(){const box=$("events");box.textContent="";const today=new Date().toISOString().slice(0,10);
- const list=showAllEvents?eventsData.slice(0,150):eventsData.slice(0,8);
- if(!list.length)box.append(el("div",{class:"empty"},icon("clock"),"Событий пока нет"));
+ const filtered=!!(evFilter.tunnel||evFilter.q);
+ const list=showAllEvents||filtered?eventsData.slice(0,150):eventsData.slice(0,8);
+ let cnt=$("evCount");if(!cnt){cnt=el("div",{class:"evcount",id:"evCount"});box.before(cnt)}
+ cnt.hidden=!filtered;cnt.textContent=filtered?`Найдено ${eventsData.length} из ${eventsTotal}`+(eventsData.length>150?", показаны последние 150":""):"";
+ $("evTunnel").closest(".evfilter").hidden=!filtered&&!eventsTotal;
+ if(!list.length)box.append(el("div",{class:"empty"},icon("clock"),filtered?"Ничего не найдено":"Событий пока нет"));
  const EVI={ok:"check",bad:"x",warn:"excl",info:"info"};
  for(const e of list)box.append(el("div",{class:"li"},el("span",{class:"evi "+e.kind},icon(EVI[e.kind]||"info")),
   el("div",{class:"tx",text:e.text}),el("div",{class:"tm",text:e.time.slice(0,10)===today?e.time.slice(11,16):e.time.slice(8,10)+"."+e.time.slice(5,7)+" "+e.time.slice(11,16)})));
- $("eventsMore").hidden=eventsData.length<=8;$("eventsMore").textContent=showAllEvents?"Свернуть":`Показать все (${Math.min(eventsData.length,150)})`}
+ $("eventsMore").hidden=filtered||eventsData.length<=8;$("eventsMore").textContent=showAllEvents?"Свернуть":`Показать все (${Math.min(eventsData.length,150)})`}
 $("eventsMore").onclick=()=>{showAllEvents=!showAllEvents;renderEvents()};
 // A slow service in manual mode doesn't move by itself: the overview suggests comparing it
 function slowManual(key,x,d){if(x.tunnel==="split"||(x.latency!=null&&x.latency<=d.max_latency))return false;
@@ -3459,7 +3718,7 @@ function renderTunnels(){
   const ping=el("div",{class:"tping "+(x.latency?pingKind(x.latency):"none")},x.latency?String(Math.round(x.latency)):"—",x.latency?el("small",{text:"мс"}):null);
   const busy=doing?el("span",{class:"spin tbusy",role:"status",title:doing.text,"aria-label":doing.text}):null;
   const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(open),"aria-label":`${x.country}: ${label}, подробнее`},
-   codeBadge(c),el("div",{},el("div",{class:"tname",text:x.country}),sub),busy,ping,el("span",{class:"chev","aria-hidden":"true"}),tunnelButtons(c,x));
+   codeBadge(c),el("div",{},el("div",{class:"tname",text:x.country&&x.country!==c?x.country:tname(c)}),sub),busy,ping,el("span",{class:"chev","aria-hidden":"true"}),tunnelButtons(c,x));
   const toggle=e=>{if(e.target.closest("button"))return;open?openCards.delete(c):openCards.set(c,Date.now());renderTunnels()};
   head.onclick=toggle;head.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle(e)}};
   const body=open?el("div",{class:"tbody"},tmeta(x,x.unchecked?null:st.fail_threshold),spark(c),
@@ -3528,11 +3787,13 @@ function renderApps(){
  const d=routesData,box=$("apps");if(!d)return;$("appsBlock").hidden=!d.apps.length;box.textContent="";
  const usable=d.all_tunnels.filter(t=>t.nodes>0);
  for(const a of d.apps){const r=d.app_results[a.app],key="app:"+a.app;
-  const seg=el("div",{class:"seg accent",role:"radiogroup","aria-label":"Страна для "+appName(a.app)});
-  for(const t of usable){const b=el("button",{type:"button","aria-pressed":String(t.code===a.tunnel),title:tname(t.code),text:t.code});
-   b.onclick=async()=>{if(t.code===a.tunnel)return;for(const x of seg.children){x.disabled=true;x.setAttribute("aria-pressed",String(x===b))}thumb(seg);
-    try{await api("/api/move",{domain:key,to:t.code});toast(`${appName(a.app)} теперь через ${tname(t.code)}`)}catch(e){toastErr(e)}loadRoutes()};
-   seg.append(b)}
+  const go=async to=>{try{await api("/api/move",{domain:key,to});toast(`${appName(a.app)} теперь через ${tname(to)}`)}catch(e){toastErr(e)}loadRoutes()};
+  let seg;
+  if(usable.length>SEG_MAX){seg=tunnelSelect(a.tunnel,usable,go,"Страна для "+appName(a.app));seg.classList.add("tpick")}
+  else{seg=el("div",{class:"seg accent",role:"radiogroup","aria-label":"Страна для "+appName(a.app)});
+   for(const t of usable){const b=el("button",{type:"button","aria-pressed":String(t.code===a.tunnel),title:tname(t.code),text:t.code});
+    b.onclick=()=>{if(t.code===a.tunnel)return;for(const x of seg.children){x.disabled=true;x.setAttribute("aria-pressed",String(x===b))}thumb(seg);go(t.code)};
+    seg.append(b)}}
   const cur=usable.find(t=>t.code===a.tunnel);
   box.append(el("div",{class:"card tcard"},
    el("div",{class:"thead"},el("span",{class:"avatar",style:"background:"+(APP_COLORS[a.app]||"#8e8e93"),text:appName(a.app).charAt(0)}),
@@ -3626,24 +3887,32 @@ function renderItems(box,items,results,d){box.textContent="";
  for(const {key,tunnel,group} of items){const res=results[key],name=group?group.name:itemName(key);
   const sel=el("input",{type:"checkbox",class:"check","aria-label":"Выбрать "+name});sel.checked=selected.has(key);
   sel.onchange=()=>{sel.checked?selected.add(key):selected.delete(key);renderRoutes()};
-  const pin=(d.preferred||{})[key]||"",mode=(d.modes||{})[key]||"auto",ev=(d.evacuated||{})[key],hold=(d.hold_down||{})[key];
-  const sw=el("select",{class:"mini","aria-label":"Режим для "+name,title:"«Авто», «Вручную» или предпочтительный туннель"});
+  const prefs=[].concat((d.preferred||{})[key]||[]),pin=prefs[0]||"",mode=(d.modes||{})[key]||"auto",ev=(d.evacuated||{})[key],hold=(d.hold_down||{})[key];
+  const sw=el("select",{class:"mini","aria-label":"Режим для "+name,title:"«Авто», «Вручную» или предпочтительные туннели"});
   sw.append(el("option",{value:"auto","data-ic":"sparkle","data-sub":"При плохой связи или без нод переезжает туда, где есть ноды",text:"Авто"}),
    el("option",{value:"manual","data-ic":"hand","data-sub":"Никогда не переносится сам, только письмо при сбое",text:"Вручную"}));
   const pg=el("optgroup",{label:"Предпочтительный туннель"});
   const tl=[...d.all_tunnels];if(pin&&!tl.some(t=>t.code===pin))tl.push({code:pin,nodes:0});
   for(const t of tl)pg.append(el("option",{value:t.code,"data-ic":"pin","data-short":`${flag(t.code)} ${t.code}`,"data-menu":`${flag(t.code)} ${t.code} · ${tname(t.code)}`,
    "data-sub":t.nodes?`${t.nodes} ${plural(t.nodes,"нода","ноды","нод")}`:"сейчас нет нод",text:t.code}));
+  // Several preferred tunnels in order: picked in a dialog
+  pg.append(el("option",{value:"__multi","data-ic":"pin","data-menu":prefs.length>1?"Изменить список…":"Несколько туннелей…",
+   "data-short":prefs.length>1?"📌 "+prefs.join(" › "):"Несколько…","data-sub":prefs.length>1?prefs.join(" › "):"По порядку: сначала первый, потом следующие",text:"Несколько"}));
   sw.append(pg);sw.dataset.tone=mode==="auto"?"on":pin?"pin":"";
-  sw.value=mode;sw.onchange=()=>saveMode(key,sw.value,sw,mode);
+  const cur=prefs.length>1?"__multi":pin||(mode==="preferred"?"auto":mode);
+  sw.value=cur;sw.onchange=async()=>{
+   if(sw.value!=="__multi")return saveMode(key,sw.value,sw,cur);
+   const list=await pickPreferred(name,prefs.length?prefs:[],d);
+   if(list)saveMode(key,list,sw,cur);else sw.value=cur};
   const tchip=group&&group.split
    ?el("span",{class:"chip bad",text:"⚠ "+Object.entries(group.tunnels).map(([t,n])=>`${t} ${n}`).join(" · ")})
    :el("span",{class:"chip",text:tunnelLabel(tunnel)});
   const main=el("div",{class:"li-main"},el("div",{class:"li-title"},name,tchip));
-  if(pin&&ev&&ev.from===pin)main.append(el("div",{class:"warnline"},icon("clock"),ev.new_node
-   ?`Временно в ${ev.to}: на ноде ${pin} ему было плохо. Вернётся, когда в ${pin} будет другая нода и она ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`
-   :`Временно в ${ev.to}: в ${pin} был сбой. Вернётся, когда ${pin} ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`));
-  else if(pin&&tunnel&&tunnel!==pin&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("pin"),`Вернётся в ${pin}, когда он будет в норме`));
+  if(pin&&ev&&ev.from)main.append(el("div",{class:"warnline"},icon("clock"),ev.new_node
+   ?`Временно в ${ev.to}: на ноде ${ev.from} ему было плохо. Вернётся, когда в ${ev.from} будет другая нода и она ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`
+   :`Временно в ${ev.to}: в ${ev.from} был сбой. Вернётся, когда ${ev.from} ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`));
+  else if(pin&&tunnel&&tunnel!==pin&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("pin"),prefs.includes(tunnel)
+   ?`Сейчас в запасном ${tunnel} (№${prefs.indexOf(tunnel)+1}). Вернётся в ${pin}, когда он будет в норме`:`Вернётся в ${pin}, когда он будет в норме`));
   if(hold&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("clock"),`Удержание после переезда ещё ${Math.max(1,Math.round((hold-Date.now()/1000)/60))} мин`));
   const tour=(d.tours||{})[key];if(tour)main.append(el("div",{class:"warnline"},icon("refresh"),tourText(tour)));
   if(group){const n=group.domains.length,del=el("button",{type:"button",class:"btn sm danger"},icon("trash"),n>1?"Удалить все домены":"Удалить домен");
@@ -3671,18 +3940,55 @@ function renderItems(box,items,results,d){box.textContent="";
   const right=el("div",{class:"li-right"},sw);
   if(mode==="manual"&&!(group&&group.split)){right.classList.add("inline");right.prepend(tunnelSeg(key,tunnel,d))}
   box.append(el("div",{class:"li"},sel,main,right))}}
+// More tunnels than this don't fit a phone's width as buttons: a pop-up menu instead
+const SEG_MAX=4;
+function tunnelSelect(tunnel,tl,onPick,label){
+ const sel=el("select",{class:"field tun","aria-label":label});
+ const list=[...tl];if(tunnel&&!list.some(t=>t.code===tunnel))list.unshift({code:tunnel,nodes:0});
+ if(!tunnel)sel.append(el("option",{value:"","data-short":"—",text:"—"}));
+ for(const t of list.sort((a,b)=>tname(a.code).localeCompare(tname(b.code),"ru")))sel.append(el("option",{value:t.code,disabled:!t.nodes&&t.code!==tunnel,
+  "data-short":`${flag(t.code)} ${t.code} · ${tname(t.code)}`,"data-menu":`${flag(t.code)} ${t.code} · ${tname(t.code)}`,
+  "data-sub":t.nodes?`${t.nodes} ${plural(t.nodes,"нода","ноды","нод")}`:"нет нод",text:t.code}));
+ sel.value=tunnel||"";sel.onchange=()=>{if(sel.value&&sel.value!==tunnel){sel.disabled=true;onPick(sel.value)}};return sel}
 // Manual mode: the service's tunnel is picked right in the row
-function tunnelSeg(key,tunnel,d){const s=el("div",{class:"seg tseg accent",role:"radiogroup","aria-label":"Туннель для "+itemName(key)});
+function tunnelSeg(key,tunnel,d){
  const tl=d.all_tunnels.filter(t=>t.nodes>0||t.code===tunnel);
+ if(tl.length>SEG_MAX){const s=tunnelSelect(tunnel,tl,to=>moveDomain(key,to,s),"Туннель для "+itemName(key));s.classList.add("tsel");return s}
+ const s=el("div",{class:"seg tseg accent",role:"radiogroup","aria-label":"Туннель для "+itemName(key)});
  if(tunnel&&!tl.some(t=>t.code===tunnel))tl.push({code:tunnel,nodes:0});
  for(const t of tl){const on=t.code===tunnel;
   const b=el("button",{type:"button","aria-pressed":String(on),title:`${tname(t.code)}${t.nodes?"":" · нет нод"}`},`${flag(t.code)} ${t.code}`);
   b.disabled=!on&&!t.nodes;b.onclick=()=>{if(on)return;s.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",String(x===b)));thumb(s);moveDomain(key,t.code,b)};
   s.append(b)}
  requestAnimationFrame(()=>thumb(s));return s}
+// The preferred tunnels of a service, in order: tap to add to the end of the list, arrows to reorder
+function pickPreferred(name,current,d){return new Promise(resolve=>{
+ const order=current.filter(c=>d.all_tunnels.some(t=>t.code===c)||current.includes(c));
+ const dlg=el("dialog",{class:"alertd prefd","aria-label":"Предпочтительные туннели"}),list=el("div",{class:"plist"});
+ const no=el("button",{type:"button",text:"Отменить"}),yes=el("button",{type:"button",class:"def",text:"Сохранить"});
+ const info=c=>{const t=d.all_tunnels.find(x=>x.code===c);return t&&t.nodes?`${t.nodes} ${plural(t.nodes,"нода","ноды","нод")}`:"сейчас нет нод"};
+ const row=(c,i)=>{const on=i>=0,r=el("div",{class:"prow"+(on?" on":""),role:"button",tabindex:"0","aria-pressed":String(on)},
+   el("span",{class:"pn",text:on?String(i+1):"+"}),el("span",{class:"pt"},el("b",{text:`${flag(c)} ${c} · ${tname(c)}`}),el("small",{text:info(c)})));
+  if(on){const up=el("button",{type:"button","aria-label":"Выше",text:"↑"}),dn=el("button",{type:"button","aria-label":"Ниже",text:"↓"});
+   up.disabled=i===0;dn.disabled=i===order.length-1;
+   up.onclick=e=>{e.stopPropagation();[order[i-1],order[i]]=[order[i],order[i-1]];draw()};
+   dn.onclick=e=>{e.stopPropagation();[order[i+1],order[i]]=[order[i],order[i+1]];draw()};
+   r.append(el("span",{class:"pm"},up,dn))}
+  const toggle=()=>{on?order.splice(i,1):order.push(c);draw()};
+  r.onclick=toggle;r.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle()}};return r};
+ const draw=()=>{list.textContent="";order.forEach((c,i)=>list.append(row(c,i)));
+  const rest=d.all_tunnels.map(t=>t.code).filter(c=>!order.includes(c)).sort((a,b)=>tname(a).localeCompare(tname(b),"ru"));
+  if(rest.length)list.append(el("div",{class:"psep",text:order.length?"Добавить":"Туннели"}),...rest.map(c=>row(c,-1)));
+  yes.disabled=!order.length;yes.textContent=order.length?`Сохранить (${order.length})`:"Сохранить"};
+ dlg.append(el("div",{class:"ab"},el("h3",{text:name}),el("p",{text:"Сначала первый туннель. Если ему там плохо и смена ноды не помогла — следующий по списку. В другие туннели — только если не подошёл ни один."}),list),
+  el("div",{class:"abtns"},no,yes));
+ (document.querySelector("dialog[open]")||document.body).append(dlg);dlg.showModal();draw();
+ const done=v=>{dlg.close();dlg.remove();resolve(v)};
+ no.onclick=()=>done(null);yes.onclick=()=>done(order.slice());dlg.addEventListener("cancel",e=>{e.preventDefault();done(null)})})}
 async function saveMode(key,mode,sw,was){const n=itemName(key);sw.disabled=true;
- try{const r=await api("/api/pin",{key,mode});
-  toast(r.note||(mode==="auto"?`Авто включено для ${n}`:mode==="manual"?`${n}: вручную`:`${n}: предпочтительный туннель ${mode}`),!!r.note);
+ const many=Array.isArray(mode);
+ try{const r=await api("/api/pin",many?{key,mode:"preferred",tunnels:mode}:{key,mode});
+  toast(r.note||(mode==="auto"?`Авто включено для ${n}`:mode==="manual"?`${n}: вручную`:many?`${n}: предпочтительные ${mode.join(" › ")}`:`${n}: предпочтительный туннель ${mode}`),!!r.note);
   if(mode==="auto")wasRunning=true}
  catch(e){sw.value=was;toast(e.message,true)}sw.disabled=false;loadRoutes()}
 async function moveDomain(domain,to,btn){btn.disabled=true;
@@ -3965,7 +4271,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._check_auth():
             return
-        self.path = urllib.parse.urlparse(self.path).path
+        url = urllib.parse.urlparse(self.path)
+        self.path, query = url.path, {k: v[-1] for k, v in urllib.parse.parse_qs(url.query).items()}
         if self.path == "/api/auth":
             self._send(200, {"setup": not password_is_set(), "signed_in": self._signed_in(), "min": MIN_PASSWORD,
                              "from_env": bool(WEB_PASSWORD)})
@@ -3989,7 +4296,9 @@ class SettingsHandler(BaseHTTPRequestHandler):
                         "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - EVENTS_DAYS * 86400)):
                     prune_events()
                 events = list(reversed(EVENTS))
-            self._send(200, {"events": events})
+            tunnel, text = query.get("tunnel", "").strip().upper(), query.get("q", "").strip().lower()
+            matched = filter_events(events, tunnel, text) if tunnel or text else events
+            self._send(200, {"events": matched, "total": len(events), "tunnels": event_tunnels(events)})
         elif self.path == "/api/history":
             now = int(time.time())
             cutoff = now - HISTORY_HOURS * 3600  # Points are pruned only by a check: none may have run for a while
@@ -4037,6 +4346,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "evacuated": {k: dict(e, new_node=tunnel_ip(e["from"]) in bad_ips(k, e["from"]))
                               for k, e in AUTO_STATE["evacuated"].items()},
                 "preferred": preferred_tunnels(),
+                # Tunnels a check judged to have only a minority of bad services: the node stays, those services move
+                "node_verdict": dict(NODE_VERDICT),
             })
         elif self.path == "/api/status":
             queue, done = queue_view()
@@ -4119,21 +4430,32 @@ class SettingsHandler(BaseHTTPRequestHandler):
             name = domain.split(":", 1)[-1]
             self._queued(queue_action(f"Перенос {name} в {to}", lambda: move_job(domain, to)))
         elif self.path == "/api/pin":
-            # mode: "auto", "manual" or a tunnel code (preferred tunnel); "" from older pages is manual
+            # mode: "auto", "manual", or the preferred tunnels in order: "tunnels": [codes] (older pages: a code
+            # or "NL,GB" as the mode); "" from older pages is manual
             key, mode = (body.get("key"), body.get("mode")) if isinstance(body, dict) else (None, None)
+            tunnels = body.get("tunnels") if isinstance(body, dict) else None
+            if isinstance(mode, str) and mode not in MODE_NAMES and mode != "preferred" and tunnels is None:
+                tunnels = mode.split(",")
             codes = {t["code"] for t in ROUTES["all_tunnels"]} | set(ROUTES["tunnels"])
+            if tunnels is not None:
+                if not isinstance(tunnels, list) or not all(isinstance(c, str) for c in tunnels):
+                    return self._send(400, {"error": "Неверный список туннелей"})
+                tunnels = list(dict.fromkeys(c.strip().upper() for c in tunnels if c.strip()))
+                mode = "preferred"
             if not isinstance(key, str) or not key or "=" in key or "\n" in key or "," in key \
-                    or not isinstance(mode, str) or (mode not in MODE_NAMES and mode not in codes):
+                    or not isinstance(mode, str) or (mode not in MODE_NAMES and mode != "preferred") \
+                    or (mode == "preferred" and (not tunnels or len(tunnels) > 10 or any(c not in codes for c in tunnels))):
                 return self._send(400, {"error": "Неверный сервис или туннель"})
             mode = mode or "manual"
-            was = service_mode(key)
             manual, prefs = listed(MANUAL_SERVICES), preferred_tunnels()
+            was = pref_label(prefs[key]) if key in prefs else service_mode(key)
             manual.discard(key)
             prefs.pop(key, None)
             if mode == "manual":
                 manual.add(key)
-            elif mode != "auto":
-                prefs[key] = mode
+            elif mode == "preferred":
+                prefs[key] = tunnels
+                mode = pref_label(tunnels)
             errors = save_settings({"MANUAL_SERVICES": ",".join(sorted(manual)), "PREFERRED_TUNNELS": preferred_setting(prefs)})
             if errors:
                 return self._send(400, {"errors": errors})
@@ -4148,14 +4470,17 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 log_event("info", f"{name}: режим {label(mode)} вместо {label(was)}")
             if mode not in MODE_NAMES:
                 nodes = {t["code"]: t["nodes"] for t in ROUTES["all_tunnels"]}
-                if not nodes.get(mode):
+                first = next((c for c in tunnels if nodes.get(c)), None)
+                if first is None:
                     note = f"В {mode} сейчас нет нод: {name} переедет туда, когда они появятся"
                 else:
-                    def pin_job(key=key, mode=mode, name=name):
+                    def pin_job(key=key, mode=mode, name=name, tunnels=tunnels, nodes=nodes):
                         PIN_FAILED.pop(key, None)
-                        enforce_preferred(shared_client(), {mode: 0}, only={key})
-                        return 200, {"ok": True, "message": f"{name}: предпочтительный туннель {mode}"}
-                    job = queue_action(f"Перенос {name} в {mode}", pin_job)
+                        enforce_preferred(shared_client(), {c: 0 for c in tunnels if nodes.get(c)}, only={key})
+                        return 200, {"ok": True, "message": f"{name}: предпочтительные туннели {mode}"}
+                    if first != tunnels[0]:
+                        note = f"В {tunnels[0]} сейчас нет нод: {name} пока будет в {first} и вернётся в {tunnels[0]}, когда там появятся ноды"
+                    job = queue_action(f"Перенос {name} в {first}", pin_job)
                     if not job["done"].wait(QUEUE_WAIT):
                         note = f"{name} переедет в {mode} в свою очередь" + (f", после: {BUSY['text'].lower()}" if BUSY["text"] else "")
                     elif job["result"][0] >= 300:
@@ -4231,6 +4556,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
                     if before.get("activeNum", 0) < 2:
                         return (409, {"error": f"В туннеле {tunnel} нет другой ноды для переключения"})
                     set_action(tunnel, "Смена ноды…")
+                    # The user left this node: if Deeper brings the tunnel back to it, the node watcher leaves it again
+                    note_node_bad(tunnel, before.get("activeIp"))
                     res = client.switch_node(tunnel, before.get("activeIp") or "")
                     if not (isinstance(res, dict) and res.get("success")):
                         return (502, {"error": f"Deeper не сменил ноду: {res}"})
@@ -4396,6 +4723,10 @@ def watch_nodes_once(client, tunnels):
             if EMPTY_SINCE.pop(code, None) is not None:
                 log_event("ok", f"{code}: ноды появились, нод {t.get('activeNum')}", mail="nodes_back")
                 CHECK_NOW.set()
+            try:
+                avoid_bad_node(client, t)
+            except Exception as e:
+                logger.error(f"Ошибка ухода с плохой ноды {code}: {e}")
             continue
         if code not in EMPTY_SINCE:
             EMPTY_SINCE[code] = now
@@ -4404,7 +4735,7 @@ def watch_nodes_once(client, tunnels):
         if code in ACTIONS:
             continue  # Already being handled: a check, a rebuild or a failover
         # Services preferring this tunnel leave it even with failover off: they come back by themselves
-        pinned = {k for k, c in prefs.items() if c == code}
+        pinned = {k for k, c in prefs.items() if code in c}
         # Not during a comparison: it is moving services itself. Retried every 30 s, not every tick
         if (FAILOVER_EMPTY or pinned) and empty_for >= FAILOVER_WAIT and not COMPARE["running"] \
                 and now - EVAC_TRIED.get(code, 0) >= 30 and MOVE_LOCK.acquire(blocking=False):
