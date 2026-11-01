@@ -126,6 +126,11 @@ SETTINGS_SCHEMA = {
 # Fixed tuning: used to be settings, but the defaults are what works, and every knob made the page harder to use
 FIXED_SETTINGS = {
     "LATENCY_TIMEOUT": 3.5,       # Seconds to wait for the TCP handshake and the first byte
+    # Ping only proves the headers come through: DPI or a bad MTU can freeze a connection after its first ~16 KB.
+    # So this many domains of every tunnel per check (in turn; stalled ones always) also download a page...
+    "BODY_CHECK_SITES": 3,
+    "BODY_CHECK_KB": 64,          # ...up to this much (well above 16 KB)...
+    "BODY_TIMEOUT": 8,            # ...within this many seconds after the first byte
     "TUNNEL_FAIL_PCT": 50,        # A tunnel fails when at least this share of its domains is bad, %
     "SKIP_ALL_SLOW": True,        # Every tunnel failing at once is the network's fault: nothing is repaired
     "SWITCH_ATTEMPTS": 2,         # Node switches per outage before a rebuild is considered
@@ -1124,8 +1129,9 @@ BAD_IP_HOURS = 24         # How long a node a service had to leave counts as bad
 CACHE_HOURS = 48          # Nothing the watchdog remembers about domains, nodes and moves is kept longer
 TOUR_FORGET = 2 * 86400   # A tour of the tunnels is forgotten after this long
 # "<tunnel> <host>" -> quality of a site in a tunnel: {"url", "tunnel", "lat", "tcp", "ttfb", "status",
-# "error", "loss", "window", "fails", "at"}
+# "error", "loss", "window", "fails", "stalled", "at"}
 QUALITY = {}
+BODY_TURN = {}            # code -> where the next check's page downloads start among the tunnel's known domains
 TUNNEL_LOSS = {}          # code -> median loss of the tunnel's domains at its last check
 LAST_CHECK = {}           # code -> {"bad", "counted", "silent"}: domain counts of the tunnel's last check
 SSL_CTX = ssl.create_default_context()
@@ -1136,9 +1142,56 @@ def host_of(url):
     return urllib.parse.urlparse(url if "://" in url else "https://" + url).hostname or ""
 
 
-def probe_url(url, timeout=3.5):
+class Stall(str):
+    """Probe status of a page that stopped coming after its headers. `sized`: the server said how long it is, so
+    it is a stall for sure; without that it could be an endless stream, so it counts only for a domain that has
+    downloaded fully lately (host_full)."""
+    def __new__(cls, text, sized=False):
+        obj = super().__new__(cls, text)
+        obj.sized = sized
+        return obj
+
+
+def read_body(sock, first, limit, timeout):
+    """Reads the answer after its first bytes until it ends or `limit` bytes came. Returns None, or a Stall when
+    it froze or was too slow (BODY_TIMEOUT)."""
+    buf, need, chunked, sized = bytearray(first), limit, False, False
+    head = -1
+    deadline = time.monotonic() + BODY_TIMEOUT
+    try:
+        while True:
+            if head < 0:
+                head = buf.find(b"\r\n\r\n")
+                if head >= 0:
+                    headers = bytes(buf[:head]).lower()
+                    m = re.search(rb"\ncontent-length:\s*(\d+)", headers)
+                    if m:
+                        need, sized = min(limit, head + 4 + int(m.group(1))), True
+                    chunked = b"chunked" in headers
+            if len(buf) >= need or (chunked and buf.endswith(b"0\r\n\r\n")):
+                return None
+            left = deadline - time.monotonic()
+            slow = Stall(f"медленная загрузка: {len(buf) // 1024} КБ за {BODY_TIMEOUT} с", sized)
+            if left <= 0:
+                return slow
+            sock.settimeout(min(timeout, left))
+            try:
+                chunk = sock.recv(16384)
+            except socket.timeout:
+                if time.monotonic() >= deadline:
+                    return slow
+                raise
+            if not chunk:  # Connection: close — the whole answer came
+                return None
+            buf += chunk
+    except (OSError, ssl.SSLError):
+        return Stall(f"обрыв загрузки на {len(buf) // 1024} КБ", sized)
+
+
+def probe_url(url, timeout=3.5, body=0):
     """One synthetic request split into phases: the TCP handshake (SYN -> SYN-ACK) to the site's port, then TLS
     and an HTTP HEAD up to the first byte of the answer (TTFB). DNS stays outside the timings.
+    With `body` (bytes) it is a GET instead, and the page must also download up to that much (read_body).
     Returns (tcp_ms, ttfb_ms, status): times are None if the request failed, status is the HTTP code or the error."""
     u = urllib.parse.urlparse(url if "://" in url else "https://" + url)
     host, https = u.hostname, u.scheme != "http"
@@ -1165,13 +1218,17 @@ def probe_url(url, timeout=3.5):
         if https:
             sock = SSL_CTX.wrap_socket(sock, server_hostname=host)
         path = (u.path or "/") + (f"?{u.query}" if u.query else "")
-        sock.sendall(f"HEAD {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\n"
+        sock.sendall(f"{'GET' if body else 'HEAD'} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\nAccept: */*\r\n"
                      f"Connection: close\r\n\r\n".encode())
         first = sock.recv(32)
         t2 = time.monotonic()
         if not first:
             return None, None, "соединение закрыто без ответа"
         m = re.match(rb"HTTP/[\d.]+ (\d{3})", first)
+        if body and m:
+            stall = read_body(sock, first, body, timeout)
+            if stall:
+                return None, None, stall
         return (t1 - t0) * 1000, (t2 - t1) * 1000, int(m.group(1)) if m else "ответ не HTTP"
     except socket.timeout:
         return None, None, "таймаут ответа"
@@ -1189,14 +1246,21 @@ def probe_url(url, timeout=3.5):
                 pass
 
 
-def probe_all(urls, rounds=None):
-    """Probes every URL `rounds` times, each round all of them at once. Returns {url: [(tcp, ttfb, status)]}."""
+def probe_all(urls, rounds=None, body=()):
+    """Probes every URL `rounds` times, each round all of them at once; the URLs in `body` download their page in
+    the first round. Returns {url: [(tcp, ttfb, status)]}."""
     rounds = rounds or PROBE_ROUNDS
     result = {u: [] for u in urls}
+
+    def one(u, first):
+        if first and u in body:
+            return probe_url(u, timeout=LATENCY_TIMEOUT, body=BODY_CHECK_KB * 1024)
+        return probe_url(u, timeout=LATENCY_TIMEOUT)
+
     if urls:
         with ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(urls))) as pool:
-            for _ in range(rounds):
-                for u, p in zip(urls, pool.map(lambda u: probe_url(u, timeout=LATENCY_TIMEOUT), urls)):
+            for r in range(rounds):
+                for u, p in zip(urls, pool.map(lambda u: one(u, r == 0), urls)):
                     result[u].append(p)
     return result
 
@@ -1212,6 +1276,12 @@ def host_known(host, now=None):
     return (now or time.time()) - seen < HOST_MEMORY_DAYS * 86400
 
 
+def host_full(host, now=None):
+    """The domain has downloaded a whole page through some tunnel lately: a stall of it means something."""
+    full = AUTO_STATE["hosts"].get(host, {}).get("full", 0)
+    return (now or time.time()) - full < HOST_MEMORY_DAYS * 86400
+
+
 def penalized(host, status):
     """An error status counts against a tunnel only if the site has answered normally lately:
     a site that always answers 403 (e.g. to anything that isn't a browser) is just that kind of site."""
@@ -1219,9 +1289,10 @@ def penalized(host, status):
     return status in ERROR_STATUSES and time.time() - good < HOST_MEMORY_DAYS * 86400
 
 
-def record_quality(code, url, probes, now=None):
+def record_quality(code, url, probes, now=None, body=None):
     """Folds one check's probes of a site into its quality in the tunnel: the ping of this check and the loss over
-    the regular probes of the last LOSS_CHECKS checks. Returns the record."""
+    the regular probes of the last LOSS_CHECKS checks. `body`: this check's page download — None if there was
+    none (the last result stays), False if it came whole, the Stall if it froze. Returns the record."""
     now = now or time.time()
     host = host_of(url)
     best = best_probe(probes)
@@ -1233,7 +1304,12 @@ def record_quality(code, url, probes, now=None):
             h["seen"] = now
             if status not in ERROR_STATUSES:
                 h["good"] = now
+        if body is False:
+            h["full"] = now
         prev = QUALITY.get(f"{code} {host}") or {"window": [], "fails": 0}
+        stalled = prev.get("stalled") if body is None else body or None
+        if stalled and best:
+            status = stalled
         # The regular probes only: a repeat probe of a bad site is there to rule out noise, not to add loss
         size = LOSS_CHECKS * PROBE_ROUNDS
         window = (prev["window"] + [p[0] is not None for p in probes[:PROBE_ROUNDS]])[-size:]
@@ -1242,7 +1318,7 @@ def record_quality(code, url, probes, now=None):
         lat = best[0] + best[1] if best else None
         rec = {"url": url, "tunnel": code, "lat": lat, "tcp": best and best[0], "ttfb": best and best[1],
                "status": status, "error": error, "loss": loss, "window": window,
-               "fails": 0 if best else prev["fails"] + 1, "at": now}
+               "fails": 0 if best else prev["fails"] + 1, "stalled": stalled, "at": now}
         QUALITY[f"{code} {host}"] = rec
     return rec
 
@@ -1273,23 +1349,38 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
         return True, 0, "No canaries configured"
 
     now = time.time()
-    probes = probe_all(endpoints)
+    trusted = lambda u: host_known(host_of(u), now)
+    # Pages to download: the ones that stalled last time (has it passed?), then the known domains in turn
+    stuck = [u for u in endpoints if (QUALITY.get(f"{tunnel_code} {host_of(u)}") or {}).get("stalled")]
+    known = [u for u in endpoints if trusted(u) and u not in stuck]
+    turn = BODY_TURN.get(tunnel_code, 0) % len(known) if known else 0
+    body = (stuck + (known[turn:] + known[:turn])[:max(0, BODY_CHECK_SITES - len(stuck))]) if BODY_CHECK_SITES else []
+    BODY_TURN[tunnel_code] = turn + BODY_CHECK_SITES
+    probes = probe_all(endpoints, body=set(body))
+    stall = lambda u, p: isinstance(p[2], Stall) and (p[2].sized or host_full(host_of(u), now))
+    stalled = [u for u in body if stall(u, probes[u][0])]
+    if stalled:
+        # A stall must happen twice in a row: the page is downloaded once more right away
+        for u, extra in probe_all(stalled, rounds=1, body=set(stalled)).items():
+            probes[u] += extra
+            if extra[0][0] is not None:
+                stalled.remove(u)
+    downloads = {u: (probes[u][0][2] if u in stalled else False if probes[u][0][0] is not None else None) for u in body}
     # Deeper resolves routed domains through the tunnel, so a DNS failure of a domain that answered lately is the
     # tunnel's fault. A domain that never answered anywhere and doesn't resolve is just gone
-    trusted = lambda u: host_known(host_of(u), now)
     resolves = [u for u in endpoints if trusted(u)
                 or not all(isinstance(p[2], str) and p[2].startswith("DNS:") for p in probes[u])]
     # Before this check is recorded: a domain answering for the first time counts too
     counted = [u for u in resolves if trusted(u) or best_probe(probes[u])] or resolves
     if not counted:
         for u in endpoints:
-            record_quality(tunnel_code, u, probes[u], now)
+            record_quality(tunnel_code, u, probes[u], now, downloads.get(u))
         LAST_CHECK[tunnel_code] = {"bad": 0, "counted": 0, "silent": len(endpoints)}
         return True, 0, "No resolvable domains: " + ", ".join(host_of(u) for u in endpoints)
 
     def is_bad(u):
         best = best_probe(probes[u])
-        return best is None or best[0] + best[1] > max_latency_ms or penalized(host_of(u), best[2])
+        return best is None or best[0] + best[1] > max_latency_ms or penalized(host_of(u), best[2]) or u in stalled
 
     bad = [u for u in counted if is_bad(u)]
     retried = False
@@ -1300,10 +1391,10 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
             probes[u] += extra
         bad = [u for u in counted if is_bad(u)]
 
-    recs = {u: record_quality(tunnel_code, u, probes[u], now) for u in endpoints}
+    recs = {u: record_quality(tunnel_code, u, probes[u], now, downloads.get(u)) for u in endpoints}
     for u, r in recs.items():
         SITE_RESULTS[f"{tunnel_code} {u}"] = {"url": u, "tunnel": tunnel_code, "latency": r["lat"], "status": r["status"],
-                                              "ok": r["lat"] is not None, "loss": r["loss"],
+                                              "ok": r["lat"] is not None and not r["stalled"], "loss": r["loss"],
                                               "counted": u in counted, "time": time.strftime("%H:%M:%S")}
     answered = [recs[u]["lat"] for u in counted if recs[u]["lat"] is not None]
     med = median(answered)
@@ -1311,7 +1402,8 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
     LAST_CHECK[tunnel_code] = {"bad": len(bad), "counted": len(counted), "silent": len(endpoints) - len(counted)}
 
     worst = sorted(bad, key=lambda u: recs[u]["lat"] if recs[u]["lat"] is not None else 10 ** 9, reverse=True)
-    listed_bad = "; ".join(f"{host_of(u)}: " + (f"{recs[u]['lat']:.0f}ms (HTTP {recs[u]['status']})" if recs[u]["lat"] is not None
+    listed_bad = "; ".join(f"{host_of(u)}: " + (f"{recs[u]['lat']:.0f}ms (" + (f"HTTP {recs[u]['status']}" if isinstance(recs[u]["status"], int)
+                                                                           else recs[u]["status"]) + ")" if recs[u]["lat"] is not None
                                                else f"FAIL ({recs[u]['status']})") for u in worst[:8]) \
         + (f"; ещё {len(worst) - 8}" if len(worst) > 8 else "")
     note = " (после повторного замера)" if retried else ""
@@ -1897,9 +1989,10 @@ def compare_routes(client, keys):
 
 def bad_now(r):
     """The service worked badly in this check: no answer, slower than MAX_LATENCY_MS, loss above SERVICE_LOSS_PCT
-    over its recent probes, or most of its domains answering with an error status (whatever the latency)."""
+    over its recent probes, most of its domains answering with an error status (whatever the latency), or a page of
+    it that stops downloading after the headers."""
     return not r["ok"] or (r["latency"] is not None and r["latency"] > MAX_LATENCY_MS) \
-        or r["loss"] * 100 > SERVICE_LOSS_PCT or r.get("errors", 0) * 2 > 1
+        or r["loss"] * 100 > SERVICE_LOSS_PCT or r.get("errors", 0) * 2 > 1 or bool(r.get("stalled"))
 
 
 def degraded(r):
@@ -1920,7 +2013,7 @@ def good(r):
     """The service really works well (not just "not bad yet" right after a move): answers, within the latency limit,
     no loss above SERVICE_LOSS_PCT, no error statuses."""
     return r["ok"] and r["latency"] is not None and r["latency"] <= MAX_LATENCY_MS \
-        and r["loss"] * 100 <= SERVICE_LOSS_PCT and not r.get("errors", 0)
+        and r["loss"] * 100 <= SERVICE_LOSS_PCT and not r.get("errors", 0) and not r.get("stalled")
 
 
 def summarize(name, tunnel, url, recs):
@@ -1929,7 +2022,8 @@ def summarize(name, tunnel, url, recs):
             "latency": sum(r["lat"] for r in answered) / len(answered) if answered else None,
             "status": (answered or recs)[0]["status"], "ok": bool(answered),
             "loss": sum(r["loss"] for r in recs) / len(recs),
-            "fails": min(r["fails"] for r in recs), "errors": sum(r["error"] for r in recs) / len(recs)}
+            "fails": min(r["fails"] for r in recs), "errors": sum(r["error"] for r in recs) / len(recs),
+            "stalled": next((f"{host_of(r['url'])}: {r['stalled']}" for r in recs if r.get("stalled")), None)}
 
 
 def service_results(since):
@@ -1957,7 +2051,8 @@ MANUAL_ALERTED = set()  # Manual-mode services already reported as not working
 
 def why_bad(r):
     slow = r["latency"] is not None and r["latency"] > MAX_LATENCY_MS
-    return ("не отвечает" if not r["ok"] else f"потери {r['loss']:.0%}" if r["loss"] * 100 > SERVICE_LOSS_PCT
+    return ("не отвечает" if not r["ok"] else f"страница не загружается ({r['stalled']})" if r.get("stalled")
+            else f"потери {r['loss']:.0%}" if r["loss"] * 100 > SERVICE_LOSS_PCT
             else f"медленно, {fmt_ms(r['latency'])}" if slow
             else f"ошибки ответа (HTTP {r['status']})" if r.get("errors", 0)
             else f"нет ответа {r['fails']} проверки подряд" if r["fails"] else f"плохое качество, {fmt_ms(r['latency'])}")
