@@ -142,12 +142,23 @@ FIXED_SETTINGS = {
     "COMPARE_SAMPLES": 3,
     "ROUTE_SETTLE": 3,
     "EVENTS_DAYS": 3,
-    "SHOW_EVENTS": True,
 }
 
 # Runtime state shown in the web UI
 STATUS = {"last_run": None, "next_run": None, "error": None, "tunnels": {}, "last_email": None}
 CHECK_NOW = threading.Event()
+CHECK_ONLY = set()  # Tunnels asked to be checked by themselves (request_check); the daemon checks just them
+CHECK_ALL = [False]  # A check of every tunnel was asked for
+
+
+def request_check(codes=None):
+    """Asks the daemon for a check now: of every tunnel, or only of `codes` (nodes came back, a new node to judge).
+    A check of a few tunnels takes seconds and doesn't wait for the others."""
+    if codes is None:
+        CHECK_ALL[0] = True
+    else:
+        CHECK_ONLY.update(codes)
+    CHECK_NOW.set()
 # Latest per-site results of tunnel checks: "<tunnel> <url>" -> {url, tunnel, latency, status, ok, time}
 SITE_RESULTS = {}
 # Cached Smart Route data for the web UI
@@ -161,6 +172,9 @@ ROUTE_LOCK = threading.Lock()
 ACTIONS = {}  # code -> {"text", "since"}: what the watchdog is doing with a tunnel right now, for the web UI
 NODE_WATCH_EVERY = 10  # Seconds between node count checks
 EMPTY_SINCE = {}  # code -> when the tunnel was first seen without nodes
+EMPTY_NOTE_AFTER = 60  # Seconds without nodes before it goes to the log
+EMPTY_NOTED = set()  # Tunnels whose loss of nodes is in the log
+REBUILD_LOOKED = {}  # code -> when the watcher last considered rebuilding the empty tunnel
 ALL_EMPTY_SINCE = 0  # When every monitored tunnel was first seen without nodes (0: some have nodes)
 GREEN_SINCE = {}  # code -> since when the tunnel has nodes and passes its checks
 NODES_STABLE = 20  # Seconds a tunnel must be green before services moved away not by a failover go back to it
@@ -309,7 +323,6 @@ def apply_settings():
     settings = current_settings()
     globals().update(FIXED_SETTINGS)
     globals().update(settings)
-    globals()["EMPTY_REBUILD_EVERY"] = settings["REBUILD_EVERY_HOURS"] * 3600
     MONITOR_TUNNELS = [t.strip().upper() for t in settings["MONITOR_TUNNELS"].split(",") if t.strip()]
     SMTP_FROM = settings["SMTP_FROM"] or settings["SMTP_USER"]
     return settings
@@ -325,7 +338,8 @@ def save_settings(values):
 
 
 def _save_settings(values):
-    saved = load_saved_settings()
+    # Keys of older versions are dropped: nothing reads them, and they only look like settings that work
+    saved = {k: v for k, v in load_saved_settings().items() if k in SETTINGS_SCHEMA}
     errors = []
     for key, value in values.items():
         if key not in SETTINGS_SCHEMA:
@@ -1984,9 +1998,10 @@ def node_bad(code):
     return {ip for ip, t in AUTO_STATE["node_bad"].get(code, {}).items() if now - t < NODE_BAD_HOURS * 3600}
 
 
-def recheck_soon():
-    """An extra check soon after a node switch: the new node is judged in a minute, not after a whole interval."""
-    timer = threading.Timer(RECHECK_AFTER, CHECK_NOW.set)
+def recheck_soon(code):
+    """An extra check of the tunnel soon after a node switch: the new node is judged in a minute, not after a whole
+    interval."""
+    timer = threading.Timer(RECHECK_AFTER, request_check, args=([code],))
     timer.daemon = True
     timer.start()
 
@@ -1997,6 +2012,8 @@ def avoid_bad_node(client, t):
     code, ip = t.get("tunnelCode"), t.get("activeIp")
     if not ip or t.get("activeNum", 0) < 2 or ip not in node_bad(code) or code in ACTIONS or STATUS.get("all_slow"):
         return
+    if len(node_bad(code)) >= t.get("activeNum", 0):
+        return  # Every node it has had lately was bad: switching only goes round them. This one gets a check instead
     now = time.time()
     times = [x for x in RESWITCHES.get(code, []) if now - x < 3600]
     RESWITCHES[code] = times
@@ -2021,7 +2038,7 @@ def avoid_bad_node(client, t):
     finally:
         set_action(code)
     fresh_node(client, code)
-    recheck_soon()
+    recheck_soon(code)
     text = f"{code}: Deeper вернул туннель на ноду {ip}, на которой было плохо. Нода сменена снова, IP {ip} → {new_ip}"
     logger.warning(text)
     log_event("warn", text)
@@ -2049,6 +2066,15 @@ def node_switch_first(client, current):
     for key, r in current.items():
         if r["tunnel"] not in (None, "split", "ZZ", "LL") and not r.get("silent"):
             votes.setdefault(r["tunnel"], []).append(degraded(r))
+    # A node remembered as bad that works for most services again is forgiven: nodes recover, and a node kept
+    # on the list for nothing would be switched away from for hours
+    for code, v in votes.items():
+        ip = (STATUS["tunnels"].get(code) or {}).get("ip")
+        if ip in node_bad(code) and sum(v) < len(v) * NODE_BAD_SHARE \
+                and (STATUS["tunnels"].get(code) or {}).get("healthy", True):
+            with STATE_LOCK:
+                AUTO_STATE["node_bad"].get(code, {}).pop(ip, None)
+            log_event("ok", f"{code}: нода {ip} снова работает нормально, больше не считается плохой")
     troubled = {}
     for key, r in current.items():
         code = r["tunnel"]
@@ -2092,7 +2118,7 @@ def node_switch_first(client, current):
         finally:
             set_action(code)
         fresh_node(client, code)
-        recheck_soon()
+        recheck_soon(code)
         waiting |= set(keys)
         share = f"{bad} из {total}" if total > 1 else "единственный сервис"
         text = (f"{code}: плохо работают {names} ({share}), нода сменена ({n} из {SWITCH_ATTEMPTS}), IP {old_ip} → {new_ip}. "
@@ -2121,7 +2147,7 @@ def decide_services(client, current):
             if bad and key not in MANUAL_ALERTED:
                 MANUAL_ALERTED.add(key)
                 log_event("bad", f"{name} («Вручную»): в {r['tunnel']} {why_bad(r)}, сам не переносится", mail="service")
-            elif not bad and key in MANUAL_ALERTED:
+            elif good(r) and key in MANUAL_ALERTED:  # Not just "no longer counted bad" (a new node resets the count)
                 MANUAL_ALERTED.discard(key)
                 log_event("ok", f"{name} («Вручную»): в {r['tunnel']} снова работает, {fmt_ms(r['latency'])}", mail="service")
             continue
@@ -2278,7 +2304,7 @@ def move_job(domain, to):
     save_auto_state()
     log_event("info", f"{name}: перенесён в {to} вручную"
               + (f", предпочтительные туннели остаются {pref_label(prefs)}" if prefs and prefs[0] != to else ""), mail="changes")
-    CHECK_NOW.set()  # The tunnels it left and went to are checked right away: the overview shows them as they are
+    request_check()  # The tunnels it left and went to are checked right away: the overview shows them as they are
     return 200, {"ok": True, "message": f"{name} теперь через {to}"}
 
 
@@ -2379,7 +2405,7 @@ def recover_tunnel(client, code, country, active_ip, active_num, canaries, max_l
             return False, "не изменился", active_num, action, [f"Deeper не сменил ноду: {res}"]
         time.sleep(VERIFY_PAUSE)
         fresh_node(client, code)
-        recheck_soon()
+        recheck_soon(code)
         match = get_tunnel(client, code) or {}
         if match:
             live_pool(code, match)
@@ -2398,8 +2424,9 @@ def recover_tunnel(client, code, country, active_ip, active_num, canaries, max_l
     return success and bool(new_pool), new_ip, new_pool, f"Перестроение туннеля, так как {reason}", []
 
 
-def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
-    """Executes a single monitoring cycle and repairs degraded tunnels."""
+def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, only=None):
+    """Executes a single monitoring cycle and repairs degraded tunnels. `only`: check just these tunnels, the others
+    keep their last results."""
     if max_latency_ms is None:
         max_latency_ms = MAX_LATENCY_MS
     fails = {}
@@ -2446,13 +2473,17 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
     active_tunnels = []
     for t in tunnels:
         code = t.get("tunnelCode")
-        if not MONITOR_TUNNELS or code in MONITOR_TUNNELS:
+        if (not MONITOR_TUNNELS or code in MONITOR_TUNNELS) and (only is None or code in only):
             active_tunnels.append(t)
 
     logger.info(f"Checking {len(active_tunnels)} monitored tunnel(s) ({', '.join(t.get('tunnelCode') for t in active_tunnels)})...")
 
-    ROUTES["tunnels"] = [t.get("tunnelCode") for t in active_tunnels]
-    SITE_RESULTS.clear()
+    if only is None:
+        ROUTES["tunnels"] = [t.get("tunnelCode") for t in active_tunnels]
+        SITE_RESULTS.clear()
+    else:
+        for k in [k for k in SITE_RESULTS if k.split(" ", 1)[0] in only]:
+            del SITE_RESULTS[k]
     started = time.time()
     # Each test site tests the tunnel its domain goes through right now (Smart Route or App Relocator)
     site_routes = {}
@@ -2566,6 +2597,9 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
     # rebuilding all tunnels then only cuts every service off
     measured = [c for c, *_ in checked]
     all_slow = SKIP_ALL_SLOW and len(measured) >= 2 and not any(tunnel_status[c]["healthy"] for c in measured)
+    if only is not None:
+        # A few tunnels say nothing about all of them: the last full check does, unless these work
+        all_slow = bool(STATUS.get("all_slow")) and not any(tunnel_status[c]["healthy"] for c in measured)
     if all_slow:
         if not STATUS.get("all_slow"):
             log_event("warn", "Медленные все туннели сразу: похоже на проблему сети или Deeper, ноды не меняются и туннели не перестраиваются", mail="all_slow")
@@ -2634,7 +2668,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE):
             fails[code] = 0
             SWITCHES.pop(code, None)
 
-    STATUS["tunnels"] = tunnel_status
+    STATUS["tunnels"] = tunnel_status if only is None else dict(STATUS["tunnels"], **tunnel_status)
     record_history(tunnel_status)
 
     # App Relocator apps: current tunnel and quality via their website (already probed if it tests the tunnel)
@@ -3569,7 +3603,7 @@ $("reset").onclick=async()=>{if(!await ask("Сбросить настройки?
 let lastStatus=null;
 async function loadStatus(){
  let st;try{st=await api("/api/status")}catch(e){setPill("bad","Нет связи с сервером");return}
- lastStatus=st;const codes=Object.keys(st.tunnels||{});$("eventsBlock").hidden=st.show_events===false;
+ lastStatus=st;const codes=Object.keys(st.tunnels||{});
  statusTunnels=codes;
  $("runInfo").textContent=st.last_run?`Последняя проверка ${st.last_run.slice(11)} · следующая ${st.next_run?st.next_run.slice(11):"—"}`:"Проверок ещё не было";
  $("alert").hidden=!st.error;$("alert").textContent=st.error||"";
@@ -4352,7 +4386,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/status":
             queue, done = queue_view()
             self._send(200, dict(STATUS, fail_threshold=FAIL_THRESHOLD, actions=ACTIONS, now=int(time.time()),
-                                 show_events=SHOW_EVENTS, busy=BUSY, queue=queue, queue_done=done,
+                                 busy=BUSY, queue=queue, queue_done=done,
                                  check_waiting=CHECK_NOW.is_set() and bool(BUSY["text"])))
         else:
             self._send(404, {"error": "not found"})
@@ -4485,7 +4519,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                         note = f"{name} переедет в {mode} в свою очередь" + (f", после: {BUSY['text'].lower()}" if BUSY["text"] else "")
                     elif job["result"][0] >= 300:
                         note = f"Не удалось перенести сейчас: {job['result'][1].get('error')}"
-            CHECK_NOW.set()
+            request_check()
             self._send(200, {"ok": True, "note": note})
         elif self.path in ("/api/add-domains", "/api/delete-domains"):
             body = body if isinstance(body, dict) else {}
@@ -4542,7 +4576,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 if error or failed:
                     return (502, {"error": error or f"Deeper не принял: {', '.join(failed)}", "done": done})
                 if done:
-                    CHECK_NOW.set()
+                    request_check()
                 return (200, {"ok": True, "done": done, "message": f"{'Добавлено' if adding else 'Удалено'} доменов: {len(done)}"})
             self._queued(queue_action("Добавление доменов" if adding else "Удаление доменов", rules_job, tunnel=None))
         elif self.path == "/api/switch-node":
@@ -4598,7 +4632,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                     return (502, {"error": f"Deeper не перестроил туннель {tunnel}"})
                 logger.info(f"Туннель {tunnel} перестроен вручную: {before.get('activeIp')} -> {new_ip} (пул: {new_pool})")
                 log_event("info", f"{tunnel}: туннель перестроен вручную, IP {before.get('activeIp')} → {new_ip}", mail="changes")
-                CHECK_NOW.set()  # Re-check right away so the overview shows the new state
+                request_check()  # Re-check right away so the overview shows the new state
                 return (200, {"ok": True, "old_ip": before.get("activeIp"), "new_ip": new_ip, "pool": new_pool,
                               "message": f"Туннель {tunnel} перестроен: {before.get('activeIp')} → {new_ip}"})
             self._queued(queue_action(f"Перестроение туннеля {tunnel}", refresh_job, tunnel=tunnel))
@@ -4641,7 +4675,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 return (200, {"ok": True, "changed": changed, "message": f"{what}: изменено {len(changed)}"})
             self._queued(queue_action("Восстановление копии" if restoring else "Загрузка файла", restore_job, tunnel=None))
         elif self.path == "/api/check-now":
-            CHECK_NOW.set()
+            request_check()
             self._send(200, {"ok": True})
         elif self.path == "/api/events/clear":
             with STATE_LOCK:
@@ -4720,9 +4754,13 @@ def watch_nodes_once(client, tunnels):
             continue
         if t.get("activeNum", 0) > 0:
             EVAC_NOTIFIED.pop(code, None)
-            if EMPTY_SINCE.pop(code, None) is not None:
-                log_event("ok", f"{code}: ноды появились, нод {t.get('activeNum')}", mail="nodes_back")
-                CHECK_NOW.set()
+            gone = EMPTY_SINCE.pop(code, None)
+            if gone is not None:
+                if code in EMPTY_NOTED:
+                    log_event("ok", f"{code}: ноды появились через {span(int(now - gone) // 60 * 60 or 60)}, нод {t.get('activeNum')}",
+                              mail="nodes_back")
+                request_check([code])  # Just this tunnel: the others were checked as usual
+            EMPTY_NOTED.discard(code)
             try:
                 avoid_bad_node(client, t)
             except Exception as e:
@@ -4730,8 +4768,12 @@ def watch_nodes_once(client, tunnels):
             continue
         if code not in EMPTY_SINCE:
             EMPTY_SINCE[code] = now
-            log_event("bad", f"{code}: нет активных нод")  # Mailed with what was done about it
         empty_for = now - EMPTY_SINCE[code]
+        # Nodes of many tunnels come and go for seconds: only a longer gap goes to the log (moved services are logged
+        # by evacuate right away)
+        if code not in EMPTY_NOTED and empty_for >= EMPTY_NOTE_AFTER:
+            EMPTY_NOTED.add(code)
+            log_event("bad", f"{code}: нет активных нод")  # Mailed with what was done about it
         if code in ACTIONS:
             continue  # Already being handled: a check, a rebuild or a failover
         # Services preferring this tunnel leave it even with failover off: they come back by themselves
@@ -4750,9 +4792,13 @@ def watch_nodes_once(client, tunnels):
                 MOVE_LOCK.release()
         # Deeper finds nodes by itself and a rebuild drops the pool it is collecting, so only after an hour
         # without nodes, and under the same limits as any automatic rebuild (rebuild_blocker)
-        if EMPTY_REBUILD_AFTER and empty_for >= EMPTY_REBUILD_AFTER and code not in ACTIONS:
+        if EMPTY_REBUILD_AFTER and empty_for >= EMPTY_REBUILD_AFTER and code not in ACTIONS \
+                and now - REBUILD_LOOKED.get(code, 0) >= 300:  # Asks Deeper about its services: not every tick
+            REBUILD_LOOKED[code] = now
             try:
-                if rebuild_blocker(client, code, tunnels):
+                # Only a tunnel someone needs: services still in it, or preferred by some. Rebuilding one nobody
+                # uses only blocks the rebuilds of the others for REBUILD_SPACING
+                if not (pinned or tunnel_services(client, code)) or rebuild_blocker(client, code, tunnels):
                     continue
                 logger.warning(f"В туннеле {code} нет нод {span(int(empty_for // 60) * 60)}, перестраиваю...")
                 log_event("warn", f"{code}: нет нод {span(int(empty_for // 60) * 60)}, перестраиваю туннель")
@@ -4905,6 +4951,11 @@ def main():
         if WEB_ENABLED:
             start_web_server()
         threading.Thread(target=watch_nodes, daemon=True).start()
+        old = sorted(k for k in load_saved_settings() if k not in SETTINGS_SCHEMA)
+        if old:
+            with SETTINGS_LOCK:
+                _save_settings({})  # Drops the keys of older versions
+            logger.info(f"Удалены устаревшие настройки: {', '.join(old)}")
         logger.info(f"Запуск Deeper Watchdog в режиме демона (интервал: {args.interval or CHECK_INTERVAL}с, "
                     f"порог задержки: {args.max_latency or MAX_LATENCY_MS}мс, сбоев до восстановления: {FAIL_THRESHOLD})...")
         last_params = client_params()
@@ -4915,18 +4966,23 @@ def main():
             next_run = last_run + interval if last_run else time.time()
             if CHECK_NOW.is_set() or time.time() >= next_run:
                 CHECK_NOW.clear()
+                # Only some tunnels asked for and the regular check not due: just them, the schedule stays
+                only = set(CHECK_ONLY) if CHECK_ONLY and not CHECK_ALL[0] and time.time() < next_run else None
+                CHECK_ONLY.clear()
+                CHECK_ALL[0] = False
                 if client_params() != last_params:
                     last_params = client_params()
                     host, user, password = last_params
                     logger.info(f"Параметры подключения к Deeper Connect изменены ({host}), переподключение...")
                     client = DeeperClient(host=host, username=user, password=password)
                 try:
-                    with route_turn("Проверка туннелей"):
-                        run_watchdog_iteration(client, max_latency_ms=args.max_latency)
+                    with route_turn("Проверка туннелей" if only is None else f"Проверка {', '.join(sorted(only))}"):
+                        run_watchdog_iteration(client, max_latency_ms=args.max_latency, only=only)
                 except Exception as e:
                     logger.error(f"Ошибка итерации: {e}")
-                last_run = time.time()
-                next_run = last_run + interval
+                if only is None:
+                    last_run = time.time()
+                    next_run = last_run + interval
             STATUS["next_run"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_run))
             CHECK_NOW.wait(min(5, max(0.1, next_run - time.time())))
     else:
