@@ -121,10 +121,12 @@ SETTINGS_SCHEMA = {
     # doesn't answer or is twice slower than allowed leaves after one check; "stats": the tunnel is judged by its
     # domains as before, but services already failed in it don't count for its status and ping
     "BAD_SERVICES": ("choice", "first", ("first", "fast", "stats"), None),
+    # The overview's layout: "standard" (cards), "table" (a control panel), "services" (services first) or "dark"
+    "UI_VIEW": ("choice", "standard", ("standard", "table", "services", "dark"), None),
     # App Relocator apps shown in the web UI (Deeper app keys)
     "APPS": ("str", "instagram,telegram", None, None),
     # A Smart Route service named like a configured app (Telegram for telegram) goes wherever the app goes, so the
-    # app and its links never go through different countries. Only services in auto mode
+    # app and its links never go through different countries. Not services in manual mode
     "LINK_APP_GROUPS": ("bool", "true", None, None),
     # Extra/overriding service groups, one "Name=domain1,domain2" per line
     "SERVICE_GROUPS": ("text", "", None, None),
@@ -1568,12 +1570,22 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None, methods
     for u, r in recs.items():
         SITE_RESULTS[f"{tunnel_code} {u}"] = {"url": u, "tunnel": tunnel_code, "latency": r["lat"], "status": r["status"],
                                               "ok": r["lat"] is not None and not r["stalled"], "loss": r["loss"],
-                                              "counted": u in counted, "time": time.strftime("%H:%M:%S")}
+                                              "counted": u in counted, "tcp": bool(methods.get(u)),
+                                              "time": time.strftime("%H:%M:%S")}
+
+    def ping(tcp):
+        """The median of what works in the tunnel (a few slow services don't make a good node look slow), of the
+        domains checked by a page or by a connection: their pings differ several times, they don't mix."""
+        kind = [u for u in counted if bool(methods.get(u)) == tcp and recs[u]["lat"] is not None]
+        return median([recs[u]["lat"] for u in kind if u in judged and u not in bad]) \
+            or median([recs[u]["lat"] for u in kind])
+
     answered = [recs[u]["lat"] for u in counted if recs[u]["lat"] is not None]
-    # The tunnel's ping is that of what works in it: a few slow services don't make a good node look slow
-    med = median([recs[u]["lat"] for u in judged if recs[u]["lat"] is not None and u not in bad]) or median(answered)
+    lat_page, lat_tcp = ping(False), ping(True)
+    med = lat_page or lat_tcp  # The tunnel's one ping (history, ranking): by pages when it has any
     TUNNEL_LOSS[tunnel_code] = median([recs[u]["loss"] for u in counted])
-    LAST_CHECK[tunnel_code] = {"bad": len(bad), "counted": len(counted), "silent": len(endpoints) - len(counted)}
+    LAST_CHECK[tunnel_code] = {"bad": len(bad), "counted": len(counted), "silent": len(endpoints) - len(counted),
+                               "lat_page": lat_page, "lat_tcp": lat_tcp}
 
     worst = sorted(bad, key=lambda u: recs[u]["lat"] if recs[u]["lat"] is not None else 10 ** 9, reverse=True)
     listed_bad = "; ".join(f"{host_of(u)}: " + (f"{recs[u]['lat']:.0f}ms (" + (f"HTTP {recs[u]['status']}" if isinstance(recs[u]["status"], int)
@@ -1633,9 +1645,10 @@ def diagnose(key, code, urls):
 
 
 def app_follower(key):
-    """The app a Smart Route service follows (LINK_APP_GROUPS), as ROUTES["apps"] has it, or None: a service in auto
-    mode named like a configured app that goes through a tunnel."""
-    if not LINK_APP_GROUPS or not key.startswith("group:") or service_mode(key) != "auto":
+    """The app a Smart Route service follows (LINK_APP_GROUPS), as ROUTES["apps"] has it, or None: a service named
+    like a configured app that goes through a tunnel. Not in manual mode: the user keeps it where it is. With its
+    own preferred tunnels it follows the app all the same, the list counts again once it is unlinked."""
+    if not LINK_APP_GROUPS or not key.startswith("group:") or service_mode(key) == "manual":
         return None
     name = key.split(":", 1)[1].lower()
     return next((a for a in ROUTES["apps"] if a["app"].lower() == name and a["tunnel"] not in (None, "ZZ", "LL")), None)
@@ -1926,6 +1939,8 @@ def enforce_preferred(client, green_since, only=None):
             continue
         if k in AUTO_STATE["manual_away"] and only is None:
             continue  # The user moved it elsewhere by hand: it stays there
+        if app_follower(k):
+            continue  # Goes with its app: its own list waits until it is unlinked
         evac = AUTO_STATE["evacuated"].get(k) or {}
         left = evac.get("left") or ({evac["from"]: evac.get("at", 0)} if evac.get("from") else {})
         for c in codes:
@@ -2962,7 +2977,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
             "country": country, "ip": active_ip, "pool": active_num,
             "healthy": healthy, "latency": lat, "details": details, "fails": fails.get(code, 0),
             "loss": TUNNEL_LOSS.get(code), **LAST_CHECK.get(code, {}),
-            "sites": [{k: r[k] for k in ("url", "latency", "status", "counted")}
+            "sites": [{k: r.get(k) for k in ("url", "latency", "status", "counted", "tcp")}
                       for r in (SITE_RESULTS.get(f"{code} {ep}") for ep in canaries) if r],
         }
         # The new failure count is shown once every tunnel is measured: if all of them fail, it doesn't count
@@ -3202,6 +3217,8 @@ svg.i{width:1em;height:1em;flex:none;stroke:currentColor;fill:none;stroke-width:
 .seg button:disabled{cursor:default}.seg button:disabled:not([aria-pressed="true"]){opacity:.4}
 .seg button+button::after{content:"";position:absolute;left:0;top:25%;bottom:25%;border-left:1px solid var(--muted2);transition:opacity .2s}
 .seg button[aria-pressed="true"]::after,.seg button[aria-pressed="true"]+button::after{opacity:0}
+.topright{justify-self:end;display:flex;align-items:center;gap:10px;min-width:0}.topright .pill{min-width:0}
+.langseg button{padding:4px 9px;font-size:12px}
 .navtabs{justify-self:center}
 .navtabs .seg{min-width:260px}
 .navtabs .seg button{display:inline-flex;align-items:center;justify-content:center;gap:6px}
@@ -3570,6 +3587,95 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
 .bk:first-child{border-top:0}.bk .bk-t{flex:1;min-width:0;font-size:14px;font-weight:500}.bk .bk-t small{display:block;color:var(--muted);font-size:12px;font-weight:400}
 .note{font-size:13px;color:var(--muted);margin:6px 4px 0}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}.spin{animation-duration:1.5s!important}}
+
+/* Overview layouts (UI_VIEW) */
+body[data-view="table"] #tunSect,body[data-view="table"] #tunnels{display:none}
+body[data-view="services"] #tunSect,body[data-view="services"] #tunnels,body[data-view="services"] #appsBlock,body[data-view="services"] #svcBlock{display:none!important}
+.vkpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:-6px 0 4px}
+.vk{background:var(--card);border-radius:var(--radius-sm);box-shadow:var(--shadow);padding:12px 16px;display:flex;flex-direction:column;gap:1px;min-width:0}
+.vk small{font-size:11px;font-weight:650;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.vk b{font-size:26px;font-weight:750;letter-spacing:-.03em;font-variant-numeric:tabular-nums}
+.vk span{font-size:12px;color:var(--muted)}
+.vtable{margin-top:22px;padding:0;overflow:hidden}
+.vr{display:grid;grid-template-columns:36px minmax(0,1.4fr) 130px 190px minmax(90px,1fr) 64px 36px;gap:14px;align-items:center;padding:9px 16px;border-top:.5px solid var(--sep);cursor:pointer}
+.vr:first-child{border-top:0}
+@media (hover:hover){.vr:not(.vh):hover{background:var(--fill)}}
+.vr.vh{cursor:default;font-size:11px;font-weight:650;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);padding-block:10px}
+.vr .code{width:32px;height:32px}.vr .code .flag{font-size:22px}.vr .code .cc{font-size:8px;right:-5px}
+.vn{min-width:0}.vn b{display:block;font-weight:600;font-size:15px}.vn small{display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vr .tstate{margin-top:0}
+.vping{font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.vping.ok,.vt-p.ok{color:var(--green)}.vping.warn,.vt-p.warn{color:var(--orange)}.vping.bad,.vt-p.bad{color:var(--red)}.vping.none{color:var(--muted)}
+.vspark .spark{margin:0}.vspark .spark svg{height:28px}.vspark .spark .cap{display:none}
+.vnum{font-variant-numeric:tabular-nums;font-weight:600}
+.vr .tmore{justify-self:end}
+.vdet{padding:2px 16px 14px 66px;display:flex;flex-direction:column;gap:6px}
+.vmore{display:flex;align-items:center;gap:12px;padding:11px 16px;border-top:.5px solid var(--sep);font-size:13.5px;font-weight:600;color:var(--muted);cursor:pointer;flex-wrap:wrap}
+.vchips{display:flex;gap:5px;flex-wrap:wrap;min-width:0}
+.vchips span{font-size:11.5px;font-weight:600;background:var(--fill);border-radius:6px;padding:2px 7px;color:var(--text)}
+.vchips span.bad{background:var(--red-soft);color:var(--red)}
+.vlink{margin-left:auto;color:var(--accent-text)}
+@media (max-width:700px){.topright .pill{display:none}.brand{white-space:nowrap}}
+@media (max-width:820px){.vkpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .vr{grid-template-columns:32px minmax(0,1fr) auto 32px;gap:10px}.vr.vh,.vr>:nth-child(3),.vr .vspark,.vr .vnum{display:none}.vdet{padding-left:16px}}
+/* Services first */
+.vsvc{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:16px;margin-top:4px;align-items:start}
+.vsvc-main{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;align-content:start}
+.vs{border:0;text-align:left;font:inherit;color:inherit;cursor:pointer;padding:14px;display:flex;flex-direction:column;gap:10px;transition:transform .18s var(--spring),box-shadow .2s}
+@media (hover:hover){.vs:hover{box-shadow:var(--shadow-lift)}}
+.vs:active{transform:scale(.98)}
+.vs-t{display:flex;align-items:center;gap:10px;min-width:0}
+.vs .avatar{width:36px;height:36px;border-radius:11px;display:grid;place-items:center;color:#fff;font-weight:700;flex:none}
+.vs-n{min-width:0}.vs-n b{display:block;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.vs-n small{display:block;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vs-w{display:flex;justify-content:space-between;align-items:center;gap:8px;background:var(--fill);border-radius:10px;padding:7px 10px;font-size:13px}
+.vs-w b{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vbar{height:5px;border-radius:3px;background:var(--fill);overflow:hidden}
+.vbar i{display:block;height:100%;border-radius:3px;background:var(--gray)}
+.vbar i.ok{background:var(--green-dot)}.vbar i.warn{background:var(--orange-dot)}.vbar i.bad{background:var(--red-dot)}
+.vs-m{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.vsvc-side{display:flex;flex-direction:column;gap:0;min-width:0}
+.vside{padding:8px 6px}
+.vside-h{font-size:12px;font-weight:650;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);padding:6px 10px 4px}
+.vt{display:flex;align-items:center;gap:9px;padding:5px 4px 5px 10px;font-size:14px;min-width:0}
+.vt-n{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vt-p{font-weight:650;font-variant-numeric:tabular-nums;font-size:13px;white-space:nowrap}
+.vsvc-side .sect{font-size:18px;margin-top:22px}
+.vsvc-side .evfilter{flex-wrap:wrap}
+@media (max-width:900px){.vsvc{grid-template-columns:1fr}}
+/* Dark panel */
+body[data-view="dark"]{color-scheme:dark;
+ --bg:#05070c;--card:rgba(255,255,255,.055);--card2:#1c2230;--raise:#262c3a;
+ --label:#fff;--text:#eef2f8;--muted:rgba(225,232,245,.6);--muted2:rgba(225,232,245,.3);
+ --sep:rgba(255,255,255,.08);--fill:rgba(255,255,255,.08);--fill2:rgba(255,255,255,.11);--fill3:rgba(255,255,255,.16);
+ --accent:#4f8dff;--accent-soft:rgba(79,141,255,.2);--accent-text:#7aa8ff;
+ --green:#3ddc84;--green-dot:#3ddc84;--green-soft:rgba(61,220,132,.16);
+ --red:#ff6b62;--red-dot:#ff5a4f;--red-soft:rgba(255,90,79,.18);
+ --orange:#ffb03b;--orange-dot:#ffa524;--orange-soft:rgba(255,165,36,.18);
+ --shadow:0 0 0 1px rgba(255,255,255,.07);--shadow-lift:0 0 0 1px rgba(255,255,255,.12),0 20px 40px -12px rgba(0,0,0,.7);
+ --glass:rgba(8,11,18,.72);--glass-strong:rgba(12,15,24,.9);--glass-line:rgba(255,255,255,.08);
+ --menu:rgba(30,35,48,.92);--menu-shadow:0 0 0 .5px rgba(255,255,255,.14),0 16px 48px rgba(0,0,0,.6);
+ --bg-art:radial-gradient(60% 50% at 10% -5%,rgba(40,90,190,.45),transparent 70%),radial-gradient(50% 45% at 100% 0%,rgba(80,60,170,.35),transparent 70%),radial-gradient(50% 40% at 50% 110%,rgba(20,120,140,.18),transparent 70%)}
+body[data-view="dark"] .card{backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px)}
+body[data-view="dark"] dialog,body[data-view="dark"] .sheet{--card:#151a25}
+body[data-view="dark"] .tcard{overflow:hidden}
+body[data-view="dark"] .tcard.st-ok{box-shadow:0 0 0 1px rgba(61,220,132,.16),0 14px 40px -24px rgba(61,220,132,.55)}
+body[data-view="dark"] .tcard.st-bad{box-shadow:0 0 0 1px rgba(255,90,79,.28),0 14px 40px -20px rgba(255,90,79,.6)}
+body[data-view="dark"] .tcard.st-warn{box-shadow:0 0 0 1px rgba(255,165,36,.22),0 14px 40px -22px rgba(255,165,36,.5)}
+.tcard .vchips{padding:8px 0 0 44px}
+.vmore.voff{grid-column:1/-1;border-top:0;padding:8px 4px}
+.vdark{display:grid;grid-template-columns:210px minmax(0,1fr) minmax(0,1.3fr);gap:10px;margin:-6px 0 4px}
+.vglass{padding:16px 18px;min-width:0}
+.vglass h6{margin:0 0 8px;font-size:11px;font-weight:650;letter-spacing:.07em;text-transform:uppercase;color:var(--muted)}
+.vringbox{display:grid;place-items:center;position:relative;padding:14px}
+.vring{width:150px;height:150px}
+.vringc{position:absolute;text-align:center}.vringc b{display:block;font-size:30px;font-weight:800;letter-spacing:-.03em}.vringc small{font-size:11px;color:var(--muted)}
+.vbig{font-size:34px;font-weight:800;letter-spacing:-.03em;font-variant-numeric:tabular-nums;line-height:1.15}
+.vbig.sm{font-size:24px;margin-top:6px}.vbig small{font-size:14px;font-weight:600;color:var(--muted);letter-spacing:0}
+.vev{display:grid;grid-template-columns:auto auto minmax(0,1fr);gap:8px;align-items:center;font-size:13px;padding:3px 0}
+.vev time{font-size:11.5px;font-weight:600;color:var(--muted);font-variant-numeric:tabular-nums}
+.vev span:last-child{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dot.ok{background:var(--green-dot)}
+@media (max-width:820px){.vdark{grid-template-columns:1fr}}
 </style></head>
 <body>
 <header class="top"><div class="top-in">
@@ -3578,7 +3684,8 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
   <button type="button" data-tab="overview" aria-pressed="true"><i data-ic="gauge"></i>Обзор</button>
   <button type="button" data-tab="settings" aria-pressed="false"><i data-ic="sliders"></i>Настройки</button>
  </div></nav>
- <span class="pill" id="statePill"><span class="dot"></span><span>Загрузка…</span></span>
+ <div class="topright"><div class="seg langseg" id="langseg" role="group" aria-label="Язык" data-noi18n><button type="button" data-lang="ru" aria-pressed="true">RU</button><button type="button" data-lang="en" aria-pressed="false">EN</button><button type="button" data-lang="zh" aria-pressed="false">中文</button></div>
+ <span class="pill" id="statePill"><span class="dot"></span><span>Загрузка…</span></span></div>
 </div></header>
 
 <main>
@@ -3594,8 +3701,11 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
    <button class="btn gray" id="openRoutes" type="button"><i data-ic="chart"></i><span>Пинг и рекомендации</span></button>
   </div>
  </div>
- <div class="sect">Туннели</div>
+ <div id="vHero" hidden></div>
+ <div class="sect" id="tunSect">Туннели</div>
  <div class="tunnels" id="tunnels"></div>
+ <div id="vTable" class="card vtable" hidden></div>
+ <div id="vSvc" class="vsvc" hidden><div class="vsvc-main" id="vSvcCards"></div><aside class="vsvc-side"><div class="card vside" id="vTuns"></div><div id="vSideEv"></div></aside></div>
  <div id="appsBlock" hidden><div class="sect">Приложения</div><div class="tunnels" id="apps"></div></div>
  <div id="svcBlock" hidden><div class="sect">Сервисы</div><div class="card svcgrid" id="svcList"></div></div>
  <div id="eventsBlock"><div class="sect">Журнал</div>
@@ -3671,7 +3781,7 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
 </dialog>
 
 <script>
-const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые сайты":["globe","#30b0c7"],"Приложения":["grid","#5856d6"],
+const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые сайты":["globe","#30b0c7"],"Приложения":["grid","#5856d6"],"Вид":["chart","#ff9f0a"],
  "Перестроение туннелей":["refresh","#ff9500"],
  "Резервные копии и перенос":["archive","#8e8e93"],"Доступ":["lock","#34c759"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
@@ -3689,9 +3799,13 @@ const GROUPS=[
     ["fast","Быстрый уход очень плохих","Как «Сначала уезжают плохие», и сервис без ответа или вдвое медленнее допустимого уезжает уже после одной проверки"],
     ["stats","Только статистика","Туннель оценивается по доменам, как раньше, но сервисы, у которых уже сбой, не портят его пинг и статус"]]],
   ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Туннель не прошёл столько проверок подряд, и в нём больше одной ноды — меняется нода и туннель проверяется заново. Его сервисы ждут смены ноды и уезжают, только если не помогло"]]},
+ {title:"Вид",fields:[
+  ["UI_VIEW","choice","Вид главной страницы","Как показывать обзор. Язык меняется кнопками RU / EN / 中文 в шапке",
+   [["standard","Стандартный","Карточки туннелей, как раньше"],["table","Пульт управления","Сводка и таблица проверяемых туннелей с графиком пинга"],
+    ["services","Сначала сервисы","Карточки сервисов и приложений, туннели и журнал сбоку"],["dark","Тёмная панель","Кольцо здоровья, средний пинг и события, тёмное оформление"]]]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
   ["APPS","text","Приложения","Коды через запятую"],
-  ["LINK_APP_GROUPS","switch","Сервис вместе с приложением","Сервис из правил Smart Route с тем же названием, что и приложение (например, Telegram и telegram), всегда в туннеле приложения: сам не переезжает, а следует за ним. Только в режиме «Авто»"]]},
+  ["LINK_APP_GROUPS","switch","Сервис вместе с приложением","Сервис из правил Smart Route с тем же названием, что и приложение (например, Telegram и telegram), всегда в туннеле приложения: сам не переезжает, а следует за ним. Кроме режима «Вручную»; свои предпочтительные туннели сервиса при этом не действуют"]]},
  {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку и в нём больше одной ноды, сначала меняется нода (до 2 раз) и туннель проверяется заново, его сервисы ждут. Не помогло — уезжают только те сервисы, которым плохо. Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
   ["REBUILD_ENABLED","switch","Перестраивать в крайнем случае","Выключено: watchdog сам никогда не перестраивает туннели, только переносит сервисы и меняет ноды. Кнопка «Перестроить» в меню туннеля работает всегда"],
   ["REBUILD_EVERY_HOURS","number","Не чаще раза в, ч","Для каждого туннеля, считая и ручные перестроения"]]},
@@ -3981,6 +4095,7 @@ async function loadSettings(){
  countryNames=s.COUNTRY_NAMES||{};
  const cats=new Set($("EMAIL_EVENTS").value.split(",").map(x=>x.trim()));
  for(const c of document.querySelectorAll("#mailcats [data-cat]"))c.checked=cats.has(c.dataset.cat);
+ if(s.UI_VIEW&&s.UI_VIEW!==VIEW)setView(s.UI_VIEW);
  updateVisibility()}
 
 let statusTunnels=[];
@@ -4060,7 +4175,8 @@ function renderEvents(){const box=$("events");box.textContent="";const today=new
  if(!list.length)box.append(el("div",{class:"empty"},icon("clock"),filtered?"Ничего не найдено":"Событий пока нет"));
  const EVI={ok:"check",bad:"x",warn:"excl",info:"info"};
  for(const e of list)box.append(el("div",{class:"li"},el("span",{class:"evi "+e.kind},icon(EVI[e.kind]||"info")),
-  el("div",{class:"tx",text:e.text}),el("div",{class:"tm",text:e.time.slice(0,10)===today?e.time.slice(11,16):e.time.slice(8,10)+"."+e.time.slice(5,7)+" "+e.time.slice(11,16)})));
+  el("div",{class:"tx","data-noi18n":"",text:e.text}),el("div",{class:"tm",text:e.time.slice(0,10)===today?e.time.slice(11,16):e.time.slice(8,10)+"."+e.time.slice(5,7)+" "+e.time.slice(11,16)})));
+ if(VIEW==="table"||VIEW==="dark")renderView();
  $("eventsMore").hidden=filtered||eventsData.length<=8;$("eventsMore").textContent=showAllEvents?"Свернуть":`Показать все (${Math.min(eventsData.length,150)})`}
 $("eventsMore").onclick=()=>{showAllEvents=!showAllEvents;renderEvents()};
 // A slow service in manual mode doesn't move by itself: the overview suggests comparing it
@@ -4069,12 +4185,12 @@ function slowManual(key,x,d){if(x.tunnel==="split"||(x.latency!=null&&x.latency<
 // A tour of the tunnels: what has been tried, and where it settled
 function tourText(t){return t.settled?`плохо во всех туннелях (${t.tried.join(", ")}), остаётся в лучшем — ${t.best}, пока где-нибудь не появится новая нода`
  :`пробует туннели: опробованы ${t.tried.join(", ")}`}
-function renderServices(){const d=routesData;if(!d)return;
+function renderServices(){const d=routesData;if(!d)return;if(VIEW==="services")renderView();
  const list=Object.entries(d.services||{}).sort((a,b)=>(a[1].ok-b[1].ok)||a[1].name.localeCompare(b[1].name));
  $("svcBlock").hidden=!list.length;const box=$("svcList");box.textContent="";
  for(const [key,x] of list){const tour=(d.tours||{})[key],touring=tour&&!tour.settled;
   const b=el("button",{type:"button",class:"svc",title:`${hostOf(x.url)}: ${x.latency!=null?Math.round(x.latency)+" мс":"нет ответа ("+x.status+")"}`+(tour?" · "+tourText(tour):"")+(slowManual(key,x,d)?` · медленно в ${x.tunnel}, сравните туннели`:"")},
-   el("span",{class:"dot "+pingKind(x.latency)}),x.name,
+   el("span",{class:"dot "+pingKind(x.latency,byTcp(key))}),x.name,
    el("span",{class:"t"+(x.tunnel==="split"?" bad":""),text:x.tunnel==="split"?"⚠ разные страны":x.tunnel+(touring?" · обход":tour?" · лучший":slowManual(key,x,d)?" · сравните":"")}),
    el("span",{class:"v",text:x.latency!=null?Math.round(x.latency):"—"}));
   b.onclick=async()=>{$("rtFilter").value=x.name;openDoms.add(key);await loadRoutes();openSheet()};box.append(b)}}
@@ -4092,17 +4208,27 @@ async function importFile(input){const f=input.files[0];input.value="";if(!f)ret
  try{const x=await api("/api/import",{data});toast(`Загружено, изменено правил: ${x.changed.length}`);await loadSettings()}catch(e){toastErr(e)}
  loadBackups();loadRoutes();loadEvents()}
 // Green: answered, yellow: slower than the threshold, red: no answer
-function pingKind(latency){const max=(routesData&&routesData.max_latency)||Infinity;return latency==null?"bad":latency>max?"warn":"ok"}
+// `tcp`: a connection-only ping, judged by its own lower limit
+function pingKind(latency,tcp){const max=(routesData&&(tcp?routesData.max_tcp_latency:routesData.max_latency))||Infinity;return latency==null?"bad":latency>max?"warn":"ok"}
+const KIND_RANK={ok:0,warn:1,bad:2};
+// The service is checked by a connection only ("tcp" or Telegram's servers)
+const byTcp=key=>!!routesData&&((routesData.methods||{})[key]||routesData.check_method||"page")!=="page";
+// Page and connection pings don't mix: "418 / 95" with both, else the one there is
+function pingPair(page,tcp){return page&&tcp?`${Math.round(page)} / ${Math.round(tcp)}`:String(Math.round(page||tcp))}
+function pairKind(page,tcp){const k=[page?pingKind(page):null,tcp?pingKind(tcp,true):null].filter(Boolean);
+ return k.sort((a,b)=>KIND_RANK[b]-KIND_RANK[a])[0]||"none"}
+const PAIR_TITLE="Пинг по странице / по соединению: способы меряют разное, поэтому не смешиваются";
 const openSites=new Set();
 function siteList(tunnel,x){
  const sites=x&&x.sites&&x.sites.length?x.sites:routesData?Object.values(routesData.sites).filter(s=>s.tunnel===tunnel):[];
  if(!sites.length)return null;
  // Domains that count first, the worst of them on top; ones that don't answer anywhere last
- const max=(routesData&&routesData.max_latency)||Infinity,bad=s=>s.latency==null||s.latency>max,cnt=s=>s.counted!==false;
+ const max=(routesData&&routesData.max_latency)||Infinity,maxT=(routesData&&routesData.max_tcp_latency)||Infinity,
+  bad=s=>s.latency==null||s.latency>(s.tcp?maxT:max),cnt=s=>s.counted!==false;
  const sorted=[...sites].sort((a,b)=>cnt(b)-cnt(a)||bad(b)-bad(a)||(b.latency??1e9)-(a.latency??1e9));
- const row=s=>el("li",{class:cnt(s)?"":"muted"},el("span",{class:"dot "+(cnt(s)?pingKind(s.latency):"")}),
-  el("span",{class:"h",text:hostOf(s.url)}),el("span",{class:"v",title:s.status!=null?String(s.status):"",
-   text:!cnt(s)?"не в счёт":s.latency!=null?Math.round(s.latency)+" мс":"нет ответа"}));
+ const row=s=>el("li",{class:cnt(s)?"":"muted"},el("span",{class:"dot "+(cnt(s)?pingKind(s.latency,s.tcp):"")}),
+  el("span",{class:"h",text:hostOf(s.url)}),el("span",{class:"v",title:(s.tcp?"По соединению. ":"")+(s.status!=null?String(s.status):""),
+   text:!cnt(s)?"не в счёт":s.latency!=null?Math.round(s.latency)+" мс"+(s.tcp?" · соед.":""):"нет ответа"}));
  const head=x&&x.counted?el("li",{class:"muted"},`В норме ${x.counted-x.bad} из ${x.counted} ${plural(x.counted,"домена","доменов","доменов")}`
   +(x.silent?`, ещё ${x.silent} не отвечают нигде`:"")+(x.loss?` · потери ${Math.round(x.loss*100)}%`:"")):null;
  const list=el("ul",{class:"sitelist"},head,...sorted.slice(0,5).map(row));
@@ -4128,7 +4254,9 @@ function renderTunnels(){
  // Tunnels with nodes by country name, so a card stays where it was; without nodes folded at the end
  const byName=(a,b)=>(st.tunnels[a].country||a).localeCompare(st.tunnels[b].country||b,"ru");
  const all=Object.keys(st.tunnels||{});
- const codes=all.filter(c=>st.tunnels[c].pool>0).sort(byName);
+ const dark=VIEW==="dark";
+ const codes=all.filter(c=>st.tunnels[c].pool>0&&!(dark&&st.tunnels[c].unchecked)).sort(byName);
+ const off=dark?all.filter(c=>st.tunnels[c].pool>0&&st.tunnels[c].unchecked).sort(byName):[];
  const empty=all.filter(c=>!(st.tunnels[c].pool>0)).sort(byName);
  const box=$("tunnels");box.textContent="";
  const card=c=>{const x=st.tunnels[c],noNodes=x.pool===0,open=openCards.has(c);
@@ -4141,7 +4269,8 @@ function renderTunnels(){
    long?el("span",{class:"tdoing",title:doing.text,text:doing.text}):el("span",{text:`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`}),
    !long&&x.all_slow?el("span",{class:"warn",title:"Проверку не прошли все туннели сразу: похоже на сеть или Deeper, а не на ноды. Сбой не засчитывается, ноды не меняются; сервисы, которые плохо работают, всё равно переезжают туда, где есть ноды",text:"медленные все туннели"})
    :!long&&x.fails&&!x.unchecked?el("span",{class:"warn",text:`сбоев ${x.fails} из ${st.fail_threshold}`}):null);
-  const ping=el("div",{class:"tping "+(x.latency?pingKind(x.latency):"none")},x.latency?String(Math.round(x.latency)):"—",x.latency?el("small",{text:"мс"}):null);
+  const lp=x.lat_page!==undefined?x.lat_page:x.latency,lt=x.lat_tcp||null,has=!!(x.latency&&(lp||lt));
+  const ping=el("div",{class:"tping "+(has?pairKind(lp,lt):"none"),title:lp&&lt?PAIR_TITLE:lt?"Пинг по соединению":null},has?pingPair(lp,lt):"—",has?el("small",{text:"мс"}):null);
   const busy=doing?el("span",{class:"spin tbusy",role:"status",title:doing.text,"aria-label":doing.text}):null;
   const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(open),"aria-label":`${x.country}: ${label}, подробнее`},
    codeBadge(c),el("div",{},el("div",{class:"tname",text:x.country&&x.country!==c?x.country:tname(c)}),sub),busy,ping,el("span",{class:"chev","aria-hidden":"true"}),tunnelButtons(c,x));
@@ -4152,7 +4281,9 @@ function renderTunnels(){
    :noNodes?el("div",{class:"details",text:"Нет активных нод: сервисы переносятся в туннели, где ноды есть."})
    :siteList(c,x)||el("div",{class:"details",text:plainDetails(x)}),
    action?el("div",{class:"details",text:"→ "+action}):null):null;
-  return el("div",{class:"card tcard compact"+(open?" open":"")},head,body)};
+  const chips=dark&&!open?svcIn(c):[];
+  return el("div",{class:"card tcard compact st-"+(cls||"none")+(open?" open":"")},head,
+   chips.length?el("div",{class:"vchips"},...chips.slice(0,4).map(z=>el("span",{class:z.ok?"":"bad",text:z.name})),chips.length>4?el("span",{text:"+"+(chips.length-4)}):null):null,body)};
  for(const c of codes)box.append(card(c));
  if(empty.length){
   const head=el("div",{class:"thead",role:"button",tabindex:"0","aria-expanded":String(!!emptyOpen),"aria-label":`Без нод: ${empty.length}, показать`},
@@ -4164,7 +4295,12 @@ function renderTunnels(){
   head.onclick=toggle;head.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle()}};
   box.append(el("div",{class:"card tcard compact tempty"+(emptyOpen?" open":"")},head));
   if(emptyOpen)for(const c of empty)box.append(card(c))}
- if(!all.length&&!st.error)box.append(el("div",{class:"card empty"},el("span",{class:"spin"}),"Ждём первую проверку…"))}
+ if(off.length){const line=el("div",{class:"vmore voff",role:"button",tabindex:"0","aria-expanded":String(!!vOffOpen)},
+   el("span",{text:"Не проверяются:"}),el("span",{class:"vchips"},...off.map(c=>el("span",{title:tname(c),text:c}))),el("span",{class:"vlink",text:vOffOpen?"Свернуть":"Показать"}));
+  const flip=()=>{vOffOpen=vOffOpen?0:Date.now();renderTunnels()};line.onclick=flip;line.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();flip()}};
+  box.append(line);if(vOffOpen)for(const c of off)box.append(card(c))}
+ if(!all.length&&!st.error)box.append(el("div",{class:"card empty"},el("span",{class:"spin"}),"Ждём первую проверку…"));
+ renderView()}
 function codeBadge(c){const f=flag(c);return f?el("span",{class:"code",title:tname(c)},el("span",{class:"fw"},el("span",{class:"flag",text:f})),el("span",{class:"cc",text:c})):el("span",{class:"code",text:c})}
 function tmeta(x,threshold){return el("div",{class:"meta"},el("span",{},icon("server"),x.ip||"—"),el("span",{},icon("nodes"),`${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`),
  threshold!=null?el("span",{class:x.fails?"warn":""},icon("tri"),`сбоев ${x.fails} из ${threshold}`):null)}
@@ -4226,7 +4362,7 @@ function renderApps(){
    el("div",{class:"thead"},el("span",{class:"avatar",style:"background:"+(APP_COLORS[a.app]||"#8e8e93"),text:appName(a.app).charAt(0)}),
     el("div",{},el("div",{class:"tname",text:appName(a.app)}),
      el("div",{class:"small muted",style:"margin-top:3px",text:(cur?`${flag(a.tunnel)} через ${tname(a.tunnel)}`:"через "+tunnelLabel(a.tunnel))+(cur?` · ${cur.ip||"—"}`:"")}))),
-   el("div",{class:"ping "+(r?pingKind(r.latency):"")},r&&r.latency?String(Math.round(r.latency)):"—",el("small",{text:r&&r.latency?"мс":r?"нет ответа":""})),
+   el("div",{class:"ping "+(r?pingKind(r.latency,byTcp("app:"+a.app)):""),title:byTcp("app:"+a.app)?"Пинг по соединению":null},r&&r.latency?String(Math.round(r.latency)):"—",el("small",{text:r&&r.latency?"мс":r?"нет ответа":""})),
    el("div",{class:"meta"},el("span",{},icon("sparkle"),"Deeper рекомендует: "+(a.recommended.join(", ")||"—"))),
    seg))}
  requestAnimationFrame(thumbAll)}
@@ -4274,21 +4410,21 @@ function renderRoutes(){
  const byTunnel={};for(const x of Object.values(d.sites))(byTunnel[x.tunnel]=byTunnel[x.tunnel]||[]).push(x);
  const codes=Object.keys(byTunnel).sort();
  if(!codes.length)tb.append(el("div",{class:"empty",text:"Проверок ещё не было"}));
- const max=d.max_latency||Infinity,cnt=s=>s.counted!==false,bad=s=>s.latency==null||s.latency>max;
+ const max=d.max_latency||Infinity,maxT=d.max_tcp_latency||Infinity,cnt=s=>s.counted!==false,bad=s=>s.latency==null||s.latency>(s.tcp?maxT:max);
+ const medOf=l=>{const v=l.filter(s=>s.latency!=null).map(s=>s.latency).sort((a,b)=>a-b);return v.length?v[Math.floor(v.length/2)]:null};
  for(const c of codes){const list=byTunnel[c].sort((a,b)=>cnt(b)-cnt(a)||bad(b)-bad(a)||hostOf(a.url).localeCompare(hostOf(b.url)));
   const counted=list.filter(cnt),good=counted.filter(s=>!bad(s)).length;
-  const lats=counted.filter(s=>s.latency!=null).map(s=>s.latency).sort((a,b)=>a-b);
-  const med=lats.length?lats[Math.floor(lats.length/2)]:null;
+  const mp=medOf(counted.filter(s=>!s.tcp)),mt=medOf(counted.filter(s=>s.tcp));
   const rows=list.map(x=>{const h=hostOf(x.url),real=d.site_routes[h];
-   return el("li",{class:cnt(x)?"":"muted"},el("span",{class:"dot "+(cnt(x)?pingKind(x.latency):"")}),
+   return el("li",{class:cnt(x)?"":"muted"},el("span",{class:"dot "+(cnt(x)?pingKind(x.latency,x.tcp):"")}),
     el("span",{class:"h",title:`${h}: ${ms(x.latency)}${x.status!=null?" ("+x.status+")":""}`,text:h}),
     real&&real!==c?el("span",{class:"via",title:`Сайт идёт через ${real}, поэтому здесь он на самом деле проверяет ${real}`,text:"через "+real}):null,
-    el("span",{class:"v",text:!cnt(x)?"не в счёт":x.latency!=null?Math.round(x.latency)+" мс":"нет ответа"}))});
+    el("span",{class:"v",title:x.tcp?"По соединению":null,text:!cnt(x)?"не в счёт":x.latency!=null?Math.round(x.latency)+" мс"+(x.tcp?" · соед.":""):"нет ответа"}))});
   const det=el("details",{class:"tgroup"},
    el("summary",{class:"li"},codeBadge(c),
     el("div",{class:"li-main"},el("div",{class:"li-title",text:tname(c)}),
      el("div",{class:"small "+(counted.length&&good<counted.length/2?"bad":"muted"),text:`В норме ${good} из ${counted.length} ${plural(counted.length,"домена","доменов","доменов")}`+(list.length>counted.length?`, ещё ${list.length-counted.length} не в счёт`:"")})),
-    el("span",{class:"tright"},el("span",{class:"dot "+(med!=null?pingKind(med):"bad")}),med!=null?Math.round(med)+" мс":"—",el("span",{class:"chev"}))),
+    el("span",{class:"tright",title:mp&&mt?PAIR_TITLE:null},el("span",{class:"dot "+(mp||mt?pairKind(mp,mt):"bad")}),mp||mt?pingPair(mp,mt)+" мс":"—",el("span",{class:"chev"}))),
    el("ul",{class:"sitelist"},...rows));
   det.open=openTests.has(c);det.ontoggle=()=>det.open?openTests.add(c):openTests.delete(c);tb.append(det)}
  // Compare controls
@@ -4303,10 +4439,13 @@ function renderRoutes(){
  $("selAll").indeterminate=selected.size>0&&selected.size<allKeys.length;
  // Apps and rules
  const q=$("rtFilter").value.trim().toLowerCase();
- const appItems=d.apps.map(a=>({key:"app:"+a.app,tunnel:a.tunnel})).filter(x=>!q||itemName(x.key).toLowerCase().includes(q));
+ const follows=d.follows||{},appNames=new Set(d.apps.map(a=>a.app));
+ const followers=a=>d.groups.filter(g=>follows[g.key]===a);
+ const appItems=d.apps.map(a=>({key:"app:"+a.app,tunnel:a.tunnel})).filter(x=>!q||itemName(x.key).toLowerCase().includes(q)
+  ||followers(x.key.slice(4)).some(g=>g.domains.some(m=>m.domain.includes(q))));
  $("rtAppsHead").hidden=$("rtApps").hidden=!appItems.length;
  renderItems($("rtApps"),appItems,results,d);
- const rules=d.groups.map(g=>({key:g.key,tunnel:g.main,group:g}))
+ const rules=d.groups.filter(g=>!appNames.has(follows[g.key])).map(g=>({key:g.key,tunnel:g.main,group:g}))
   .filter(x=>!q||x.group.name.toLowerCase().includes(q)||x.group.domains.some(m=>m.domain.includes(q))).sort((a,b)=>
   (b.group.split-a.group.split)||(!!results[b.key]-!!results[a.key])||(selected.has(b.key)-selected.has(a.key))||
   (b.group.domains.length>1)-(a.group.domains.length>1)||a.group.name.localeCompare(b.group.name));
@@ -4318,6 +4457,14 @@ function moveButtons(key,label,exclude){
  for(const t of routesData.all_tunnels.filter(t=>t.nodes>0&&t.code!==exclude)){
   const b=el("button",{type:"button",class:"btn sm",text:t.code,title:tname(t.code)});b.onclick=()=>moveDomain(key,t.code,b);wrap.append(b)}
  return wrap}
+// The domains of a Smart Route service: list, move to another service, delete. `inApp`: shown in its app's row
+function domsBlock(key,name,group,inApp){const n=group.domains.length,del=el("button",{type:"button",class:"btn sm danger"},icon("trash"),n>1?"Удалить все домены":"Удалить домен");
+ del.onclick=()=>deleteDomains([key],`${name}: удалить ${n} ${plural(n,"домен","домена","доменов")} из Smart Route?`,del);
+ const det=el("details",{class:"doms"},el("summary",{text:`${n} ${plural(n,"домен","домена","доменов")}`+(inApp?" Smart Route":"")}),
+  el("ul",{},...group.domains.map(m=>{const x=el("button",{type:"button",class:"xdel",title:"Удалить","aria-label":"Удалить "+m.domain},icon("x"));
+   x.onclick=()=>deleteDomains([m.domain],`Удалить ${m.domain} из Smart Route?`,x);
+   return el("li",{},el("span",{text:m.domain}),el("span",{},regroupSelect(m,group),el("span",{class:"chip"+(group.split&&m.tunnel!==group.main?" bad":""),text:m.tunnel}),x))})),
+  addToGroupRow(group),el("div",{class:"rec"},del));det.open=openDoms.has(key);det.ontoggle=()=>det.open?openDoms.add(key):openDoms.delete(key);return det}
 function renderItems(box,items,results,d){box.textContent="";
  for(const {key,tunnel,group} of items){const res=results[key],name=group?group.name:itemName(key);
   const sel=el("input",{type:"checkbox",class:"check","aria-label":"Выбрать "+name});sel.checked=selected.has(key);
@@ -4349,16 +4496,12 @@ function renderItems(box,items,results,d){box.textContent="";
   else if(pin&&tunnel&&tunnel!==pin&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("pin"),prefs.includes(tunnel)
    ?`Сейчас в запасном ${tunnel} (№${prefs.indexOf(tunnel)+1}). Вернётся в ${pin}, когда он будет в норме`:`Вернётся в ${pin}, когда он будет в норме`));
   if(hold&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("clock"),`Удержание после переезда ещё ${Math.max(1,Math.round((hold-Date.now()/1000)/60))} мин`));
-  const follows=(d.follows||{})[key];
-  if(follows)main.append(el("div",{class:"warnline"},icon("swap"),`Вместе с приложением ${follows}: переезжает вслед за ним`));
   const tour=(d.tours||{})[key];if(tour)main.append(el("div",{class:"warnline"},icon("refresh"),tourText(tour)));
-  if(group){const n=group.domains.length,del=el("button",{type:"button",class:"btn sm danger"},icon("trash"),n>1?"Удалить все домены":"Удалить домен");
-   del.onclick=()=>deleteDomains([key],`${name}: удалить ${n} ${plural(n,"домен","домена","доменов")} из Smart Route?`,del);
-   const det=el("details",{class:"doms"},el("summary",{text:`${n} ${plural(n,"домен","домена","доменов")}`}),
-   el("ul",{},...group.domains.map(m=>{const x=el("button",{type:"button",class:"xdel",title:"Удалить","aria-label":"Удалить "+m.domain},icon("x"));
-    x.onclick=()=>deleteDomains([m.domain],`Удалить ${m.domain} из Smart Route?`,x);
-    return el("li",{},el("span",{text:m.domain}),el("span",{},regroupSelect(m,group),el("span",{class:"chip"+(group.split&&m.tunnel!==group.main?" bad":""),text:m.tunnel}),x))})),
-   addToGroupRow(group),el("div",{class:"rec"},del));det.open=openDoms.has(key);det.ontoggle=()=>det.open?openDoms.add(key):openDoms.delete(key);main.append(det)}
+  if(group)main.append(domsBlock(key,name,group));
+  // An app shows the Smart Route service that follows it (same name) inside its row: one entry for both
+  if(key.startsWith("app:"))for(const g of d.groups.filter(g=>(d.follows||{})[g.key]===key.slice(4))){
+   if(g.split||g.main!==tunnel)main.append(el("div",{class:"warnline"},icon("swap"),`Домены ${g.name} ещё в ${g.split?"разных странах":g.main}, переедут к приложению при следующей проверке`));
+   main.append(domsBlock(g.key,g.name,g,true))}
   if(res){
    const best=Object.entries(res.pings).filter(([,p])=>p.ms!=null).sort((a,b)=>a[1].ms-b[1].ms)[0];
    main.append(el("div",{class:"chips"},...Object.keys(res.pings).map(t=>{const p=res.pings[t];
@@ -4536,6 +4679,325 @@ $("closeRoutes").onclick=()=>$("routes").close();
 $("routes").addEventListener("click",e=>{if(e.target===$("routes"))$("routes").close()});
 $("rtFilter").oninput=()=>renderRoutes();
 
+// Interface language: RU is the source, EN and ZH are translated on the fly from the rendered text.
+// Each entry is [ru, en, zh]; {0}, {1}… stand for values, which are translated in turn (countries, "3 домена").
+const I18N=[
+["мс","ms","毫秒"],["Сбой","Failure","故障"],["Ниже","Lower","下移"],["авто","auto","自动"],["Авто","Auto","自动"],["Порт","Port","端口"],
+["Выше","Higher","上移"],["Кому","To","收件人"],["Логин","Login","登录名"],["Задан","Set","已设置"],["Почта","Email","邮件"],["Обзор","Overview","概览"],
+["Поиск","Search","搜索"],["Выйти","Log out","退出"],["Домены","Domains","域名"],["Сервис","Service","服务"],["Доступ","Access","访问"],["Журнал","Log","日志"],
+["Пароль","Password","密码"],["Страна","Country","国家"],["Готово","Done","完成"],["Создать","Create","创建"],["Нет нод","No nodes","无节点"],["Разделы","Sections","分区"],
+["Сменить","Change","更换"],["Закрыть","Close","关闭"],["Вручную","Manual","手动"],["Удалить","Delete","删除"],["Туннели","Tunnels","隧道"],["Сервисы","Services","服务"],
+["От кого","From","发件人"],["Туннель","Tunnel","隧道"],["нет нод","no nodes","无节点"],["Добавить","Add","添加"],["Проверка","Check","检测"],["Свернуть","Collapse","收起"],
+["напрямую","direct","直连"],["Работает","Working","正常"],["Действия","Actions","操作"],["Не задан","Not set","未设置"],["Страница","Page","页面"],["Сбросить","Reset","重置"],
+["Очистить","Clear","清空"],["Отменить","Cancel","取消"],["Название","Name","名称"],["Загрузить","Upload","上传"],["не в счёт","not counted","不计入"],["Изменения","Changes","变更"],
+["Проверка…","Checking…","检测中…"],["Несколько","Several","多个"],["Сохранено","Saved","已保存"],["В очереди","Queued","排队中"],["Загрузка…","Loading…","加载中…"],["В сервис…","To service…","移入服务…"],
+["Настройки","Settings","设置"],["Перенести","Move","移动"],["Сохранить","Save","保存"],["без сбоев","no failures","无故障"],["Как у всех","Same as all","同全局"],["Проверяем…","Checking…","检测中…"],
+["Несколько…","Several…","多个…"],["Приложения","Apps","应用"],["Сравнение…","Comparing…","比较中…"],["Соединение","Connection","连接"],["нет ответа","no answer","无响应"],["SMTP-сервер","SMTP server","SMTP 服务器"],
+["Диагностика","Diagnostics","诊断"],["Выбрать все","Select all","全选"],["Выйти везде","Log out everywhere","全部退出"],["Все туннели","All tunnels","所有隧道"],["Включая это","Including this one","包括此设备"],
+["Нужно войти","Sign-in required","需要登录"],["Поиск сайта","Find a site","查找网站"],["Сравнить все","Compare all","全部比较"],["Новый сервис","New service","新服务"],["Диагностика…","Diagnosing…","诊断中…"],
+["О чём писать","What to report","通知内容"],["По умолчанию","Default","默认"],["Скачать файл","Download file","下载文件"],["Сменить ноду","Change node","更换节点"],["Показать все","Show all","显示全部"],
+["Восстановить","Restore","恢复"],["Новый пароль","New password","新密码"],["(как у всех)","(same as all)","(同全局)"],["Письма-отчёты","Email reports","邮件报告"],["По соединению","By connection","按连接"],
+["Журнал очищен","Log cleared","日志已清空"],["Удалить домен","Delete domain","删除域名"],["Новый сервис…","New service…","新服务…"],["Для порта 465","For port 465","用于端口 465"],["Введите домен","Enter a domain","输入域名"],
+["Не проверяется","Not checked","未检测"],["Будет добавлен","Will be added","将被添加"],["сейчас нет нод","no nodes now","当前无节点"],["Сброс настроек","Reset settings","重置设置"],["Ноды появились","Nodes are back","节点已出现"],
+["Идёт сравнение","Comparison running","正在比较"],["Тестовые сайты","Test sites","测试网站"],["Проверка почты","Email test","邮件测试"],["Загрузить файл","Upload file","上传文件"],["⚠ разные страны","⚠ different countries","⚠ 不同国家"],
+["Добавить сервис","Add service","添加服务"],["Тестовое письмо","Test email","测试邮件"],["Очистить журнал","Clear log","清空日志"],["Добавить домены","Add domains","添加域名"],["Домен или сервис","Domain or service","域名或服务"],
+["Изменить список…","Edit list…","编辑列表…"],["Событий пока нет","No events yet","暂无事件"],["Очистить журнал?","Clear the log?","清空日志？"],["В пуле одна нода","Only one node in the pool","节点池中只有一个节点"],
+["Разделы настроек","Settings sections","设置分区"],["Пусто: как логин","Empty: same as login","留空：同登录名"],["Проверить сейчас","Check now","立即检测"],["Отдельный сервис","Separate service","独立服务"],
+["Переезд при сбое","Move on failure","故障时迁移"],["Серверы Telegram","Telegram servers","Telegram 服务器"],["Пароль приложения","App password","应用密码"],["Только статистика","Statistics only","仅统计"],
+["Не чаще раза в, ч","At most once per, h","最多每（小时）一次"],["Действие при сбое","Action on failure","故障时操作"],["Ничего не найдено","Nothing found","未找到"],["Нет нод в туннеле","No nodes in the tunnel","隧道中无节点"],
+["Проверка туннелей","Tunnel checks","隧道检测"],["проверка не прошла","check failed","检测未通过"],["Проверка не прошла","Check failed","检测未通过"],["Удалить все домены","Delete all domains","删除所有域名"],
+["Настройки сброшены","Settings reset","设置已重置"],["Сайты и приложения","Sites and apps","网站和应用"],["Проверка завершена","Check finished","检测完成"],["Коды через запятую","Codes, comma separated","代码，用逗号分隔"],
+["Не удалось вернуть","Could not return","无法恢复"],["Сравнение запущено","Comparison started","比较已开始"],["Способ из настроек","Method from settings","设置中的方式"],["Нет связи с Deeper","No connection to Deeper","无法连接 Deeper"],
+["Пинг по соединению","Connection ping","连接延迟"],["Только этот туннель","This tunnel only","仅此隧道"],["Сравнение завершено","Comparison finished","比较完成"],["Замеров за проверку","Samples per check","每次检测采样数"],
+["Пинг и рекомендации","Ping and recommendations","延迟与建议"],["Сбросить настройки?","Reset settings?","重置设置？"],["Другая нода из пула","Another node from the pool","池中的另一个节点"],["Все туннели в норме","All tunnels are fine","所有隧道正常"],
+["Допустимый пинг, мс","Allowed ping, ms","允许延迟，毫秒"],["Несколько туннелей…","Several tunnels…","多个隧道…"],["IP-адрес устройства","Device IP address","设备 IP 地址"],["Перестроить туннель","Rebuild tunnel","重建隧道"],
+["Добавить все домены","Add all domains","添加所有域名"],["Способ из настроек: ","Method from settings: ","设置中的方式："],["Туннель сейчас занят","The tunnel is busy","隧道正忙"],["Deeper рекомендует: ","Deeper recommends: ","Deeper 推荐："],
+["Нет связи с сервером","No connection to the server","无法连接服务器"],["Проверок ещё не было","No checks yet","尚未检测"],["Все домены уже здесь","All domains are already here","所有域名已在此处"],["Как проверять сервисы","How to check services","服务检测方式"],
+["Пароль веб-интерфейса","Web interface password","网页界面密码"],["Перестроение туннелей","Tunnel rebuilds","隧道重建"],["медленные все туннели","all tunnels are slow","所有隧道都慢"],["Ждём первую проверку…","Waiting for the first check…","等待首次检测…"],
+["Медленные все туннели","All tunnels are slow","所有隧道都慢"],["Сначала уезжают плохие","Bad ones move first","差的先迁移"],["Ничего менять не нужно","Nothing needs changing","无需更改"],["Восстановление туннеля","Tunnel recovery","隧道恢复"],
+["Как проверяется сервис","How the service is checked","服务检测方式"],["Название=домен1,домен2","Name=domain1,domain2","名称=域名1,域名2"],["Интервал проверки, сек","Check interval, s","检测间隔，秒"],
+["Домены туннеля отвечают","The tunnel's domains answer","隧道的域名有响应"],["Пул нод соберётся заново","The node pool will be rebuilt","节点池将重新组建"],["Предпочтительный туннель","Preferred tunnel","首选隧道"],
+["Ожидание первой проверки","Waiting for the first check","等待首次检测"],["Предпочтительные туннели","Preferred tunnels","首选隧道"],["Например, smtp.yandex.ru","For example, smtp.gmail.com","例如 smtp.qq.com"],
+["Текущий туннель подходит","The current tunnel is fine","当前隧道合适"],["Быстрый уход очень плохих","Very bad ones leave fast","很差的立即迁移"],["Выйти на всех устройствах","Log out on all devices","在所有设备上退出"],
+["Если плохо части сервисов","If some services are bad","部分服务不佳时"],["Deeper Connect недоступен","Deeper Connect is unreachable","Deeper Connect 不可用"],["Перенести в другой сервис","Move to another service","移到其他服务"],
+["Файл не читается как JSON","The file is not valid JSON","文件不是有效的 JSON"],["Удалить все записи сейчас","Delete all entries now","立即删除所有记录"],["Проверяю всеми способами…","Checking with every method…","正在用所有方式检测…"],
+["Нет нод: нечего проверять","No nodes: nothing to check","无节点：无可检测"],["Резервные копии и перенос","Backups and transfer","备份与迁移"],["Нет нод ни в одном туннеле","No tunnel has nodes","所有隧道都无节点"],
+["Тестовое письмо отправлено","Test email sent","测试邮件已发送"],["Домены туннеля не ответили","The tunnel's domains didn't answer","隧道的域名无响应"],["Выйти на всех устройствах?","Log out on all devices?","在所有设备上退出？"],
+["Название берётся из домена","The name comes from the domain","名称取自域名"],["Сервис вместе с приложением","Service follows the app","服务跟随应用"],["Задан в .env (WEB_PASSWORD)","Set in .env (WEB_PASSWORD)","在 .env 中设置（WEB_PASSWORD）"],
+["О событиях, отмеченных ниже","About the events checked below","关于下方勾选的事件"],["Это не файл Deeper Watchdog","This is not a Deeper Watchdog file","这不是 Deeper Watchdog 文件"],["Сервис «Вручную» не работает","A “Manual” service is down","“手动”服务不可用"],
+["465 для SSL, 587 для STARTTLS","465 for SSL, 587 for STARTTLS","SSL 用 465，STARTTLS 用 587"],["Сервисы из правил Smart Route","Services from Smart Route rules","Smart Route 规则中的服务"],["Запрос к сайту, как у браузера","A request to the site, like a browser","像浏览器一样请求网站"],
+["Перестраивать в крайнем случае","Rebuild as a last resort","万不得已时重建"],["Не удалось загрузить настройки: ","Could not load settings: ","无法加载设置："],["Допустимый пинг «Соединения», мс","Allowed “Connection” ping, ms","“连接”允许延迟，毫秒"],
+["Смена ноды — после, сбоев подряд","Change node after, failures in a row","连续故障多少次后更换节点"],["Все записи журнала будут удалены.","All log entries will be deleted.","所有日志记录将被删除。"],["Домены в разных странах. Собрать в:","Domains are in different countries. Gather in:","域名分布在不同国家。集中到："],
+["Записи старше 3 дней удаляются сами.","Entries older than 3 days are deleted automatically.","超过 3 天的记录会自动删除。"],["Отправка с сохранёнными настройками…","Sending with the saved settings…","正在用已保存的设置发送…"],
+["Поиск в журнале по домену или сервису","Search the log by domain or service","按域名或服务搜索日志"],["Можно несколько адресов через запятую","Several addresses, comma separated","可填多个地址，用逗号分隔"],["Сбой сервиса — после, плохих проверок","Service failure after, bad checks","多少次不佳检测后判定服务故障"],
+["Как часто проверять туннели, от 30 сек","How often to check tunnels, from 30 s","隧道检测频率，至少 30 秒"],["Правила появятся после первой проверки","Rules will appear after the first check","规则将在首次检测后出现"],
+["И результат перестроения всех туннелей","And the result of rebuilding all tunnels","以及所有隧道的重建结果"],["Домены по туннелям · последняя проверка","Domains by tunnel · last check","各隧道的域名 · 上次检测"],
+["Туннель снова с нодами, сервисы вернулись","The tunnel has nodes again, services returned","隧道已有节点，服务已返回"],["Пароль изменён, остальные устройства вышли","Password changed, other devices logged out","密码已更改，其他设备已退出"],
+["Проверить всеми способами сейчас и выбрать","Check with every method now and choose","立即用所有方式检测并选择"],["По порядку: сначала первый, потом следующие","In order: the first one, then the next","按顺序：先第一个，再下一个"],
+["Проверка ещё идёт, результат появится позже","The check is still running, the result will appear later","检测仍在进行，结果稍后显示"],["Туннели Deeper Connect, приложения и сервисы","Deeper Connect tunnels, apps and services","Deeper Connect 隧道、应用和服务"],
+["Запрос к сайту, как у браузера. Точнее всего","A request to the site, like a browser. The most accurate","像浏览器一样请求网站。最准确"],["«Авто», «Вручную» или предпочтительные туннели","“Auto”, “Manual” or preferred tunnels","“自动”、“手动”或首选隧道"],
+["Сам он не переносится, и когда он снова в норме","It doesn't move by itself, and when it's fine again","它不会自动迁移，以及恢复正常时"],["Смена ноды или перестроение после сбоев проверки","Node change or rebuild after failed checks","检测故障后更换节点或重建"],
+["Для каждого туннеля, считая и ручные перестроения","For each tunnel, manual rebuilds included","每个隧道，包括手动重建"],["Никогда не переносится сам, только письмо при сбое","Never moves by itself, only an email on failure","从不自动迁移，故障时仅发邮件"],
+["Сервис не удалось вернуть в предпочтительный туннель","Could not return the service to its preferred tunnel","无法将服务返回首选隧道"],["Перенос сервисов из туннеля без нод и его перестроение","Moving services out of a tunnel without nodes and rebuilding it","从无节点隧道迁出服务并重建"],
+["Пароль спросят заново везде, и на этом устройстве тоже.","The password will be asked again everywhere, this device included.","所有设备（包括本设备）都需重新输入密码。"],["Туннель медленный или не отвечает, и когда он снова в норме","The tunnel is slow or not answering, and when it's fine again","隧道慢或无响应，以及恢复正常时"],
+["При плохой связи или без нод переезжает туда, где есть ноды","Moves where there are nodes when the connection is bad or there are no nodes","连接差或无节点时迁移到有节点的隧道"],["Копий пока нет: первая появится перед первым изменением правил","No backups yet: the first one is made before the first rule change","暂无备份：首次更改规则前会创建第一个"],
+["Нет активных нод: сервисы переносятся в туннели, где ноды есть.","No active nodes: services move to tunnels that have nodes.","无活动节点：服务迁移到有节点的隧道。"],["Не удаётся связаться с устройством, и когда связь восстановлена","The device can't be reached, and when the connection is back","无法连接设备，以及连接恢复时"],
+["Похоже на проблему сети или Deeper, восстановление не запускается","Looks like a network or Deeper problem, recovery doesn't start","似乎是网络或 Deeper 的问题，不启动恢复"],["Сервис ушёл из туннеля, где плохо работал, и итог обхода туннелей","A service left a tunnel where it worked badly, and the result of trying tunnels","服务离开表现差的隧道，以及遍历隧道的结果"],
+["Письмо уходит с сохранёнными настройками: сначала нажмите «Сохранить»","The email uses the saved settings: press “Save” first","邮件使用已保存的设置：请先点击“保存”"],["Соединение с серверами Telegram, через которые работает само приложение","A connection to the Telegram servers the app itself uses","连接应用本身使用的 Telegram 服务器"],
+["Что делать, когда в туннеле плохо нескольким сервисам, а остальным хорошо","What to do when some services in a tunnel are bad and the rest are fine","隧道中部分服务差、其余正常时怎么办"],["Настройки, ручные переносы, смена ноды и перестроение вручную, новые туннели","Settings, manual moves, manual node changes and rebuilds, new tunnels","设置、手动迁移、手动更换节点与重建、新隧道"],
+["Правила удалятся из Smart Route Deeper. Перед этим сохранится резервная копия.","The rules will be removed from Deeper Smart Route. A backup is saved first.","规则将从 Deeper Smart Route 删除。删除前会保存备份。"],
+["Домены одного сервиса всегда переносятся и сравниваются вместе, в одной стране.","A service's domains always move and are compared together, in one country.","同一服务的域名总是一起迁移和比较，位于同一国家。"],
+["Изменения применяются сразу после сохранения, перезапускать контейнер не нужно.","Changes apply right after saving, no container restart needed.","保存后立即生效，无需重启容器。"],
+["Пинг по странице / по соединению: способы меряют разное, поэтому не смешиваются","Page ping / connection ping: the methods measure different things, so they aren't mixed","页面延迟 / 连接延迟：两种方式测量的内容不同，因此不混合"],
+["Сервис измерен в своём туннеле каждым способом. Нажмите на способ, чтобы проверять сервис так.","The service was measured in its tunnel by every method. Click a method to check the service that way.","已在服务所在隧道用每种方式测量。点击一种方式即按此方式检测。"],
+["Только соединение с сервером: для сервисов, которые работают, но не отвечают на запрос проверки","Only a connection to the server: for services that work but don't answer the check request","仅连接服务器：用于正常工作但不响应检测请求的服务"],
+["Для всех сервисов, у которых не выбран свой способ (меню «Проверка» у сервиса в «Пинг и рекомендации»)","For all services without their own method (the service's “Check” menu in “Ping and recommendations”)","适用于未单独选择方式的所有服务（“延迟与建议”中服务的“检测”菜单）"],
+["Туннель оценивается по доменам, как раньше, но сервисы, у которых уже сбой, не портят его пинг и статус","The tunnel is judged by domains as before, but services that already failed don't spoil its ping and status","隧道仍按域名评估，但已故障的服务不影响其延迟和状态"],
+["Сервис медленнее этого в 2 из 3 последних проверок переезжает в туннель с нодами. Для способа проверки «Страница»","A service slower than this in 2 of the last 3 checks moves to a tunnel with nodes. For the “Page” check method","在最近 3 次检测中有 2 次慢于此值的服务会迁移到有节点的隧道。适用于“页面”检测方式"],
+["Как «Сначала уезжают плохие», и сервис без ответа или вдвое медленнее допустимого уезжает уже после одной проверки","Like “Bad ones move first”, and a service with no answer or twice slower than allowed leaves after one check","同“差的先迁移”，且无响应或慢于允许值两倍的服务在一次检测后即迁移"],
+["Туннель оценивается по сервисам, а не по доменам. Плохие уезжают, не дожидаясь смены ноды, и не портят пинг туннеля","The tunnel is judged by services, not domains. Bad ones leave without waiting for a node change and don't spoil the tunnel's ping","隧道按服务而非域名评估。差的服务不等更换节点即迁移，不影响隧道延迟"],
+["Только соединение с сервером. Для сервисов, которые работают, но не отвечают на запрос проверки через некоторые ноды","Only a connection to the server. For services that work but don't answer the check request through some nodes","仅连接服务器。用于正常工作但经某些节点不响应检测请求的服务"],
+["Сколько раз меряется каждый домен, 1–5. В пинг идёт лучший замер, неудачные — в потери. Больше — точнее, но проверка дольше","How many times each domain is measured, 1–5. The best sample is the ping, failed ones count as loss. More is more accurate but slower","每个域名测量次数，1–5。最佳结果计为延迟，失败计为丢包。次数越多越准确，但检测更慢"],
+["Через этот туннель сейчас не идёт ни один сервис, поэтому пинг не измерить. Перенесите в него сервис в «Пинг и рекомендации».","No service goes through this tunnel now, so there is no ping. Move a service into it in “Ping and recommendations”.","目前没有服务经过此隧道，无法测量延迟。请在“延迟与建议”中将服务移入。"],
+["Все домены сервиса добавляются в Smart Route одной кнопкой. Домены, которые уже есть в другой стране, переносятся в выбранную.","All of a service's domains are added to Smart Route with one button. Domains already in another country move to the chosen one.","一键将服务的所有域名添加到 Smart Route。已在其他国家的域名会迁移到所选国家。"],
+["Пароль спрашивается один раз на каждом устройстве. Смена пароля и «Выйти везде» заставят все остальные устройства войти заново.","The password is asked once on each device. Changing it or “Log out everywhere” makes all other devices sign in again.","每台设备只需输入一次密码。更改密码或“全部退出”会让其他设备重新登录。"],
+["Сначала первый туннель. Если ему там плохо и смена ноды не помогла — следующий по списку. В другие туннели — только если не подошёл ни один.","The first tunnel first. If it's bad there and a node change didn't help, the next one in the list. Other tunnels only if none fits.","先用第一个隧道。若表现差且更换节点无效，则用列表中的下一个。仅当都不合适时才用其他隧道。"],
+["То же для сервисов со способом «Соединение» или «Серверы Telegram». Их пинг в 3–4 раза меньше: меряется одно соединение, а не загрузка страницы","The same for services with the “Connection” or “Telegram servers” method. Their ping is 3–4 times lower: one connection is measured, not a page load","同上，用于“连接”或“Telegram 服务器”方式的服务。其延迟低 3–4 倍：只测一次连接，而非页面加载"],
+["Выключено: watchdog сам никогда не перестраивает туннели, только переносит сервисы и меняет ноды. Кнопка «Перестроить» в меню туннеля работает всегда","Off: the watchdog never rebuilds tunnels by itself, it only moves services and changes nodes. The “Rebuild” button in the tunnel menu always works","关闭：watchdog 从不自动重建隧道，只迁移服务和更换节点。隧道菜单中的“重建”按钮始终可用"],
+["Все изменения, сделанные в веб-интерфейсе, удалятся, и вернутся исходные значения из файла .env. Сервисы, «Авто» и предпочтительные туннели сохранятся.","All changes made in the web interface will be removed and the values from .env return. Services, “Auto” and preferred tunnels are kept.","网页界面中的所有更改将被删除，恢复 .env 中的原始值。服务、“自动”和首选隧道会保留。"],
+["Можно несколько через запятую или пробел. Поддомены Deeper подхватывает сам. Если выбрать сервис, домены станут его частью и всегда будут в одной стране с ним.","Several, separated by commas or spaces. Deeper picks up subdomains itself. If you choose a service, the domains become part of it and always stay in its country.","可用逗号或空格分隔多个。Deeper 会自动包含子域名。若选择服务，域名将归入该服务并始终与其在同一国家。"],
+["Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.","Apps from Deeper “App relocation” shown on the overview and included in comparisons. For example: instagram, telegram, facebook, chatGpt, youtube.","Deeper“应用迁移”中显示在概览并参与比较的应用。例如：instagram、telegram、facebook、chatGpt、youtube。"],
+["Туннель не прошёл столько проверок подряд, и в нём больше одной ноды — меняется нода и туннель проверяется заново. Его сервисы ждут смены ноды и уезжают, только если не помогло","After this many failed checks in a row, if the tunnel has more than one node, the node changes and the tunnel is checked again. Its services wait for the node change and leave only if it didn't help","隧道连续这么多次检测未通过且有多个节点时，更换节点并重新检测。其服务等待更换节点，仅在无效时迁移"],
+["Проверку не прошли все туннели сразу: похоже на сеть или Deeper, а не на ноды. Сбой не засчитывается, ноды не меняются; сервисы, которые плохо работают, всё равно переезжают туда, где есть ноды","All tunnels failed the check at once: it looks like the network or Deeper, not the nodes. The failure isn't counted and nodes don't change; services that work badly still move where there are nodes","所有隧道同时未通过检测：像是网络或 Deeper 的问题，而非节点。不计故障、不换节点；表现差的服务仍迁移到有节点的隧道"],
+["Сервис из правил Smart Route с тем же названием, что и приложение (например, Telegram и telegram), всегда в туннеле приложения: сам не переезжает, а следует за ним. Кроме режима «Вручную»; свои предпочтительные туннели сервиса при этом не действуют","A Smart Route service with the same name as an app (e.g. Telegram and telegram) always stays in the app's tunnel: it doesn't move by itself but follows the app. Except in “Manual” mode; the service's own preferred tunnels don't apply then","与应用同名的 Smart Route 服务（如 Telegram 与 telegram）始终在应用的隧道中：不自行迁移而是跟随应用。“手动”模式除外；此时服务自己的首选隧道不生效"],
+["Сервис переезжает, если ему плохо (медленно, потери, нет ответа, ошибки) в стольких из последних проверок (на одну больше этого числа): при 2 — в 2 из 3. Одна плохая проверка — ещё не сбой, а сервис на грани порога («плохо, хорошо, плохо») переезжает","A service moves if it's bad (slow, loss, no answer, errors) in this many of the last checks (out of one more than this number): with 2, in 2 of 3. One bad check isn't a failure yet, while a service on the edge (“bad, good, bad”) moves","服务在最近若干次检测（比此数多一次）中有这么多次表现差（慢、丢包、无响应、错误）时迁移：设为 2 即 3 次中有 2 次。一次不佳不算故障，而徘徊在阈值的服务（差、好、差）会迁移"],
+["Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга в 2 из 3 последних проверок, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.","Each tunnel is checked by its services' domains and its apps' sites. A service moves to another tunnel only when both hold: its tunnel has a bad connection (slower than the allowed ping in 2 of the last 3 checks, losing requests, not answering, returning errors) or no nodes — and the new tunnel has nodes. Services don't move just because somewhere is faster.","每个隧道按其服务的域名和应用的网站检测。仅当两个条件都满足时服务才迁移：所在隧道连接差（最近 3 次中有 2 次慢于允许延迟、丢请求、无响应、返回错误）或无节点，且新隧道有节点。服务不会仅因别处更快而迁移。"],
+["Копия правил Deeper сохраняется сама перед каждым изменением, которое трогает много правил сразу: сравнением, переносом, добавлением и удалением доменов, загрузкой файла. Если что-то пойдёт не так, из копии всё возвращается как было. Хранятся последние 10, одинаковые подряд не повторяются. Файл содержит правила, приложения и настройки без паролей; при загрузке файла домены только добавляются и переносятся, лишние не удаляются.","A copy of the Deeper rules is saved automatically before every change that touches many rules at once: comparison, moves, adding and deleting domains, uploading a file. If something goes wrong, everything is restored from the copy. The last 10 are kept, identical ones in a row aren't repeated. The file holds rules, apps and settings without passwords; uploading it only adds and moves domains, extra ones aren't deleted.","每次批量改动规则前（比较、迁移、添加和删除域名、上传文件）都会自动保存 Deeper 规则副本。出问题时可从副本完整恢复。保留最近 10 份，连续相同的不重复保存。文件包含规则、应用和设置（不含密码）；上传文件时只添加和迁移域名，不删除多余的。"],
+["Если туннель не проходит проверку и в нём больше одной ноды, сначала меняется нода (до 2 раз) и туннель проверяется заново, его сервисы ждут. Не помогло — уезжают только те сервисы, которым плохо. Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.","If a tunnel fails the check and has more than one node, the node changes first (up to 2 times) and the tunnel is checked again while its services wait. If that doesn't help, only the services that are bad leave. Rebuilding is the last resort: only when no services remain in the tunnel, no more often than set, one tunnel at a time. A tunnel without nodes is rebuilt only after more than an hour without nodes: Deeper adds nodes itself, and a rebuild resets them.","隧道未通过检测且有多个节点时，先更换节点（最多 2 次）并重新检测，其服务等待。仍无效则只迁移表现差的服务。重建是最后手段：仅当隧道中没有服务、不超过设定频率、一次一个隧道。无节点隧道仅在超过一小时无节点时重建：Deeper 会自行补充节点，而重建会清空它们。"],
+["Вид","View","外观"],["Язык","Language","语言"],["Вид главной страницы","Overview layout","概览布局"],["Как показывать обзор. Язык меняется кнопками RU / EN / 中文 в шапке","How the overview looks. The language is switched with RU / EN / 中文 in the header","概览的显示方式。语言可用页眉中的 RU / EN / 中文 切换"],
+["Стандартный","Standard","标准"],["Карточки туннелей, как раньше","Tunnel cards, as before","隧道卡片，与之前相同"],["Пульт управления","Control panel","控制面板"],["Сводка и таблица проверяемых туннелей с графиком пинга","Summary and a table of checked tunnels with a ping chart","摘要和带延迟图的已检测隧道表"],
+["Сначала сервисы","Services first","服务优先"],["Карточки сервисов и приложений, туннели и журнал сбоку","Service and app cards, tunnels and the log on the side","服务和应用卡片，隧道和日志在侧边"],["Тёмная панель","Dark panel","深色面板"],["Кольцо здоровья, средний пинг и события, тёмное оформление","Health ring, average ping and events, dark style","健康环、平均延迟和事件，深色风格"],
+["Работают","Working","正常"],["проверяемых туннелей","checked tunnels","已检测隧道"],["в норме","fine","正常"],["Переезды","Moves","迁移"],["за 24 ч","in 24 h","24 小时内"],["Смены нод","Node changes","节点更换"],["Пинг · страница / соед.","Ping · page / conn.","延迟 · 页面 / 连接"],
+["24 часа","24 hours","24 小时"],["Показать","Show","显示"],["Не проверяются · {0}","Not checked · {0}","未检测 · {0}"],["Не проверяются:","Not checked:","未检测："],["Средний пинг","Average ping","平均延迟"],["мс страница","ms page","毫秒 页面"],["мс соединение","ms connection","毫秒 连接"],
+["События","Events","事件"],["{0} из {1} сервисов","{0} of {1} services","{1} 个服务中 {0} 个"],["сейчас в","now in","当前在"],["приложение","app","应用"],["приложение + {0}","app + {0}","应用 + {0}"],["{0} · вручную","{0} · manual","{0} · 手动"],["{0} · 📌 {1}","{0} · 📌 {1}","{0} · 📌 {1}"],
+["Нет нод: {0}","No nodes: {0}","无节点：{0}"],// Values in templates
+["{0}: вручную","{0}: manual","{0}：手动"],["сбоев {0}","failures {0}","故障 {0}"],["Туннель {0}","Tunnel {0}","隧道 {0}"],["Проверяю {0}…","Checking {0}…","正在检测 {0}…"],
+["{0}: в очереди","{0}: queued","{0}：排队中"],["Загрузить {0}?","Upload {0}?","上传 {0}？"],["Меняю ноду {0}…","Changing the node of {0}…","正在更换 {0} 的节点…"],["Собран в {0}","Gathered in {0}","已集中到 {0}"],
+["Авто включено для {0}","Auto enabled for {0}","已为 {0} 启用自动"],["Перестраиваю {0}…","Rebuilding {0}…","正在重建 {0}…"],["Лучше {0}","Better: {0}","更好：{0}"],["Собрать в {0}","Gather in {0}","集中到 {0}"],
+["Сохранить ({0})","Save ({0})","保存（{0}）"],["Добавить все домены ({0})","Add all domains ({0})","添加所有域名（{0}）"],["Быстрее всего {0}","Fastest: {0}","最快：{0}"],["сбоев {0} из {1}","failures {0} of {1}","故障 {0}/{1}"],
+["Сравнить все ({0})","Compare all ({0})","全部比较（{0}）"],["Восстановить копию от {0}?","Restore the backup from {0}?","恢复 {0} 的备份？"],["{0}: {1}, подробнее","{0}: {1}, details","{0}：{1}，详情"],
+["Без нод: {0}, показать","No nodes: {0}, show","无节点：{0}，显示"],["Удалить {0} из Smart Route?","Delete {0} from Smart Route?","从 Smart Route 删除 {0}？"],["Как назвать сервис для {0}?","Name the service for {0}","为 {0} 的服务命名"],
+["{0} · доменов {1}","{0} · domains {1}","{0} · 域名 {1}"],["{0} теперь в сервисе {1}","{0} is now in the service {1}","{0} 现在属于服务 {1}"],["Остальные домены ({0})","Other domains ({0})","其他域名（{0}）"],
+["добавлено {0} из {1}","added {0} of {1}","已添加 {0}/{1}"],["{0} перенесён в {1}","{0} moved to {1}","{0} 已移至 {1}"],["Сравнить выбранные ({0})","Compare selected ({0})","比较所选（{0}）"],["Пинг {0} за {1} ч","{0} ping over {1} h","{0} 在 {1} 小时内的延迟"],
+["{0}: предпочтительный туннель {1}","{0}: preferred tunnel {1}","{0}：首选隧道 {1}"],["Шаг {0}: {1}","Step {0}: {1}","第 {0} 步：{1}"],["в норме, {0} мс","fine, {0} ms","正常，{0} 毫秒"],["Нода {0}: {1} → {2}","Node {0}: {1} → {2}","节点 {0}：{1} → {2}"],
+["Вернётся в {0}, когда он будет в норме","Will return to {0} when it's fine","{0} 恢复正常后将返回"],["{0}: предпочтительные {1}","{0}: preferred {1}","{0}：首选 {1}"],["{0} теперь через {1}","{0} now goes via {1}","{0} 现在经由 {1}"],
+["Сравнение завершено {0}","Comparison finished {0}","比较完成 {0}"],["Добавлено через {0}: {1}","Added via {0}: {1}","已经由 {0} 添加：{1}"],["Эти домены уже есть в {0}","These domains are already in {0}","这些域名已在 {0}"],["Восстановлено, изменено: {0}","Restored, changed: {0}","已恢复，更改：{0}"],
+["Найдено {0} из {1}","Found {0} of {1}","找到 {0}/{1}"],["Загружено, изменено правил: {0}","Uploaded, rules changed: {0}","已上传，更改规则：{0}"],["среднее по {0} из {1} доменов,","average of {0} of {1} domains,","{1} 个域名中 {0} 个的平均值，"],
+["{0}: выполняется, результат появится позже","{0}: running, the result will appear later","{0}：进行中，结果稍后显示"],["пробует туннели: опробованы {0}","trying tunnels: tried {0}","正在尝试隧道：已试 {0}"],["Показать все ({0})","Show all ({0})","显示全部（{0}）"],
+["Проверка {0} ещё идёт, результат появится позже","The check of {0} is still running, the result will appear later","{0} 的检测仍在进行，结果稍后显示"],["Перенесён {0} → {1}","Moved {0} → {1}","已迁移 {0} → {1}"],["{0} мс · потери {1}%","{0} ms · loss {1}%","{0} 毫秒 · 丢包 {1}%"],
+["Плохо работает большинство доменов: {0} из {1}","Most domains work badly: {0} of {1}","多数域名表现差：{0}/{1}"],["Все сайты медленнее допустимого, лучший — {0} мс","All sites are slower than allowed, the best is {0} ms","所有网站都慢于允许值，最好的 {0} 毫秒"],
+["Сайт идёт через {0}, поэтому здесь он на самом деле проверяет {1}","The site goes via {0}, so here it actually checks {1}","该网站经由 {0}，因此这里实际检测的是 {1}"],["Туннель {0} перестроен: {1} → {2}, нод в пуле {3}","Tunnel {0} rebuilt: {1} → {2}, nodes in the pool {3}","隧道 {0} 已重建：{1} → {2}，池中节点 {3}"],
+["Удалено: {0}","Deleted: {0}","已删除：{0}"],["{0}: удалить {1} из Smart Route?","{0}: delete {1} from Smart Route?","{0}：从 Smart Route 删除 {1}？"],["Последнее письмо {0}: отправлено","Last email {0}: sent","最后一封邮件 {0}：已发送"],
+["Последнее письмо {0}: ошибка, {1}","Last email {0}: error, {1}","最后一封邮件 {0}：错误，{1}"],["Нет нод · {0}","No nodes · {0}","无节点 · {0}"],["{0} ч · мин {1} · макс {2} мс","{0} h · min {1} · max {2} ms","{0} 小时 · 最小 {1} · 最大 {2} 毫秒"],
+["Удержание после переезда ещё {0} мин","Hold after the move: {0} more min","迁移后保持还剩 {0} 分钟"],["В норме {0} из {1}","Fine: {0} of {1}","正常 {0}/{1}"],["{0}: проверка — {1}","{0}: check — {1}","{0}：检测 — {1}"],["{0}: {1} теперь через {2}","{0}: {1} now via {2}","{0}：{1} 现在经由 {2}"],
+["Последняя проверка {0} · следующая {1}","Last check {0} · next {1}","上次检测 {0} · 下次 {1}"],["Сейчас в запасном {0} (№{1}). Вернётся в {2}, когда он будет в норме","Now in backup {0} (#{1}). Will return to {2} when it's fine","当前在备用 {0}（第 {1} 个）。{2} 恢复正常后将返回"],
+["Домены {0} ещё в {1}, переедут к приложению при следующей проверке","{0} domains are still in {1}, they'll move to the app at the next check","{0} 的域名仍在 {1}，下次检测时将迁移到应用所在隧道"],["{0}: добавлено {1} через {2}","{0}: added {1} via {2}","{0}：已经由 {2} 添加 {1}"],["{0}: домены уже в сервисе","{0}: the domains are already in the service","{0}：域名已在服务中"],
+["плохо во всех туннелях ({0}), остаётся в лучшем — {1}, пока где-нибудь не появится новая нода","bad in all tunnels ({0}), stays in the best one, {1}, until a new node appears somewhere","在所有隧道中都差（{0}），留在最好的 {1}，直到某处出现新节点"],
+["Доменов в копии: {0}. Домены, которых в копии нет, будут удалены. Текущие правила сначала сохранятся в новую копию.","Domains in the backup: {0}. Domains not in the backup will be deleted. The current rules are saved to a new backup first.","备份中的域名：{0}。备份中没有的域名将被删除。当前规则会先保存为新备份。"],
+["Временно в {0}: в {1} был сбой. Вернётся, когда {2} {3} мин подряд будет в норме","Temporarily in {0}: {1} had a failure. Will return when {2} is fine for {3} min in a row","暂时在 {0}：{1} 发生故障。{2} 连续 {3} 分钟正常后返回"],
+["Временно в {0}: на ноде {1} ему было плохо. Вернётся, когда в {2} будет другая нода и она {3} мин подряд будет в норме","Temporarily in {0}: it was bad on the {1} node. Will return when {2} has another node that is fine for {3} min in a row","暂时在 {0}：在 {1} 的节点上表现差。{2} 换了节点且连续 {3} 分钟正常后返回"],
+["Доменов: {0}, файл от {1}. Настройки (кроме паролей и адреса Deeper) заменятся, домены добавятся или перенесутся в страны из файла.","Domains: {0}, file from {1}. Settings (except passwords and the Deeper address) will be replaced, domains added or moved to the file's countries.","域名：{0}，文件日期 {1}。设置（密码和 Deeper 地址除外）将被替换，域名将添加或迁移到文件中的国家。"],
+["Нет ответа ({0})","No answer ({0})","无响应（{0}）"],["нет ответа ({0})","no answer ({0})","无响应（{0}）"],["{0}: {1} мс","{0}: {1} ms","{0}：{1} 毫秒"],["{0} мс","{0} ms","{0} 毫秒"],["{0} / {1} мс","{0} / {1} ms","{0} / {1} 毫秒"],
+["Ошибка: {0}","Error: {0}","错误：{0}"],["Сбой: {0}","Failure: {0}","故障：{0}"],["Ошибка сравнения: {0}","Comparison error: {0}","比较错误：{0}"],["Уже в {0}","Already in {0}","已在 {0}"],["через {0}","in {0}","{0} 后"],
+["Выбрать {0}","Choose {0}","选择 {0}"],["Удалить {0}","Delete {0}","删除 {0}"],["Перенести {0}","Move {0}","迁移 {0}"],["Проверка {0}","Check {0}","检测 {0}"],["В сервис {0}","To service {0}","移入服务 {0}"],
+["Режим для {0}","Mode for {0}","{0} 的模式"],["Домены для {0}","Domains for {0}","{0} 的域名"],["В очереди: {0}","Queued: {0}","排队中：{0}"],["Страна для {0}","Country for {0}","{0} 的国家"],["Туннель для {0}","Tunnel for {0}","{0} 的隧道"],
+["Как у всех: {0}","Same as all: {0}","同全局：{0}"],["Добавить домены в {0}","Add domains to {0}","添加域名到 {0}"],["Действия с туннелем {0}","Tunnel actions: {0}","隧道操作：{0}"],["{0}: готово","{0}: done","{0}：完成"],
+["{0} через {1}","{0} via {1}","{0} 经由 {1}"],["{0} · сбой","{0} · failure","{0} · 故障"],["{0} · обход","{0} · bypass","{0} · 绕行"],["{0} · соед.","{0} · conn.","{0} · 连接"],["{0} · выбран","{0} · chosen","{0} · 已选"],["{0} · лучший","{0} · best","{0} · 最佳"],
+["{0} · сравните","{0} · compare","{0} · 请比较"],["{0} · нет нод","{0} · no nodes","{0} · 无节点"],["{0} (как у всех)","{0} (same as all)","{0}（同全局）"],["Deeper рекомендует: {0}","Deeper recommends: {0}","Deeper 推荐：{0}"],["{0} · {1}","{0} · {1}","{0} · {1}"],
+];
+// Words after a number: "3 домена" → "3 domains"
+const I18N_NOUNS={"нода":["node","个节点"],"ноды":["nodes","个节点"],"нод":["nodes","个节点"],"домен":["domain","个域名"],"домена":["domains","个域名"],"доменов":["domains","个域名"],
+ "туннель":["tunnel","个隧道"],"туннеля":["tunnels","个隧道"],"туннелей":["tunnels","个隧道"],"сервис":["service","个服务"],"сервиса":["services","个服务"],"сервисов":["services","个服务"],
+ "мин":["min","分钟"],"ч":["h","小时"],"сек":["s","秒"],"мс":["ms","毫秒"]};
+// Phrases replaced inside longer texts that no entry covers as a whole
+const I18N_PARTS=[["нет ответа","no answer","无响应"],["не в счёт","not counted","不计入"],["ещё","more","还有"],["не отвечают нигде","don't answer anywhere","在任何地方都无响应"],["потери","loss","丢包"],
+ ["медленно в","slow in","慢于"],["сравните туннели","compare tunnels","请比较隧道"],["без нод","no nodes","无节点"],["быстрее на","faster by","更快"],["начнётся после","starts after","开始于"],["соед.","conn.","连接"],
+ ["через","via","经由"],["из","of","/"],["мс","ms","毫秒"],["нет нод","no nodes","无节点"],["сбой","failure","故障"],["Сбой","Failure","故障"],["выбран","chosen","已选"],["лучший","best","最佳"],["обход","bypass","绕行"],["нода","node","个节点"],["ноды","nodes","个节点"],["нод","nodes","个节点"],["домен","domain","个域名"],["домена","domains","个域名"],["доменов","domains","个域名"],["туннеля","tunnels","个隧道"],["туннелей","tunnels","个隧道"]];
+let LANG="ru";try{LANG=localStorage.getItem("lang")||"ru"}catch(e){}
+const i18nIdx=()=>LANG==="en"?1:2;
+let i18nExact=null,i18nPats=null,i18nParts=null;
+function i18nBuild(){i18nExact=new Map();i18nPats=[];
+ const esc=s=>s.replace(/[.*+?^$()|[\]\\]/g,"\\$&");
+ for(const e of I18N){if(!e[1])continue;const k=e[0].trim();
+  if(/\{\d\}/.test(k)){const order=[];const rx=esc(k).replace(/\\?\{(\d)\\?\}/g,(m,d)=>{order.push(+d);return "(.+?)"});
+   i18nPats.push({rx:new RegExp("^"+rx+"$"),order,e,lit:k.replace(/\{\d\}/g,"").length})}
+  else i18nExact.set(k,e)}
+ i18nPats.sort((a,b)=>b.lit-a.lit);
+ i18nParts=I18N_PARTS.slice().sort((a,b)=>b[0].length-a[0].length).map(p=>[new RegExp("(?<![А-Яа-яЁё])"+esc(p[0])+"(?![А-Яа-яЁё])","g"),p])}
+// Russian country names → the same country in the chosen language
+function i18nCountry(s){const i=i18nIdx();let names;try{names=new Intl.DisplayNames([i===1?"en":"zh"],{type:"region"})}catch(e){return null}
+ const codes=new Set([...Object.keys(countryNames||{}),...Object.keys((lastStatus&&lastStatus.tunnels)||{})]);
+ for(const c of codes){const t=lastStatus&&lastStatus.tunnels&&lastStatus.tunnels[c];
+  if(s===tname(c)||(t&&t.country===s)){try{return names.of(c)}catch(e){}}}
+ return null}
+const i18nCache=new Map();
+function tr(s){if(LANG==="ru"||!s||!/[А-Яа-яЁё]/.test(s))return s;if(!i18nExact)i18nBuild();
+ const key=LANG+"\u0000"+s;if(i18nCache.has(key))return i18nCache.get(key);
+ const lead=s.match(/^\s*/)[0],tail=s.match(/\s*$/)[0],core=s.trim();let out=null;const i=i18nIdx();
+ const ex=i18nExact.get(core);if(ex)out=ex[i];
+ if(out==null){const m=core.match(/^(\d+(?:[.,]\d+)?)\s(\S+)$/);if(m&&I18N_NOUNS[m[2]])out=m[1]+(i===1?" ":"")+I18N_NOUNS[m[2]][i-1]}
+ if(out==null)out=i18nCountry(core);
+ if(out==null)for(const p of i18nPats){const m=core.match(p.rx);if(!m)continue;
+  out=p.e[i].replace(/\{(\d)\}/g,(x,d)=>tr(m[1+p.order.indexOf(+d)]));break}
+ if(out==null){out=core;for(const [rx,p] of i18nParts)out=out.replace(rx,p[i])}
+ out=lead+out+tail;i18nCache.set(key,out);return out}
+// Rendered text is translated in place; the Russian original is kept so switching back restores it
+const i18nOrig=new WeakMap(),I18N_ATTRS=["title","placeholder","aria-label"];
+function i18nNode(n){if(n.nodeType===3){const p=n.parentNode;if(!p||/^(SCRIPT|STYLE|TEXTAREA)$/.test(p.nodeName)||p.closest&&p.closest("[data-noi18n]"))return;
+  let o=i18nOrig.get(n);if(!o||n.nodeValue!==o.out)o={ru:n.nodeValue};o.out=tr(o.ru);i18nOrig.set(n,o);if(n.nodeValue!==o.out)n.nodeValue=o.out;return}
+ if(n.nodeType!==1||n.closest("[data-noi18n]"))return;
+ for(const a of I18N_ATTRS){if(!n.hasAttribute(a))continue;const v=n.getAttribute(a);const k="a:"+a;let m=i18nOrig.get(n)||{};
+  if(!m[k]||v!==m[k].out)m[k]={ru:v};m[k].out=tr(m[k].ru);i18nOrig.set(n,m);if(v!==m[k].out)n.setAttribute(a,m[k].out)}}
+function i18nTree(root){i18nNode(root);if(root.nodeType!==1)return;const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT|NodeFilter.SHOW_ELEMENT);let n;while((n=w.nextNode()))i18nNode(n)}
+let i18nPending=new Set(),i18nTimer=0;
+const i18nObs=new MutationObserver(ms=>{for(const m of ms){if(m.type==="childList")m.addedNodes.forEach(n=>i18nPending.add(n));else i18nPending.add(m.target)}
+ if(!i18nTimer)i18nTimer=requestAnimationFrame(i18nFlush)});
+function i18nFlush(){i18nTimer=0;const ns=[...i18nPending];i18nPending.clear();i18nObs.disconnect();for(const n of ns)if(n.isConnected)i18nTree(n);i18nWatch();thumbAll()}
+function i18nWatch(){i18nObs.observe(document.body,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:I18N_ATTRS})}
+function setLang(l){LANG=l;try{localStorage.setItem("lang",l)}catch(e){}document.documentElement.lang=l==="zh"?"zh-CN":l;
+ document.querySelectorAll("#langseg button").forEach(b=>b.setAttribute("aria-pressed",String(b.dataset.lang===l)));
+ i18nObs.disconnect();i18nTree(document.body);i18nWatch();thumbAll();document.title="Deeper Watchdog"}
+document.querySelectorAll("#langseg button").forEach(b=>b.onclick=()=>setLang(b.dataset.lang));
+setLang(LANG);
+// Overview layouts (UI_VIEW): "standard" is the cards as they were; "table", "services" and "dark" are built here
+// from the same data. The choice is also kept on this device so a reload doesn't flash the standard layout first.
+const VIEWS=["standard","table","services","dark"];
+let VIEW="standard";try{VIEW=localStorage.getItem("view")||VIEW}catch(e){}
+let vOffOpen=0;
+function setView(v){if(!VIEWS.includes(v))v="standard";VIEW=v;try{localStorage.setItem("view",v)}catch(e){}
+ document.body.dataset.view=v;
+ // "Сначала сервисы" shows the log in its side column
+ const evb=$("eventsBlock"),side=$("vSideEv");
+ if(v==="services"){if(evb.parentNode!==side)side.append(evb)}else if(evb.parentNode===side)$("tab-overview").append(evb);
+ renderTunnels();renderServices()}
+const tState=x=>x.unchecked?["","Не проверяется"]:x.healthy?["ok","Работает"]:!(x.pool>0)?["warn","Нет нод"]:["bad","Сбой"];
+const tTitle=(c,x)=>x.country&&x.country!==c?x.country:tname(c);
+const tPings=x=>{const lp=x.lat_page!==undefined?x.lat_page:x.latency,lt=x.lat_tcp||null;return [lp,lt,!!(x.latency&&(lp||lt))]};
+const byCountry=st=>(a,b)=>(st.tunnels[a].country||a).localeCompare(st.tunnels[b].country||b,"ru");
+// Services and apps that go through a tunnel now, with whether they are fine
+function svcIn(code){const d=routesData;if(!d)return [];const out=[];
+ for(const [k,x] of Object.entries(d.services||{}))if(x.tunnel===code&&!(d.follows||{})[k])out.push({name:x.name,ok:x.ok});
+ for(const [a,r] of Object.entries(d.app_results||{}))if(r.tunnel===code)out.push({name:appName(a),ok:r.ok});
+ return out}
+// Moves and node changes over the last 24 hours, from the log
+function dayCounts(){const since=Date.now()-864e5;let moves=0,nodes=0;
+ for(const e of eventsData){const t=Date.parse(e.time.replace(" ","T"));if(!(t>=since))continue;
+  if(/переех|перенесён|теперь через/i.test(e.text))moves++;if(/смена ноды|нода сменена|ноду сменили|Нода .*→/i.test(e.text))nodes++}
+ return {moves,nodes}}
+const median=a=>{const v=a.filter(x=>x!=null&&x>0).sort((x,y)=>x-y);return v.length?v[(v.length-1)>>1]:null};
+function renderView(){const st=lastStatus;
+ $("vHero").hidden=!(VIEW==="table"||VIEW==="dark");$("vTable").hidden=VIEW!=="table";$("vSvc").hidden=VIEW!=="services";
+ if(!st)return;
+ if(VIEW==="table"){renderKpis();renderTable()}else if(VIEW==="dark")renderDarkHero();else if(VIEW==="services")renderSvcView()}
+const kpi=(label,value,sub)=>el("div",{class:"vk"},el("small",{text:label}),el("b",{text:String(value)}),el("span",{text:sub}));
+
+// Control panel: four figures and a table of the checked tunnels
+function renderKpis(){const st=lastStatus,d=routesData,box=$("vHero");box.className="vkpis";box.textContent="";
+ const w=Object.values(st.tunnels).filter(x=>x.pool>0&&!x.unchecked);
+ const items=d?[...Object.entries(d.services||{}).filter(([k])=>!(d.follows||{})[k]).map(([,x])=>x),...Object.values(d.app_results||{})]:[];
+ const day=dayCounts();
+ box.append(kpi("Работают",`${w.filter(x=>x.healthy).length} / ${w.length}`,"проверяемых туннелей"),
+  kpi("Сервисы",d?`${items.filter(x=>x.ok).length} / ${items.length}`:"—","в норме"),
+  kpi("Переезды",day.moves,"за 24 ч"),kpi("Смены нод",day.nodes,"за 24 ч"))}
+function renderTable(){const st=lastStatus,box=$("vTable");box.textContent="";
+ const all=Object.keys(st.tunnels).sort(byCountry(st));
+ const watched=all.filter(c=>st.tunnels[c].pool>0&&!st.tunnels[c].unchecked),
+  empty=all.filter(c=>!(st.tunnels[c].pool>0)),off=all.filter(c=>st.tunnels[c].pool>0&&st.tunnels[c].unchecked);
+ box.append(el("div",{class:"vr vh"},el("span"),el("span",{text:"Туннель"}),el("span",{text:"Состояние"}),el("span",{text:"Пинг · страница / соед."}),
+  el("span",{text:"24 часа"}),el("span",{text:"Сервисы"}),el("span")));
+ const row=c=>{const x=st.tunnels[c],[cls,label]=tState(x),[lp,lt,has]=tPings(x),s=svcIn(c),open=openCards.has(c);
+  const doing=(st.actions||{})[c];
+  const r=el("div",{class:"vr"+(open?" open":""),role:"button",tabindex:"0","aria-expanded":String(open)},codeBadge(c),
+   el("div",{class:"vn"},el("b",{text:tTitle(c,x)}),el("small",{text:doing?doing.text:`${x.ip||"—"} · ${x.pool??"—"} ${plural(x.pool||0,"нода","ноды","нод")}`})),
+   el("span",{},el("span",{class:"tstate "+cls},el("span",{class:"dot "+cls}),label)),
+   el("span",{class:"vping "+(has?pairKind(lp,lt):"none"),title:lp&&lt?PAIR_TITLE:null},has?pingPair(lp,lt)+" мс":"—"),
+   el("span",{class:"vspark"},spark(c)),
+   el("span",{class:"vnum",title:s.map(z=>z.name).join(", ")||null,text:s.length?`${s.filter(z=>z.ok).length} / ${s.length}`:"—"}),
+   tunnelButtons(c,x));
+  const toggle=e=>{if(e.target.closest("button"))return;open?openCards.delete(c):openCards.set(c,Date.now());renderView()};
+  r.onclick=toggle;r.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();toggle(e)}};
+  box.append(r);
+  if(open)box.append(el("div",{class:"vdet"},tmeta(x,x.unchecked?null:st.fail_threshold),
+   x.unchecked?null:!(x.pool>0)?el("div",{class:"details",text:"Нет активных нод: сервисы переносятся в туннели, где ноды есть."})
+   :siteList(c,x)||el("div",{class:"details",text:plainDetails(x)})))};
+ for(const c of watched)row(c);
+ const fold=(list,text,openNow,flip)=>{if(!list.length)return;
+  const line=el("div",{class:"vmore",role:"button",tabindex:"0","aria-expanded":String(!!openNow)},el("span",{text}),
+   el("span",{class:"vchips"},...list.slice(0,12).map(c=>el("span",{title:tname(c),text:c})),list.length>12?el("span",{text:"…"}):null),
+   el("span",{class:"vlink",text:openNow?"Свернуть":"Показать"}));
+  line.onclick=flip;line.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();flip()}};
+  box.append(line);if(openNow)for(const c of list)row(c)};
+ fold(empty,`Нет нод · ${empty.length} ${plural(empty.length,"туннель","туннеля","туннелей")}`,emptyOpen,()=>{emptyOpen=emptyOpen?0:Date.now();renderView()});
+ fold(off,`Не проверяются · ${off.length} ${plural(off.length,"туннель","туннеля","туннелей")}`,vOffOpen,()=>{vOffOpen=vOffOpen?0:Date.now();renderView()});
+ if(!all.length)box.append(el("div",{class:"empty"},el("span",{class:"spin"}),"Ждём первую проверку…"))}
+
+// Dark panel: the share of working services as a ring, the average pings and the latest events
+function renderDarkHero(){const st=lastStatus,d=routesData,box=$("vHero");box.className="vdark";box.textContent="";
+ const items=d?[...Object.entries(d.services||{}).filter(([k])=>!(d.follows||{})[k]).map(([,x])=>x),...Object.values(d.app_results||{})]:[];
+ const okN=items.filter(x=>x.ok).length,share=items.length?okN/items.length:0,R=62,L=2*Math.PI*R;
+ const NS="http://www.w3.org/2000/svg",mk=(tag,a)=>{const e=document.createElementNS(NS,tag);for(const k in a)e.setAttribute(k,a[k]);return e};
+ const svg=mk("svg",{viewBox:"0 0 150 150",class:"vring","aria-hidden":"true"});
+ svg.append(mk("circle",{cx:75,cy:75,r:R,fill:"none",stroke:"var(--fill2)","stroke-width":12}),
+  mk("circle",{cx:75,cy:75,r:R,fill:"none",stroke:share>=.9?"var(--green-dot)":share>=.6?"var(--orange-dot)":"var(--red-dot)","stroke-width":12,"stroke-linecap":"round",
+   "stroke-dasharray":`${(L*share).toFixed(1)} ${L.toFixed(1)}`,transform:"rotate(-90 75 75)"}));
+ const ring=el("div",{class:"card vglass vringbox"},svg,el("div",{class:"vringc"},el("b",{text:items.length?Math.round(share*100)+"%":"—"}),
+  el("small",{text:items.length?`${okN} из ${items.length} сервисов`:"Ждём первую проверку…"})));
+ const w=Object.values(st.tunnels).filter(x=>x.pool>0&&!x.unchecked&&x.healthy);
+ const mp=median(w.map(x=>x.lat_page!==undefined?x.lat_page:x.latency)),mt=median(w.map(x=>x.lat_tcp));
+ const pings=el("div",{class:"card vglass"},el("h6",{text:"Средний пинг"}),
+  el("div",{class:"vbig"},mp?String(Math.round(mp)):"—",el("small",{text:" мс страница"})),
+  el("div",{class:"vbig sm"},mt?String(Math.round(mt)):"—",el("small",{text:" мс соединение"})));
+ const ev=el("div",{class:"card vglass"},el("h6",{text:"События"}));
+ const today=new Date().toISOString().slice(0,10),list=eventsData.slice(0,5);
+ if(!list.length)ev.append(el("div",{class:"small muted",text:"Событий пока нет"}));
+ for(const e of list)ev.append(el("div",{class:"vev"},el("time",{text:e.time.slice(0,10)===today?e.time.slice(11,16):e.time.slice(8,10)+"."+e.time.slice(5,7)}),el("span",{class:"evi-dot dot "+e.kind}),el("span",{"data-noi18n":"",text:e.text})));
+ box.append(ring,pings,ev)}
+
+// Services first: a card per service or app (an app with its linked service), tunnels and the log on the side
+function renderSvcView(){const d=routesData,st=lastStatus,box=$("vSvcCards");box.textContent="";
+ if(!d){box.append(el("div",{class:"card empty"},el("span",{class:"spin"}),"Загрузка…"));return}
+ const follows=d.follows||{},cards=[];
+ for(const a of d.apps){const r=(d.app_results||{})[a.app],key="app:"+a.app,linked=Object.keys(follows).filter(k=>follows[k]===a.app);
+  const doms=linked.reduce((n,k)=>n+(((d.groups||[]).find(g=>g.key===k)||{}).domains||[]).length,0);
+  cards.push({key,name:appName(a.app),color:APP_COLORS[a.app],sub:"приложение"+(doms?` + ${doms} ${plural(doms,"домен","домена","доменов")}`:""),
+   tunnel:a.tunnel,latency:r&&r.latency,ok:r?r.ok:null,tcp:byTcp(key),filter:linked.length?((d.services||{})[linked[0]]||{}).name||appName(a.app):appName(a.app)})}
+ for(const g of d.groups||[]){if(follows[g.key])continue;const x=(d.services||{})[g.key];
+  const mode=(d.modes||{})[g.key]||"auto",prefs=[].concat((d.preferred||{})[g.key]||[]);
+  cards.push({key:g.key,name:g.name,sub:`${g.domains.length} ${plural(g.domains.length,"домен","домена","доменов")}`+(mode==="manual"?" · вручную":prefs.length?" · 📌 "+prefs.join(" › "):""),
+   tunnel:g.split?"split":g.main,latency:x&&x.latency,ok:x?x.ok:null,tcp:byTcp(g.key),limit:x&&x.limit,filter:g.name})}
+ cards.sort((a,b)=>((a.ok===false)-(b.ok===false))*-1||a.name.localeCompare(b.name));
+ const PALETTE=["#5856d6","#30b0c7","#ff9500","#34c759","#af52de","#ff2d55","#007aff","#a2845e"];
+ const hue=s=>PALETTE[[...s].reduce((h,ch)=>(h*31+ch.charCodeAt(0))>>>0,7)%PALETTE.length];
+ for(const s of cards){const max=s.limit||(s.tcp?d.max_tcp_latency:d.max_latency)||1000,kind=s.ok===false?"bad":s.latency==null?"":pingKind(s.latency,s.tcp);
+  const where=s.tunnel==="split"?el("b",{class:"bad",text:"⚠ разные страны"}):el("b",{text:`${flag(s.tunnel)} ${tname(s.tunnel)}`});
+  const c=el("button",{type:"button",class:"card vs"},
+   el("div",{class:"vs-t"},el("span",{class:"avatar",style:"background:"+(s.color||hue(s.name)),text:s.name.charAt(0).toUpperCase()}),
+    el("span",{class:"vs-n"},el("b",{text:s.name}),el("small",{text:s.sub}))),
+   el("div",{class:"vs-w"},el("span",{class:"muted",text:"сейчас в"}),where),
+   el("div",{class:"vbar"},el("i",{class:kind,style:`width:${s.latency!=null?Math.max(6,Math.min(100,s.latency/max*100)):100}%`})),
+   el("div",{class:"vs-m"},el("span",{class:kind==="bad"?"bad":"",text:s.latency!=null?Math.round(s.latency)+" мс"+(s.tcp?" · соед.":""):s.ok===null?"—":"нет ответа"}),
+    el("span",{text:s.ok===false?"сбой":s.ok?"в норме":""})));
+  c.onclick=async()=>{$("rtFilter").value=s.filter;openDoms.add(s.key);await loadRoutes();openSheet()};
+  box.append(c)}
+ // Tunnels, compact
+ const tb=$("vTuns");tb.textContent="";tb.append(el("div",{class:"vside-h",text:"Туннели"}));
+ if(!st)return;const all=Object.keys(st.tunnels).sort(byCountry(st));
+ const watched=all.filter(c=>st.tunnels[c].pool>0&&!st.tunnels[c].unchecked),empty=all.filter(c=>!(st.tunnels[c].pool>0));
+ for(const c of watched){const x=st.tunnels[c],[cls]=tState(x),[lp,lt,has]=tPings(x);
+  tb.append(el("div",{class:"vt"},el("span",{class:"dot "+cls}),el("span",{class:"vt-n",text:`${flag(c)} ${tTitle(c,x)}`}),
+   el("span",{class:"vt-p "+(has?pairKind(lp,lt):""),title:lp&&lt?PAIR_TITLE:null,text:has?pingPair(lp,lt):"—"}),tunnelButtons(c,x)))}
+ if(empty.length)tb.append(el("div",{class:"vt muted"},el("span",{class:"dot warn"}),el("span",{class:"vt-n",text:"Нет нод: "+empty.join(", ")})))}
+setView(VIEW);
 hydrateIcons();document.querySelectorAll("select").forEach(enhanceSelect);
 let tab="overview";try{tab=localStorage.getItem("tab")||tab}catch(e){}setTab(tab==="settings"?"settings":"overview");
 loadSettings().catch(e=>toast("Не удалось загрузить настройки: "+e.message,true));
@@ -4814,7 +5276,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "hold_down": {k: int(t + HOLD_DOWN) for k, t in AUTO_STATE["moved_at"].items() if t + HOLD_DOWN > time.time()},
                 "country_names": COUNTRY_NAMES,
                 "apps": ROUTES["apps"], "app_results": dict(APP_RESULTS), "all_tunnels": ROUTES["all_tunnels"],
-                "max_latency": MAX_LATENCY_MS,
+                "max_latency": MAX_LATENCY_MS, "max_tcp_latency": MAX_TCP_LATENCY_MS,
                 "groups": service_groups(ROUTES["whitelist"]),
                 "catalog": service_catalog(ROUTES["whitelist"]),
                 "services": dict(SERVICE_RESULTS),
