@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut android:shortcutId="settings" android:enabled="true" android:icon="@drawable/ic_fg"
+        android:shortcutShortLabel="@string/settings" android:shortcutLongLabel="@string/settings_long">
+        <intent android:action="com.escvratar.deeperwatchdog.SETTINGS"
+            android:targetPackage="com.escvratar.deeperwatchdog" android:targetClass="com.escvratar.deeperwatchdog.MainActivity" />
+    </shortcut>
+</shortcuts>

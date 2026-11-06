@@ -727,6 +727,8 @@ def save_json(path, data):
 
 # Event log shown in the web UI: [{time, kind, text}], newest last
 EVENTS = load_json(EVENTS_FILE, [])
+# Every entry gets a number, so the phone app asks only for entries newer than the last one it has seen
+EVENT_SEQ = max([e.get("n", 0) for e in EVENTS] or [0])
 # What the watchdog remembers about its moves, tunnels and domains (pruned by prune_cache)
 AUTO_STATE = load_json(AUTO_STATE_FILE, {})
 for _gone in ("probation", "blocked", "failovers", "beacons", "last_scheduled"):  # Older versions' state
@@ -757,10 +759,16 @@ EMAIL_CATEGORIES = ("recovery", "check", "all_slow", "no_nodes", "nodes_back", "
                     "service", "errors", "changes")
 
 
-def log_event(kind, text, mail=None):
-    """Adds an entry to the event log. kind: ok, warn, bad, info. mail: email category to also send it by."""
+def log_event(kind, text, mail=None, cat=None):
+    """Adds an entry to the event log. kind: ok, warn, bad, info. mail: email category to also send it by; cat: the
+    category for the phone app only, when the email goes out separately."""
+    global EVENT_SEQ
     with STATE_LOCK:
-        EVENTS.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind, "text": text})
+        EVENT_SEQ += 1
+        entry = {"n": EVENT_SEQ, "time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind, "text": text}
+        if mail or cat:
+            entry["cat"] = mail or cat
+        EVENTS.append(entry)
         prune_events()
     if mail:
         notify(mail, f"[Deeper Connect] {text if len(text) <= 90 else text[:88] + '…'}", text + "\n")
@@ -3041,7 +3049,8 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
         tunnel_status[code]["details"] += f" → {action_taken}: {'успешно' if success else 'не помогло'}"
         publish_tunnel(code, tunnel_status[code])
         log_event("ok" if success else "bad",
-                  f"{code}: {action_taken.split(' (')[0].lower()}, {'успешно' if success else 'не помогло'}. IP {active_ip} → {new_ip}")
+                  f"{code}: {action_taken.split(' (')[0].lower()}, {'успешно' if success else 'не помогло'}. IP {active_ip} → {new_ip}",
+                  cat="recovery")
         steps_text = "".join(f"  - {s}\n" for s in steps)
         notify("recovery", f"[Deeper Connect] {country}: {action_taken.split(' (')[0].split(',')[0].lower()}",
                f"Уведомление Deeper Connect Watchdog\n\n"
@@ -3781,7 +3790,7 @@ body[data-view="dark"] .tcard.st-warn{box-shadow:0 0 0 1px rgba(255,165,36,.22),
 </dialog>
 
 <script>
-const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые сайты":["globe","#30b0c7"],"Приложения":["grid","#5856d6"],"Вид":["chart","#ff9f0a"],
+const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые сайты":["globe","#30b0c7"],"Приложения":["grid","#5856d6"],"Вид":["chart","#ff9f0a"],"Телефон":["bell","#34c759"],
  "Перестроение туннелей":["refresh","#ff9500"],
  "Резервные копии и перенос":["archive","#8e8e93"],"Доступ":["lock","#34c759"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
@@ -3823,6 +3832,8 @@ const GROUPS=[
   ["SMTP_USER","text","Логин"],
   ["SMTP_PASS","password","Пароль приложения"],
   ["SMTP_FROM","text","От кого","Пусто: как логин"]]},
+ // Only inside the Android app (it provides window.DWApp): its own settings, kept on the phone
+ ...(window.DWApp?[{title:"Телефон",fields:[["APP_NOTIFY","appbtn","Уведомления на телефоне","Какие события присылать, адрес сервера"]]}]:[]),
  {title:"Deeper Connect",fields:[
   ["DEEPER_HOST","text","IP-адрес устройства"],
   ["DEEPER_USER","text","Логин"],
@@ -3856,6 +3867,7 @@ const ICONS={
  globe:'<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.7 3.8 5.7 3.8 9s-1.3 6.3-3.8 9c-2.5-2.7-3.8-5.7-3.8-9S9.5 5.7 12 3z"/>',
  grid:'<rect x="4" y="4" width="7" height="7" rx="2"/><rect x="13" y="4" width="7" height="7" rx="2"/><rect x="4" y="13" width="7" height="7" rx="2"/><rect x="13" y="13" width="7" height="7" rx="2"/>',
  refresh:'<path d="M19.5 10.5A7.7 7.7 0 0 0 5.6 7.4L4 9"/><path d="M4 4.5V9h4.5"/><path d="M4.5 13.5a7.7 7.7 0 0 0 13.9 3.1L20 15"/><path d="M20 19.5V15h-4.5"/>',
+ bell:'<path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2.2 2.2 0 0 0 4 0"/>',
  bolt:'<path d="M13.5 3 5 13.5h6.5L10.5 21 19 10.5h-6.5z"/>',
  chart:'<path d="M5 20v-8M12 20V5M19 20v-5"/>',
  archive:'<rect x="3" y="4" width="18" height="5" rx="1.5"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/>',
@@ -4056,6 +4068,8 @@ GROUPS.forEach((g,gi)=>{
    fetch("api/auth",{cache:"no-store"}).then(r=>r.json()).then(d=>{if(d.from_env){inp.disabled=set.disabled=true;inp.placeholder="Задан в .env (WEB_PASSWORD)"}}).catch(()=>{});
    card.append(el("div",{class:"row block"},el("div",{class:"row-text"},el("label",{text:label})),el("div",{class:"addrow"},inp,set)),
     el("div",{class:"row"},el("div",{class:"row-text"},el("label",{text:"Выйти на всех устройствах"}),el("div",{class:"help",text:"Включая это"})),el("div",{class:"row-ctl"},out)));continue}
+  if(type==="appbtn"){const b=el("button",{type:"button",class:"btn gray"},icon("bell"),"Настроить");b.onclick=()=>window.DWApp.openSettings();
+   card.append(el("div",{class:"row"},el("div",{class:"row-text"},el("label",{text:label}),el("div",{class:"help",text:help})),el("div",{class:"row-ctl"},b)));continue}
   if(type==="clearlog"){const b=el("button",{type:"button",class:"btn danger"},icon("trash"),"Очистить");
    b.onclick=async()=>{if(!await ask("Очистить журнал?","Все записи журнала будут удалены.",{ok:"Очистить",danger:true}))return;
     try{await api("/api/events/clear",{});toast("Журнал очищен");loadEvents()}catch(e){toastErr(e)}};
@@ -4774,7 +4788,7 @@ const I18N=[
 ["Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга в 2 из 3 последних проверок, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.","Each tunnel is checked by its services' domains and its apps' sites. A service moves to another tunnel only when both hold: its tunnel has a bad connection (slower than the allowed ping in 2 of the last 3 checks, losing requests, not answering, returning errors) or no nodes — and the new tunnel has nodes. Services don't move just because somewhere is faster.","每个隧道按其服务的域名和应用的网站检测。仅当两个条件都满足时服务才迁移：所在隧道连接差（最近 3 次中有 2 次慢于允许延迟、丢请求、无响应、返回错误）或无节点，且新隧道有节点。服务不会仅因别处更快而迁移。"],
 ["Копия правил Deeper сохраняется сама перед каждым изменением, которое трогает много правил сразу: сравнением, переносом, добавлением и удалением доменов, загрузкой файла. Если что-то пойдёт не так, из копии всё возвращается как было. Хранятся последние 10, одинаковые подряд не повторяются. Файл содержит правила, приложения и настройки без паролей; при загрузке файла домены только добавляются и переносятся, лишние не удаляются.","A copy of the Deeper rules is saved automatically before every change that touches many rules at once: comparison, moves, adding and deleting domains, uploading a file. If something goes wrong, everything is restored from the copy. The last 10 are kept, identical ones in a row aren't repeated. The file holds rules, apps and settings without passwords; uploading it only adds and moves domains, extra ones aren't deleted.","每次批量改动规则前（比较、迁移、添加和删除域名、上传文件）都会自动保存 Deeper 规则副本。出问题时可从副本完整恢复。保留最近 10 份，连续相同的不重复保存。文件包含规则、应用和设置（不含密码）；上传文件时只添加和迁移域名，不删除多余的。"],
 ["Если туннель не проходит проверку и в нём больше одной ноды, сначала меняется нода (до 2 раз) и туннель проверяется заново, его сервисы ждут. Не помогло — уезжают только те сервисы, которым плохо. Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.","If a tunnel fails the check and has more than one node, the node changes first (up to 2 times) and the tunnel is checked again while its services wait. If that doesn't help, only the services that are bad leave. Rebuilding is the last resort: only when no services remain in the tunnel, no more often than set, one tunnel at a time. A tunnel without nodes is rebuilt only after more than an hour without nodes: Deeper adds nodes itself, and a rebuild resets them.","隧道未通过检测且有多个节点时，先更换节点（最多 2 次）并重新检测，其服务等待。仍无效则只迁移表现差的服务。重建是最后手段：仅当隧道中没有服务、不超过设定频率、一次一个隧道。无节点隧道仅在超过一小时无节点时重建：Deeper 会自行补充节点，而重建会清空它们。"],
-["Вид","View","外观"],["Язык","Language","语言"],["Вид главной страницы","Overview layout","概览布局"],["Как показывать обзор. Язык меняется кнопками RU / EN / 中文 в шапке","How the overview looks. The language is switched with RU / EN / 中文 in the header","概览的显示方式。语言可用页眉中的 RU / EN / 中文 切换"],
+["Вид","View","外观"],["Телефон","Phone","手机"],["Уведомления на телефоне","Phone notifications","手机通知"],["Какие события присылать, адрес сервера","Which events to send, server address","发送哪些事件、服务器地址"],["Настроить","Set up","设置"],["Язык","Language","语言"],["Вид главной страницы","Overview layout","概览布局"],["Как показывать обзор. Язык меняется кнопками RU / EN / 中文 в шапке","How the overview looks. The language is switched with RU / EN / 中文 in the header","概览的显示方式。语言可用页眉中的 RU / EN / 中文 切换"],
 ["Стандартный","Standard","标准"],["Карточки туннелей, как раньше","Tunnel cards, as before","隧道卡片，与之前相同"],["Пульт управления","Control panel","控制面板"],["Сводка и таблица проверяемых туннелей с графиком пинга","Summary and a table of checked tunnels with a ping chart","摘要和带延迟图的已检测隧道表"],
 ["Сначала сервисы","Services first","服务优先"],["Карточки сервисов и приложений, туннели и журнал сбоку","Service and app cards, tunnels and the log on the side","服务和应用卡片，隧道和日志在侧边"],["Тёмная панель","Dark panel","深色面板"],["Кольцо здоровья, средний пинг и события, тёмное оформление","Health ring, average ping and events, dark style","健康环、平均延迟和事件，深色风格"],
 ["Работают","Working","正常"],["проверяемых туннелей","checked tunnels","已检测隧道"],["в норме","fine","正常"],["Переезды","Moves","迁移"],["за 24 ч","in 24 h","24 小时内"],["Смены нод","Node changes","节点更换"],["Пинг · страница / соед.","Ping · page / conn.","延迟 · 页面 / 连接"],
@@ -5239,7 +5253,11 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 events = list(reversed(EVENTS))
             tunnel, text = query.get("tunnel", "").strip().upper(), query.get("q", "").strip().lower()
             matched = filter_events(events, tunnel, text) if tunnel or text else events
-            self._send(200, {"events": matched, "total": len(events), "tunnels": event_tunnels(events)})
+            # The phone app: only entries after the last one it has seen (and the newest number to remember)
+            if query.get("since", "").isdigit():
+                since = int(query["since"])
+                matched = [e for e in matched if e.get("n", 0) > since]
+            self._send(200, {"events": matched, "total": len(events), "tunnels": event_tunnels(events), "seq": EVENT_SEQ})
         elif self.path == "/api/history":
             now = int(time.time())
             cutoff = now - HISTORY_HOURS * 3600  # Points are pruned only by a check: none may have run for a while
