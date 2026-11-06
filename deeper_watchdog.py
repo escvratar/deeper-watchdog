@@ -88,6 +88,9 @@ SETTINGS_SCHEMA = {
     "DEEPER_USER": ("str", "admin", None, None),
     "DEEPER_PASS": ("secret", "", None, None),  # Only from .env or the web UI, never in the code
     "MAX_LATENCY_MS": ("int", "2500", 100, 60000),
+    # The same for services checked by a connection only ("tcp", "telegram"): one round trip instead of the page's
+    # three or four (handshake, TLS, request), so its pings are several times lower
+    "MAX_TCP_LATENCY_MS": ("int", "400", 20, 60000),
     "CHECK_INTERVAL": ("int", "180", 30, 86400),
     # Probes of every site per check: the best one is its ping, failed ones are its loss
     "PROBE_ROUNDS": ("int", "3", 1, 5),
@@ -108,8 +111,21 @@ SETTINGS_SCHEMA = {
     # One "service_key=CODE1,CODE2,..." per line: preferred tunnels, the first one first. A service that works badly
     # goes to the next of them, to other tunnels only when none of them works for it, and comes back up the list
     "PREFERRED_TUNNELS": ("text", "", None, None),
+    # How services are checked unless set per service: "page" (an HTTPS request, as a browser makes) or "tcp" (only
+    # the TCP handshake: for services that work but don't answer the check's request through some nodes)
+    "CHECK_METHOD": ("choice", "page", ("page", "tcp"), None),
+    # Per-service check methods, one "service_key=method" per line: page, tcp or telegram (Telegram's servers)
+    "SERVICE_CHECK_METHODS": ("text", "", None, None),
+    # A few services work badly in a tunnel where the rest are fine. "first": the tunnel is judged by its services
+    # (not domains), so the bad ones leave without waiting for a node switch; "fast": the same, and a service that
+    # doesn't answer or is twice slower than allowed leaves after one check; "stats": the tunnel is judged by its
+    # domains as before, but services already failed in it don't count for its status and ping
+    "BAD_SERVICES": ("choice", "first", ("first", "fast", "stats"), None),
     # App Relocator apps shown in the web UI (Deeper app keys)
     "APPS": ("str", "instagram,telegram", None, None),
+    # A Smart Route service named like a configured app (Telegram for telegram) goes wherever the app goes, so the
+    # app and its links never go through different countries. Only services in auto mode
+    "LINK_APP_GROUPS": ("bool", "true", None, None),
     # Extra/overriding service groups, one "Name=domain1,domain2" per line
     "SERVICE_GROUPS": ("text", "", None, None),
     "SMTP_ENABLED": ("bool", "false", None, None),
@@ -154,11 +170,15 @@ STATUS = {"last_run": None, "next_run": None, "error": None, "tunnels": {}, "las
 CHECK_NOW = threading.Event()
 CHECK_ONLY = set()  # Tunnels asked to be checked by themselves (request_check); the daemon checks just them
 CHECK_ALL = [False]  # A check of every tunnel was asked for
+USER_CHECK = [False]  # The user pressed "check now": its failures count like a regular check's
+USER_FAIL_GAP = 60  # Seconds between failures counted from such checks, so a double click isn't two failures
 
 
-def request_check(codes=None):
+def request_check(codes=None, user=False):
     """Asks the daemon for a check now: of every tunnel, or only of `codes` (nodes came back, a new node to judge).
-    A check of a few tunnels takes seconds and doesn't wait for the others."""
+    A check of a few tunnels takes seconds and doesn't wait for the others. `user`: asked for from the web UI."""
+    if user:
+        USER_CHECK[0] = True
     if codes is None:
         CHECK_ALL[0] = True
     else:
@@ -295,6 +315,11 @@ def load_saved_settings():
 def parse_setting(key, value):
     """Converts a raw value to the setting's type. Raises ValueError if invalid."""
     kind, _, lo, hi = SETTINGS_SCHEMA[key]
+    if kind == "choice":  # lo: the allowed values
+        value = str(value).strip()
+        if value not in lo:
+            raise ValueError(f"{key}: неизвестное значение {value}")
+        return value
     if kind == "bool":
         if isinstance(value, bool):
             return value
@@ -446,6 +471,69 @@ def preferred_tunnels():
             if key.strip() and codes:
                 result[key.strip()] = codes
     return result
+
+
+CHECK_METHODS = ("page", "tcp", "telegram")
+# Telegram's data centers (DC1–DC5): the app talks to them directly, not to telegram.org. Deeper routes them through
+# the Telegram app's tunnel (App Relocator), so their TCP handshake tests what the app really uses
+TELEGRAM_DCS = ("149.154.175.50", "149.154.167.51", "149.154.175.100", "149.154.167.91", "91.108.56.130")
+
+
+def service_check_methods():
+    """key -> its own check method (SERVICE_CHECK_METHODS); others use CHECK_METHOD."""
+    result = {}
+    for line in SERVICE_CHECK_METHODS.splitlines():
+        if "=" in line:
+            key, method = (x.strip() for x in line.rsplit("=", 1))
+            if key and method in CHECK_METHODS:
+                result[key] = method
+    return result
+
+
+def check_method(key):
+    return service_check_methods().get(key) or CHECK_METHOD
+
+
+def latency_limit(key):
+    """The allowed ping of a service: a connection-only check has its own, lower one."""
+    return MAX_LATENCY_MS if check_method(key) == "page" else MAX_TCP_LATENCY_MS
+
+
+IP_ROUTES = {}  # ip -> (tunnel, when asked): Deeper's route of Telegram's servers, asked again after IP_ROUTE_TTL
+IP_ROUTE_TTL = 300
+
+
+def telegram_ips(client, code):
+    """Telegram's servers Deeper routes through the tunnel now: the "telegram" method probes them. None of them
+    (Telegram isn't routed there): the method falls back to "tcp", or it would measure another path."""
+    now = time.time()
+    # Asked again when old, or when it was another tunnel (the app has moved since)
+    stale = [ip for ip in TELEGRAM_DCS if now - IP_ROUTES.get(ip, (None, 0))[1] >= IP_ROUTE_TTL
+             or IP_ROUTES[ip][0] != code]
+    if stale:
+        # Deeper keeps a route record of an IP only once a connection went to it: before that it says "ZZ" even
+        # though the app's traffic goes through the tunnel (seen in prod). So a connection first, then the question
+        probe_ips(stale, timeout=LATENCY_TIMEOUT)
+    for ip in TELEGRAM_DCS:
+        if ip in stale:
+            try:
+                IP_ROUTES[ip] = (client.get_ip_route(ip), now)
+            except Exception:
+                IP_ROUTES[ip] = (None, now)
+    return [ip for ip in TELEGRAM_DCS if IP_ROUTES[ip][0] == code]
+
+
+def probe_methods(client, url_keys, tunnel_of):
+    """url -> how probe_all checks it, for the services not checked by their page: "tcp" or Telegram's servers.
+    `url_keys`: url -> service key, `tunnel_of`: url -> the tunnel it goes through."""
+    methods = {}
+    for u, key in url_keys.items():
+        m = check_method(key)
+        if m == "telegram":
+            m = telegram_ips(client, tunnel_of(u)) or "tcp"
+        if m != "page":
+            methods[u] = m
+    return methods
 
 
 def preferred_setting(prefs):
@@ -1037,6 +1125,12 @@ class DeeperClient:
         res = self._api(f"/api/smartRoute/getRoutingRecord/domain?{query}")
         return res.get("tunnelCode") if isinstance(res, dict) else None
 
+    def get_ip_route(self, ip):
+        """The tunnel an IP address is routed through ("ZZ": direct, None if unknown)."""
+        query = urllib.parse.urlencode({"routingAddress": ip})
+        res = self._api(f"/api/smartRoute/getRoutingRecord/ip?{query}")
+        return res.get("tunnelCode") if isinstance(res, dict) else None
+
     def move_domain(self, domain, from_tunnel, to_tunnel):
         """Moves a Smart Route domain rule to another tunnel. Returns True on success."""
         logger.info(f"Перенос маршрута {domain}: {from_tunnel} -> {to_tunnel}")
@@ -1188,18 +1282,34 @@ def read_body(sock, first, limit, timeout):
         return Stall(f"обрыв загрузки на {len(buf) // 1024} КБ", sized)
 
 
-def probe_url(url, timeout=3.5, body=0):
+DNS_TRIES = 3  # Lookups of a domain per probe when the resolver says "try again"
+DNS_RETRY_PAUSE = 0.5
+TCP_STATUS = "соединение"  # Probe status of a TCP-only check that connected
+TELEGRAM_STATUS = "серверы Telegram"
+
+
+def probe_url(url, timeout=3.5, body=0, tcp_only=False):
     """One synthetic request split into phases: the TCP handshake (SYN -> SYN-ACK) to the site's port, then TLS
     and an HTTP HEAD up to the first byte of the answer (TTFB). DNS stays outside the timings.
     With `body` (bytes) it is a GET instead, and the page must also download up to that much (read_body).
+    `tcp_only`: just the handshake (the "tcp" check method).
     Returns (tcp_ms, ttfb_ms, status): times are None if the request failed, status is the HTTP code or the error."""
     u = urllib.parse.urlparse(url if "://" in url else "https://" + url)
     host, https = u.hostname, u.scheme != "http"
     port = u.port or (443 if https else 80)
-    try:
-        addrs = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    except Exception as e:
-        return None, None, f"DNS: {e}"
+    addrs = None
+    for attempt in range(DNS_TRIES):
+        try:
+            addrs = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            break
+        except socket.gaierror as e:
+            # "Try again" (EAI_AGAIN) is a resolver that didn't answer in time, often once: asked again. A name that
+            # doesn't exist (EAI_NONAME) won't appear in a second
+            if e.errno != socket.EAI_AGAIN or attempt == DNS_TRIES - 1:
+                return None, None, f"DNS: {e}"
+            time.sleep(DNS_RETRY_PAUSE)
+        except Exception as e:
+            return None, None, f"DNS: {e}"
     sock, error = None, "нет адреса"
     try:
         for family, _, _, _, addr in addrs:
@@ -1215,6 +1325,8 @@ def probe_url(url, timeout=3.5, body=0):
         if sock is None:
             return None, None, error
         t1 = time.monotonic()
+        if tcp_only:
+            return (t1 - t0) * 1000, 0.0, TCP_STATUS
         if https:
             sock = SSL_CTX.wrap_socket(sock, server_hostname=host)
         path = (u.path or "/") + (f"?{u.query}" if u.query else "")
@@ -1246,13 +1358,39 @@ def probe_url(url, timeout=3.5, body=0):
                 pass
 
 
-def probe_all(urls, rounds=None, body=()):
+def probe_ips(ips, timeout=3.5):
+    """The "telegram" check method: TCP handshakes to the given servers (port 443) at once, the fastest one counts."""
+    def one(ip):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        t0 = time.monotonic()
+        try:
+            sock.connect((ip, 443))
+            return (time.monotonic() - t0) * 1000
+        except OSError:
+            return None
+        finally:
+            sock.close()
+
+    with ThreadPoolExecutor(max_workers=len(ips)) as pool:
+        times = [t for t in pool.map(one, ips) if t is not None]
+    return (min(times), 0.0, TELEGRAM_STATUS) if times else (None, None, "таймаут TCP")
+
+
+def probe_all(urls, rounds=None, body=(), methods=None):
     """Probes every URL `rounds` times, each round all of them at once; the URLs in `body` download their page in
-    the first round. Returns {url: [(tcp, ttfb, status)]}."""
+    the first round. `methods`: url -> "tcp" (handshake only) or a list of IPs (probe_ips); others are "page".
+    Returns {url: [(tcp, ttfb, status)]}."""
     rounds = rounds or PROBE_ROUNDS
     result = {u: [] for u in urls}
+    methods = methods or {}
 
     def one(u, first):
+        m = methods.get(u)
+        if m == "tcp":
+            return probe_url(u, timeout=LATENCY_TIMEOUT, tcp_only=True)
+        if isinstance(m, (list, tuple)):
+            return probe_ips(m, timeout=LATENCY_TIMEOUT)
         if first and u in body:
             return probe_url(u, timeout=LATENCY_TIMEOUT, body=BODY_CHECK_KB * 1024)
         return probe_url(u, timeout=LATENCY_TIMEOUT)
@@ -1337,11 +1475,25 @@ def median(values):
     return (values[n // 2] if n % 2 else (values[n // 2 - 1] + values[n // 2]) / 2) if n else None
 
 
-def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
+CHECK_PLAN = {}  # code -> (methods, services) of the tunnel's last regular check, for the re-checks of a recovery
+
+
+def service_failed(key):
+    """The service's checks in its current tunnel before this one already make it failed (see degraded)."""
+    return bool(key) and sum(BAD_STREAK.get(key, [])) >= FAIL_CHECKS
+
+
+def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None, methods=None, services=None):
     """Probes every given site of the tunnel. Returns (is_healthy, median_lat, details).
-    A bad node slows everything down, so the tunnel fails when at least TUNNEL_FAIL_PCT% of its domains are bad
-    (no answer, slower than max_latency_ms, or an error status): a few bad sites among good ones are those sites'
-    own problem, a node change wouldn't fix them. Domains that haven't answered anywhere lately don't count."""
+    A bad node slows everything down, so the tunnel fails when at least TUNNEL_FAIL_PCT% of it is bad (no answer,
+    slower than max_latency_ms, or an error status): a few bad ones among good ones are their own problem, a node
+    change wouldn't fix them. What is counted depends on BAD_SERVICES: its services ("first", "fast": a service with
+    many domains weighs as much as one with a single domain), or its domains without the services already failed
+    ("stats"). Its ping is the median of the good ones. Domains that haven't answered anywhere lately don't count.
+    `methods`: url -> check method for probe_all; `services`: url -> service key. Not given (re-checks during a
+    recovery): those of the tunnel's last regular check."""
+    plan = CHECK_PLAN.get(tunnel_code, ({}, {}))
+    methods, services = plan[0] if methods is None else methods, plan[1] if services is None else services
     if max_latency_ms is None:
         max_latency_ms = MAX_LATENCY_MS
     endpoints = list(dict.fromkeys(canaries or []))
@@ -1352,11 +1504,11 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
     trusted = lambda u: host_known(host_of(u), now)
     # Pages to download: the ones that stalled last time (has it passed?), then the known domains in turn
     stuck = [u for u in endpoints if (QUALITY.get(f"{tunnel_code} {host_of(u)}") or {}).get("stalled")]
-    known = [u for u in endpoints if trusted(u) and u not in stuck]
+    known = [u for u in endpoints if trusted(u) and u not in stuck and not methods.get(u)]
     turn = BODY_TURN.get(tunnel_code, 0) % len(known) if known else 0
     body = (stuck + (known[turn:] + known[:turn])[:max(0, BODY_CHECK_SITES - len(stuck))]) if BODY_CHECK_SITES else []
     BODY_TURN[tunnel_code] = turn + BODY_CHECK_SITES
-    probes = probe_all(endpoints, body=set(body))
+    probes = probe_all(endpoints, body=set(body), methods=methods)
     stall = lambda u, p: isinstance(p[2], Stall) and (p[2].sized or host_full(host_of(u), now))
     stalled = [u for u in body if stall(u, probes[u][0])]
     if stalled:
@@ -1380,14 +1532,35 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
 
     def is_bad(u):
         best = best_probe(probes[u])
-        return best is None or best[0] + best[1] > max_latency_ms or penalized(host_of(u), best[2]) or u in stalled
+        limit = MAX_TCP_LATENCY_MS if methods.get(u) else max_latency_ms
+        return best is None or best[0] + best[1] > limit or penalized(host_of(u), best[2]) or u in stalled
+
+    # "stats": services already failed here are on their way out, the tunnel is judged without them
+    judged = [u for u in counted if not service_failed(services.get(u))] if BAD_SERVICES == "stats" else counted
+    judged = judged or counted
+    by_service = BAD_SERVICES != "stats"
+
+    def share(bad):
+        """(bad, total): services, a service being bad when at least half of its domains are; or domains."""
+        if not by_service:
+            return len([u for u in judged if u in bad]), len(judged)
+        units = {}
+        for u in judged:
+            units.setdefault(services.get(u) or u, []).append(u in bad)
+        return sum(sum(v) * 2 >= len(v) for v in units.values()), len(units)
+
+    def failing(bad):
+        """Domains: at least TUNNEL_FAIL_PCT%. Services: more than that, so one bad service of two leaves by itself
+        instead of failing the tunnel and its node."""
+        n, total = share(bad)
+        return n > 0 and (n * 100 > TUNNEL_FAIL_PCT * total if by_service else n * 100 >= TUNNEL_FAIL_PCT * total)
 
     bad = [u for u in counted if is_bad(u)]
     retried = False
-    if bad and len(bad) * 100 >= TUNNEL_FAIL_PCT * len(counted):
+    if failing(bad):
         # Bad answers are often just noise: the bad sites are probed once more, each keeps its best probe
         retried = True
-        for u, extra in probe_all(bad, rounds=1).items():
+        for u, extra in probe_all(bad, rounds=1, methods=methods).items():
             probes[u] += extra
         bad = [u for u in counted if is_bad(u)]
 
@@ -1397,7 +1570,8 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
                                               "ok": r["lat"] is not None and not r["stalled"], "loss": r["loss"],
                                               "counted": u in counted, "time": time.strftime("%H:%M:%S")}
     answered = [recs[u]["lat"] for u in counted if recs[u]["lat"] is not None]
-    med = median(answered)
+    # The tunnel's ping is that of what works in it: a few slow services don't make a good node look slow
+    med = median([recs[u]["lat"] for u in judged if recs[u]["lat"] is not None and u not in bad]) or median(answered)
     TUNNEL_LOSS[tunnel_code] = median([recs[u]["loss"] for u in counted])
     LAST_CHECK[tunnel_code] = {"bad": len(bad), "counted": len(counted), "silent": len(endpoints) - len(counted)}
 
@@ -1409,9 +1583,88 @@ def check_tunnel_health(tunnel_code, canaries=None, max_latency_ms=None):
     note = " (после повторного замера)" if retried else ""
     if not answered:
         return False, 0, "All canaries failed" + note + ": " + listed_bad
-    if len(bad) * 100 >= TUNNEL_FAIL_PCT * len(counted):
-        return False, med, (f"Degraded (bad {len(bad)} of {len(counted)} domains, median {med:.0f}ms){note}: " + listed_bad)
-    return True, med, f"OK (median {med:.0f}ms, bad {len(bad)} of {len(counted)} domains)" + (f": {listed_bad}" if bad else "")
+    nbad, total = share(bad)
+    unit = "services" if by_service else "domains"
+    if failing(bad):
+        return False, med, (f"Degraded (bad {nbad} of {total} {unit}, median {med:.0f}ms){note}: " + listed_bad)
+    return True, med, f"OK (median {med:.0f}ms, bad {nbad} of {total} {unit})" + (f": {listed_bad}" if bad else "")
+
+
+METHOD_NAMES = {"page": "Страница", "tcp": "Соединение", "telegram": "Серверы Telegram"}
+
+
+def service_sites(key):
+    """(tunnel, urls) a service is checked by now: its domains in its main tunnel, or an app's website."""
+    if key.startswith("app:"):
+        a = next((a for a in ROUTES["apps"] if "app:" + a["app"] == key), None)
+        return (a["tunnel"] or "ZZ", [a["website"]]) if a and a["website"] else None
+    g = next((g for g in service_groups(ROUTES["whitelist"]) if g["key"] == key), None)
+    if not g:
+        return None
+    return g["main"], [f"https://{d['domain']}" for d in g["domains"] if d["tunnel"] == g["main"]][:8]
+
+
+def diagnose(key, code, urls):
+    """The service measured every way it can be checked, in its tunnel now, for the user to pick a method:
+    {tunnel, current, methods: [{method, name, ms, loss, status, ok, note}]}."""
+    client = shared_client()
+    tg = telegram_ips(client, code) if code != "ZZ" else []
+    todo = ["page", "tcp"] + (["telegram"] if tg or "telegram" in key.lower() else [])
+
+    def run(method):
+        m = {"page": None, "tcp": "tcp", "telegram": tg}[method]
+        if method == "telegram" and not tg:
+            return {"method": method, "name": METHOD_NAMES[method], "ms": None, "loss": None, "status": None,
+                    "ok": False, "note": f"серверы Telegram сейчас идут не через {code}: проверка будет как «Соединение»"}
+        probes = probe_all(urls, rounds=3, methods={u: m for u in urls} if m else None)
+        bests = [best_probe(p) for p in probes.values()]
+        lats = [b[0] + b[1] for b in bests if b]
+        tries = [x for p in probes.values() for x in p]
+        loss = sum(x[0] is None for x in tries) / len(tries)
+        failed = next((x[2] for x in tries if x[0] is None), None)
+        ms = median(lats)
+        return {"method": method, "name": METHOD_NAMES[method], "ms": ms, "loss": loss,
+                "status": str(next((b[2] for b in bests if b), failed)), "ok": ms is not None and ms <= (MAX_LATENCY_MS if method == "page" else MAX_TCP_LATENCY_MS)
+                and loss * 100 <= SERVICE_LOSS_PCT, "note": f"ошибка: {failed}" if failed else ""}
+
+    with ThreadPoolExecutor(max_workers=len(todo)) as pool:
+        results = list(pool.map(run, todo))
+    return {"tunnel": code, "current": check_method(key), "own": key in service_check_methods(), "methods": results}
+
+
+def app_follower(key):
+    """The app a Smart Route service follows (LINK_APP_GROUPS), as ROUTES["apps"] has it, or None: a service in auto
+    mode named like a configured app that goes through a tunnel."""
+    if not LINK_APP_GROUPS or not key.startswith("group:") or service_mode(key) != "auto":
+        return None
+    name = key.split(":", 1)[1].lower()
+    return next((a for a in ROUTES["apps"] if a["app"].lower() == name and a["tunnel"] not in (None, "ZZ", "LL")), None)
+
+
+def follow_apps(client):
+    """Moves the services that follow an app into the app's tunnel when they are elsewhere. They don't move by
+    themselves (failures, empty tunnels): the app does, and they come after it."""
+    with MOVE_LOCK:
+        client.refresh_apps_cache()
+        if not any(app_follower("group:" + a["app"]) for a in ROUTES["apps"]):
+            return
+        rules = [{"domain": i.get("domainName"), "tunnel": i.get("tunnelCode")} for i in client.get_whitelist_domains()]
+        nodes = {t["code"]: t["nodes"] for t in ROUTES["all_tunnels"]}
+        moved = False
+        for g in service_groups(rules):
+            a = app_follower(g["key"])
+            if not a or (g["main"] == a["tunnel"] and not g["split"]) or not nodes.get(a["tunnel"]):
+                continue
+            if group_mover(client, g)[0](a["tunnel"]):
+                mark_moved(g["key"])
+                moved = True
+                text = f"{g['name']}: перенесён {'из разных стран' if g['split'] else 'из ' + g['main']} в {a['tunnel']} вместе с приложением {a['app']}"
+                logger.info(text)
+                log_event("info", text)
+            else:
+                log_event("bad", f"{g['name']}: не удалось перенести в {a['tunnel']} вслед за приложением {a['app']}")
+        if moved:
+            client.get_routed_domains()
 
 
 def tunnel_services(client, code):
@@ -1601,6 +1854,8 @@ def _evacuate(client, code, only, reason, why, mail):
         if service_mode(key) == "manual":
             kept.append(name)  # Never moved by the watchdog
             continue
+        if app_follower(key):
+            continue  # Goes after its app (follow_apps below)
         target = next_target(key, code, tunnels)
         if target is None:
             failed.append(name)
@@ -1632,6 +1887,7 @@ def _evacuate(client, code, only, reason, why, mail):
         if moved:
             client.get_routed_domains()
             client.refresh_apps_cache()
+    follow_apps(client)
     return moved
 
 
@@ -1746,6 +2002,7 @@ def _enforce_preferred(client, todo):
         save_auto_state()
         client.get_routed_domains()
         client.refresh_apps_cache()
+        follow_apps(client)
 
 
 def get_tunnel(client, code):
@@ -1806,9 +2063,10 @@ def fmt_ms(ms):
     return f"{ms:.0f} мс" if ms is not None else "нет ответа"
 
 
-def measure_site(url, samples):
-    """Probes a site several times in a row. Returns (median ms of the answers or None, a status, loss 0..1)."""
-    probes = [probe_url(url, timeout=LATENCY_TIMEOUT) for _ in range(samples)]
+def measure_site(url, samples, tcp_only=False):
+    """Probes a site several times in a row (only the TCP handshake with `tcp_only`).
+    Returns (median ms of the answers or None, a status, loss 0..1)."""
+    probes = [probe_url(url, timeout=LATENCY_TIMEOUT, tcp_only=tcp_only) for _ in range(samples)]
     answered = sorted(p[0] + p[1] for p in probes if p[0] is not None)
     status = next((p[2] for p in probes if p[0] is not None), probes[-1][2])
     return (answered[len(answered) // 2] if answered else None), status, 1 - len(answered) / len(probes)
@@ -1838,11 +2096,11 @@ def pick_better_tunnel(pings, original):
     return None
 
 
-def measure_urls(urls, samples):
+def measure_urls(urls, samples, tcp_only=False):
     """Measures several URLs of one service at once. Returns {"ms": average ping of the answering ones or None,
     "loss", "errors": share of the answering domains with an error status, "status", "answered", "total"}."""
     with ThreadPoolExecutor(max_workers=max(1, len(urls))) as pool:
-        results = list(pool.map(lambda u: measure_site(u, samples), urls))
+        results = list(pool.map(lambda u: measure_site(u, samples, tcp_only), urls))
     answered = [(u, r) for u, r in zip(urls, results) if r[0] is not None]
     status = answered[0][1][1] if answered else (results[0][1] if results else None)
     ms = sum(r[0] for _, r in answered) / len(answered) if answered else None
@@ -1938,8 +2196,11 @@ def compare_routes(client, keys):
 
     def measure(key, tunnel):
         urls = jobs[key][2]
+        # The service's own check method: one that only answers a TCP handshake isn't "dead" everywhere. "telegram"
+        # counts as "tcp" here: while a comparison moves the app around, Deeper's routes of Telegram's servers lag
+        tcp_only = check_method(key) != "page"
         try:
-            m = measure_urls(urls, COMPARE_SAMPLES)
+            m = measure_urls(urls, COMPARE_SAMPLES, tcp_only)
         except Exception as e:
             m = {"ms": None, "loss": 1, "errors": 0, "status": str(e), "answered": 0, "total": len(urls)}
         logger.info(f"Сравнение {key} через {tunnel}: {fmt_ms(m['ms'])} в среднем, потери {m['loss']:.0%}, "
@@ -1991,14 +2252,17 @@ def bad_now(r):
     """The service worked badly in this check: no answer, slower than MAX_LATENCY_MS, loss above SERVICE_LOSS_PCT
     over its recent probes, most of its domains answering with an error status (whatever the latency), or a page of
     it that stops downloading after the headers."""
-    return not r["ok"] or (r["latency"] is not None and r["latency"] > MAX_LATENCY_MS) \
+    return not r["ok"] or (r["latency"] is not None and r["latency"] > r.get("limit", MAX_LATENCY_MS)) \
         or r["loss"] * 100 > SERVICE_LOSS_PCT or r.get("errors", 0) * 2 > 1 or bool(r.get("stalled"))
 
 
 def degraded(r):
     """A service failed in its tunnel: it worked badly in FAIL_CHECKS of its last FAIL_CHECKS + 1 checks there.
     One bad check is noise, but a service just around the limit (bad, good, bad) fails too: it never gets
-    FAIL_CHECKS bad ones in a row, yet it is slow half the time."""
+    FAIL_CHECKS bad ones in a row, yet it is slow half the time. BAD_SERVICES "fast": one check is enough when
+    the service doesn't answer at all or is more than twice slower than allowed."""
+    if BAD_SERVICES == "fast" and (not r["ok"] or (r["latency"] or 0) > 2 * r.get("limit", MAX_LATENCY_MS)):
+        return True
     return r.get("bad_checks", 0) >= FAIL_CHECKS
 
 
@@ -2012,7 +2276,7 @@ def stay_score(key):
 def good(r):
     """The service really works well (not just "not bad yet" right after a move): answers, within the latency limit,
     no loss above SERVICE_LOSS_PCT, no error statuses."""
-    return r["ok"] and r["latency"] is not None and r["latency"] <= MAX_LATENCY_MS \
+    return r["ok"] and r["latency"] is not None and r["latency"] <= r.get("limit", MAX_LATENCY_MS) \
         and r["loss"] * 100 <= SERVICE_LOSS_PCT and not r.get("errors", 0) and not r.get("stalled")
 
 
@@ -2043,6 +2307,8 @@ def service_results(since):
         if a["website"] and r and r["at"] >= since:
             result["app:" + a["app"]] = dict(summarize(a["app"], a["tunnel"], a["website"], [r]),
                                              silent=not host_known(host_of(r["url"])))
+    for key, r in result.items():
+        r["limit"] = latency_limit(key)
     return result
 
 
@@ -2050,7 +2316,7 @@ MANUAL_ALERTED = set()  # Manual-mode services already reported as not working
 
 
 def why_bad(r):
-    slow = r["latency"] is not None and r["latency"] > MAX_LATENCY_MS
+    slow = r["latency"] is not None and r["latency"] > r.get("limit", MAX_LATENCY_MS)
     return ("не отвечает" if not r["ok"] else f"страница не загружается ({r['stalled']})" if r.get("stalled")
             else f"потери {r['loss']:.0%}" if r["loss"] * 100 > SERVICE_LOSS_PCT
             else f"медленно, {fmt_ms(r['latency'])}" if slow
@@ -2173,7 +2439,8 @@ def node_switch_first(client, current):
     troubled = {}
     for key, r in current.items():
         code = r["tunnel"]
-        if code in (None, "split", "ZZ", "LL") or r.get("silent") or not degraded(r) or service_mode(key) == "manual":
+        if code in (None, "split", "ZZ", "LL") or r.get("silent") or not degraded(r) or service_mode(key) == "manual" \
+                or app_follower(key):
             continue
         if not (STATUS["tunnels"].get(code) or {}).get("healthy", True):
             continue  # The tunnel fails as a whole: recover_tunnel switches its node, its services wait for that
@@ -2238,6 +2505,8 @@ def decide_services(client, current):
             continue
         bad = degraded(r)
         name = key.split(":", 1)[1]
+        if app_follower(key):
+            continue  # Goes wherever its app goes (follow_apps)
         if mode == "manual":
             if bad and key not in MANUAL_ALERTED:
                 MANUAL_ALERTED.add(key)
@@ -2519,9 +2788,9 @@ def recover_tunnel(client, code, country, active_ip, active_num, canaries, max_l
     return success and bool(new_pool), new_ip, new_pool, f"Перестроение туннеля, так как {reason}", []
 
 
-def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, only=None):
+def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, only=None, user=False):
     """Executes a single monitoring cycle and repairs degraded tunnels. `only`: check just these tunnels, the others
-    keep their last results."""
+    keep their last results. `user`: the user asked for this check, its failures count."""
     if max_latency_ms is None:
         max_latency_ms = MAX_LATENCY_MS
     fails = {}
@@ -2605,6 +2874,12 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
         if info.get("website") and info.get("tunnel") and route_of(host_of(info["website"])) == info["tunnel"]:
             app_sites.setdefault(info["tunnel"], []).append(info["website"])
     ROUTES["site_routes"] = site_routes
+    # Every test site's service: the tunnel is judged by services, and each is checked its own way (check_method)
+    url_keys = {f"https://{d['domain']}": g["key"] for g in service_groups(ROUTES["whitelist"]) for d in g["domains"]}
+    for a in configured_apps():
+        info = apps_now.get(a) or {}
+        if info.get("website"):
+            url_keys[info["website"]] = "app:" + a
     tunnel_status = {}
     fails_before = dict(fails)
     checked = []  # Measured tunnels: (code, country, ip, nodes, test sites, details), recovered after all are measured
@@ -2647,7 +2922,11 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
 
         set_action(code, "Проверка…")
         try:
-            healthy, lat, details = check_tunnel_health(code, canaries=canaries, max_latency_ms=max_latency_ms)
+            keys = {u: url_keys[u] for u in canaries if u in url_keys}
+            methods = probe_methods(client, keys, lambda u, code=code: code)
+            CHECK_PLAN[code] = (methods, keys)
+            healthy, lat, details = check_tunnel_health(code, canaries=canaries, max_latency_ms=max_latency_ms,
+                                                        methods=methods, services=keys)
         finally:
             set_action(code)
         if not LAST_CHECK.get(code, {}).get("counted", 1):
@@ -2670,9 +2949,11 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
             GREEN_SINCE.setdefault(code, time.time())
         else:
             GREEN_SINCE.pop(code, None)
-            # Extra checks (a manual one, nodes coming back) don't bring a recovery closer: fails count
-            # at most once per check interval, so FAIL_THRESHOLD means minutes, not seconds
-            if time.time() - LAST_FAIL_AT.get(code, 0) >= CHECK_INTERVAL * 0.75:
+            # Automatic extra checks (nodes coming back, a new node) don't bring a recovery closer: fails count
+            # at most once per check interval, so FAIL_THRESHOLD means minutes, not seconds. A check the user
+            # asked for counts like a regular one
+            gap = USER_FAIL_GAP if user else CHECK_INTERVAL * 0.75
+            if time.time() - LAST_FAIL_AT.get(code, 0) >= gap:
                 fails[code] = fails.get(code, 0) + 1
                 LAST_FAIL_AT[code] = time.time()
             logger.warning(f"  [FAIL #{fails.get(code, 0)}] [{code} - {country}] (IP: {active_ip}) -> {details}")
@@ -2771,7 +3052,9 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
         client.refresh_apps_cache(tunnels)
         apps = [a for a in ROUTES["apps"] if a["website"]]
         todo = [a for a in apps if (QUALITY.get(f"{a['tunnel'] or 'ZZ'} {host_of(a['website'])}") or {}).get("at", 0) < started]
-        probes = probe_all(list(dict.fromkeys(a["website"] for a in todo)))
+        tunnel_of = {a["website"]: a["tunnel"] or "ZZ" for a in todo}
+        probes = probe_all(list(tunnel_of), methods=probe_methods(
+            client, {a["website"]: "app:" + a["app"] for a in todo}, tunnel_of.get))
         for a in todo:
             record_quality(a["tunnel"] or "ZZ", a["website"], probes[a["website"]])
         APP_RESULTS.clear()
@@ -2800,6 +3083,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
         # services that work badly. Hold-down and the tour of the tunnels keep them from bouncing between bad ones
         decide_services(client, current)
         enforce_preferred(client, dict(GREEN_SINCE))
+        follow_apps(client)
     except Exception as e:
         logger.error(f"Ошибка решений по сервисам: {e}")
     with STATE_LOCK:
@@ -3097,6 +3381,8 @@ dialog.prefd{width:min(400px,calc(100vw - 32px));text-align:left}
 .prow .pm{display:flex;gap:4px}
 .prow .pm button{border:0;background:var(--fill);color:var(--text);width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:15px}
 .prow .pm button:disabled{opacity:.3;cursor:default}
+.diagwait{display:flex;align-items:center;justify-content:center;gap:10px;padding:18px 8px;color:var(--muted);font-size:14px}
+.prow .dot{flex:0 0 auto;margin:0 7px}
 .psep{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin:12px 8px 4px}
 .events .li::before{left:56px!important}
 .events .tm{font-size:12px;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums;padding-top:2px}
@@ -3135,6 +3421,7 @@ dialog.prefd{width:min(400px,calc(100vw - 32px));text-align:left}
 .field:focus{background:var(--card);box-shadow:0 0 0 4px var(--accent-soft),0 0 0 1px var(--accent) inset}
 .row-ctl .field[type=number]{width:110px;text-align:right;font-variant-numeric:tabular-nums;font-weight:500}
 .row.wide .row-ctl{width:min(340px,48%)}
+.row.choice .row-ctl{justify-content:flex-end;width:auto}
 @media (max-width:640px){.row.wide{flex-wrap:wrap}.row.wide .row-ctl{width:100%}}
 .row.block{display:block}
 .row.block .seg{width:100%;margin-top:12px}
@@ -3390,13 +3677,21 @@ const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые са
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
  {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга в 2 из 3 последних проверок, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
-  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сервис медленнее этого в 2 из 3 последних проверок переезжает в туннель с нодами"],
+  ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сервис медленнее этого в 2 из 3 последних проверок переезжает в туннель с нодами. Для способа проверки «Страница»"],
+  ["MAX_TCP_LATENCY_MS","number","Допустимый пинг «Соединения», мс","То же для сервисов со способом «Соединение» или «Серверы Telegram». Их пинг в 3–4 раза меньше: меряется одно соединение, а не загрузка страницы"],
   ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"],
   ["PROBE_ROUNDS","number","Замеров за проверку","Сколько раз меряется каждый домен, 1–5. В пинг идёт лучший замер, неудачные — в потери. Больше — точнее, но проверка дольше"],
   ["FAIL_CHECKS","number","Сбой сервиса — после, плохих проверок","Сервис переезжает, если ему плохо (медленно, потери, нет ответа, ошибки) в стольких из последних проверок (на одну больше этого числа): при 2 — в 2 из 3. Одна плохая проверка — ещё не сбой, а сервис на грани порога («плохо, хорошо, плохо») переезжает"],
+  ["CHECK_METHOD","choice","Как проверять сервисы","Для всех сервисов, у которых не выбран свой способ (меню «Проверка» у сервиса в «Пинг и рекомендации»)",
+   [["page","Страница","Запрос к сайту, как у браузера. Точнее всего"],["tcp","Соединение","Только соединение с сервером. Для сервисов, которые работают, но не отвечают на запрос проверки через некоторые ноды"]]],
+  ["BAD_SERVICES","choice","Если плохо части сервисов","Что делать, когда в туннеле плохо нескольким сервисам, а остальным хорошо",
+   [["first","Сначала уезжают плохие","Туннель оценивается по сервисам, а не по доменам. Плохие уезжают, не дожидаясь смены ноды, и не портят пинг туннеля"],
+    ["fast","Быстрый уход очень плохих","Как «Сначала уезжают плохие», и сервис без ответа или вдвое медленнее допустимого уезжает уже после одной проверки"],
+    ["stats","Только статистика","Туннель оценивается по доменам, как раньше, но сервисы, у которых уже сбой, не портят его пинг и статус"]]],
   ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Туннель не прошёл столько проверок подряд, и в нём больше одной ноды — меняется нода и туннель проверяется заново. Его сервисы ждут смены ноды и уезжают, только если не помогло"]]},
  {title:"Приложения",foot:"Приложения из «Перемещения приложений» Deeper, которые показываются на обзоре и участвуют в сравнении. Например: instagram, telegram, facebook, chatGpt, youtube.",fields:[
-  ["APPS","text","Приложения","Коды через запятую"]]},
+  ["APPS","text","Приложения","Коды через запятую"],
+  ["LINK_APP_GROUPS","switch","Сервис вместе с приложением","Сервис из правил Smart Route с тем же названием, что и приложение (например, Telegram и telegram), всегда в туннеле приложения: сам не переезжает, а следует за ним. Только в режиме «Авто»"]]},
  {title:"Перестроение туннелей",foot:"Если туннель не проходит проверку и в нём больше одной ноды, сначала меняется нода (до 2 раз) и туннель проверяется заново, его сервисы ждут. Не помогло — уезжают только те сервисы, которым плохо. Перестроение — последнее средство: только когда в туннеле не осталось сервисов, не чаще заданного и по одному туннелю. Туннель без нод перестраивается, только если нод нет больше часа: Deeper сам добирает ноды, а перестроение сбрасывает их.",fields:[
   ["REBUILD_ENABLED","switch","Перестраивать в крайнем случае","Выключено: watchdog сам никогда не перестраивает туннели, только переносит сервисы и меняет ноды. Кнопка «Перестроить» в меню туннеля работает всегда"],
   ["REBUILD_EVERY_HOURS","number","Не чаще раза в, ч","Для каждого туннеля, считая и ручные перестроения"]]},
@@ -3546,7 +3841,7 @@ function enhanceSelect(sel){
    const opts=node.tagName==="OPTGROUP"?[...node.children]:[node];
    if(node.tagName==="OPTGROUP"){if(items.length)items.push({sep:true});items.push({header:node.label})}
    for(const o of opts)items.push({text:o.dataset.menu||o.textContent,sub:o.dataset.sub,icon:o.dataset.ic,disabled:o.disabled,checked:o.selected,
-    onSelect:()=>{if(sel.value===o.value)return;sel.value=o.value;sel.dispatchEvent(new Event("change"))}})}
+    onSelect:()=>{if(sel.value===o.value&&!o.dataset.again)return;sel.value=o.value;sel.dispatchEvent(new Event("change"))}})}
   showMenu(btn,items,{align:mini?"end":"stretch"})};
  new MutationObserver(sync).observe(sel,{childList:true,subtree:true,attributes:true,attributeFilter:["disabled","data-tone"]});
  sel.classList.add("nsel");sel.tabIndex=-1;sel.setAttribute("aria-hidden","true");sel.after(btn);sync()}
@@ -3656,6 +3951,8 @@ GROUPS.forEach((g,gi)=>{
   if(type==="switch"){input=el("input",{type:"checkbox",class:"switch",id:key,role:"switch"});input.onchange=updateVisibility}
   else if(type==="textarea"){row.className="row block";input=el("textarea",{id:key,class:"field",spellcheck:"false",placeholder:"Название=домен1,домен2"});
    input.dataset.key=key;row.append(text,input);card.append(row);continue}
+  else if(type==="choice"){row.classList.add("wide","choice");input=el("select",{id:key,class:"field"});
+   for(const [v,t,sub] of opts)input.append(el("option",{value:v,"data-sub":sub,text:t}))}
   else if(type==="segmented"){row.className="row block";input=el("input",{type:"hidden",id:key});const s=segmented(key,opts);s.dataset.seg=key;
    text.append(el("div",{class:"help",id:"modeHelp"}));row.append(text,s,input);input.dataset.key=key;card.append(row);continue}
   else{input=el("input",{type,id:key,class:"field",autocomplete:type==="password"?"new-password":"off",spellcheck:"false"});
@@ -3892,6 +4189,7 @@ function tunnelButtons(c,x){const busy=!!(lastStatus&&((lastStatus.actions||{})[
  const b=el("button",{type:"button",class:"btn icon tmore","aria-label":"Действия с туннелем "+c,"aria-haspopup":"menu",title:busy?(queuedFor(c)?"В очереди: "+queuedFor(c).text:"Туннель сейчас занят"):"Действия"},icon("more"));
  b.disabled=busy;
  b.onclick=()=>showMenu(b,[{header:`${flag(c)} ${tname(c)} · ${x.ip||"—"}`},
+  {text:"Проверить сейчас",icon:"gauge",sub:(x.pool||0)?"Только этот туннель":"Нет нод: нечего проверять",disabled:!(x.pool||0),onSelect:()=>checkTunnel(c,b)},
   {text:"Сменить ноду",icon:"swap",sub:(x.pool||0)<2?"В пуле одна нода":"Другая нода из пула",disabled:(x.pool||0)<2,onSelect:()=>switchNode(c,b)},
   {text:"Перестроить туннель",icon:"refresh",sub:"Пул нод соберётся заново",danger:true,onSelect:()=>refreshTunnel(c,b)},
   {sep:true},{text:"Пинг и рекомендации",icon:"chart",onSelect:async()=>{await loadRoutes();openSheet()}}],{align:"end"});
@@ -3936,6 +4234,14 @@ async function refreshTunnel(tunnel,btn){
  btn.disabled=true;toast(`Перестраиваю ${tunnel}…`);
  try{const r=await api("/api/refresh-tunnel",{tunnel});toast(`Туннель ${tunnel} перестроен: ${r.old_ip} → ${r.new_ip}, нод в пуле ${r.pool}`)}catch(e){toastErr(e)}
  btn.disabled=false;loadRoutes();setTimeout(loadStatus,4000)}
+// One tunnel checked now, like "Проверить сейчас" but without the others; its failure counts the same way
+async function checkTunnel(tunnel,btn){const before=lastStatus&&lastStatus.last_run;btn.disabled=true;toast(`Проверяю ${tunnel}…`);
+ try{await api("/api/check-now",{tunnel});
+  for(let i=0;i<45;i++){await new Promise(r=>setTimeout(r,2000));await loadStatus();if(lastStatus&&lastStatus.last_run!==before)break}
+  if(lastStatus&&lastStatus.last_run!==before){await loadRoutes();const x=(lastStatus.tunnels||{})[tunnel]||{};
+   toast(`${tunnel}: `+(x.healthy?`в норме, ${Math.round(x.latency||0)} мс`:"проверка не прошла"),!x.healthy)}
+  else toast(`Проверка ${tunnel} ещё идёт, результат появится позже`)}
+ catch(e){toastErr(e)}btn.disabled=false}
 async function switchNode(tunnel,btn){
  btn.disabled=true;toast(`Меняю ноду ${tunnel}…`);
  try{const r=await api("/api/switch-node",{tunnel});toast(`Нода ${tunnel}: ${r.old_ip} → ${r.new_ip}`)}catch(e){toastErr(e)}
@@ -4024,8 +4330,8 @@ function renderItems(box,items,results,d){box.textContent="";
   const tl=[...d.all_tunnels];if(pin&&!tl.some(t=>t.code===pin))tl.push({code:pin,nodes:0});
   for(const t of tl)pg.append(el("option",{value:t.code,"data-ic":"pin","data-short":`${flag(t.code)} ${t.code}`,"data-menu":`${flag(t.code)} ${t.code} · ${tname(t.code)}`,
    "data-sub":t.nodes?`${t.nodes} ${plural(t.nodes,"нода","ноды","нод")}`:"сейчас нет нод",text:t.code}));
-  // Several preferred tunnels in order: picked in a dialog
-  pg.append(el("option",{value:"__multi","data-ic":"pin","data-menu":prefs.length>1?"Изменить список…":"Несколько туннелей…",
+  // Several preferred tunnels in order: picked in a dialog, also when the list is already chosen (data-again)
+  pg.append(el("option",{value:"__multi","data-ic":"pin","data-again":"1","data-menu":prefs.length>1?"Изменить список…":"Несколько туннелей…",
    "data-short":prefs.length>1?"📌 "+prefs.join(" › "):"Несколько…","data-sub":prefs.length>1?prefs.join(" › "):"По порядку: сначала первый, потом следующие",text:"Несколько"}));
   sw.append(pg);sw.dataset.tone=mode==="auto"?"on":pin?"pin":"";
   const cur=prefs.length>1?"__multi":pin||(mode==="preferred"?"auto":mode);
@@ -4043,6 +4349,8 @@ function renderItems(box,items,results,d){box.textContent="";
   else if(pin&&tunnel&&tunnel!==pin&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("pin"),prefs.includes(tunnel)
    ?`Сейчас в запасном ${tunnel} (№${prefs.indexOf(tunnel)+1}). Вернётся в ${pin}, когда он будет в норме`:`Вернётся в ${pin}, когда он будет в норме`));
   if(hold&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("clock"),`Удержание после переезда ещё ${Math.max(1,Math.round((hold-Date.now()/1000)/60))} мин`));
+  const follows=(d.follows||{})[key];
+  if(follows)main.append(el("div",{class:"warnline"},icon("swap"),`Вместе с приложением ${follows}: переезжает вслед за ним`));
   const tour=(d.tours||{})[key];if(tour)main.append(el("div",{class:"warnline"},icon("refresh"),tourText(tour)));
   if(group){const n=group.domains.length,del=el("button",{type:"button",class:"btn sm danger"},icon("trash"),n>1?"Удалить все домены":"Удалить домен");
    del.onclick=()=>deleteDomains([key],`${name}: удалить ${n} ${plural(n,"домен","домена","доменов")} из Smart Route?`,del);
@@ -4066,7 +4374,7 @@ function renderItems(box,items,results,d){box.textContent="";
    else rec.append(el("span",{class:"muted",text:"Текущий туннель подходит"}));
    main.append(rec)}
   else if(group&&group.split)main.append(moveButtons(key,"Домены в разных странах. Собрать в:",null));
-  const right=el("div",{class:"li-right"},sw);
+  const right=el("div",{class:"li-right"},sw,methodSelect(key,name,d));
   if(mode==="manual"&&!(group&&group.split)){right.classList.add("inline");right.prepend(tunnelSeg(key,tunnel,d))}
   box.append(el("div",{class:"li"},sel,main,right))}}
 // More tunnels than this don't fit a phone's width as buttons: a pop-up menu instead
@@ -4114,6 +4422,48 @@ function pickPreferred(name,current,d){return new Promise(resolve=>{
  (document.querySelector("dialog[open]")||document.body).append(dlg);dlg.showModal();draw();
  const done=v=>{dlg.close();dlg.remove();resolve(v)};
  no.onclick=()=>done(null);yes.onclick=()=>done(order.slice());dlg.addEventListener("cancel",e=>{e.preventDefault();done(null)})})}
+// How a service is checked: the default way (CHECK_METHOD) or its own; "Диагностика…" measures it every way
+const METHODS={page:["Страница","Запрос к сайту, как у браузера"],tcp:["Соединение","Только соединение с сервером: для сервисов, которые работают, но не отвечают на запрос проверки"],
+ telegram:["Серверы Telegram","Соединение с серверами Telegram, через которые работает само приложение"]};
+function methodSelect(key,name,d){
+ const own=(d.methods||{})[key]||"",def=d.check_method||"page";
+ const ms=el("select",{class:"mini","aria-label":"Проверка "+name,title:"Как проверяется сервис"});
+ ms.append(el("option",{value:"","data-ic":"gauge","data-short":METHODS[def][0],"data-menu":"Как у всех: "+METHODS[def][0].toLowerCase(),"data-sub":"Способ из настроек",text:"По умолчанию"}));
+ const list=["page","tcp"].concat(/telegram/i.test(key)||own==="telegram"?["telegram"]:[]);
+ for(const m of list)ms.append(el("option",{value:m,"data-ic":"gauge","data-short":METHODS[m][0],"data-menu":METHODS[m][0],"data-sub":METHODS[m][1],text:METHODS[m][0]}));
+ ms.append(el("option",{value:"__diag","data-ic":"sparkle","data-again":"1","data-menu":"Диагностика…","data-sub":"Проверить всеми способами сейчас и выбрать",text:"Диагностика"}));
+ ms.value=own;ms.dataset.tone=own?"pin":"";
+ ms.onchange=async()=>{
+  if(ms.value!=="__diag")return saveMethod(key,ms.value,ms,own);
+  ms.value=own;const m=await diagnoseDialog(key,name,own);if(m!==null&&m!==own)saveMethod(key,m,ms,own)};
+ return ms}
+async function saveMethod(key,method,ms,was){ms.disabled=true;
+ try{await api("/api/check-method",{key,method});
+  toast(`${itemName(key)}: проверка — ${METHODS[method||routesData.check_method||"page"][0].toLowerCase()}`+(method?"":" (как у всех)"))}
+ catch(e){ms.value=was;toastErr(e)}ms.disabled=false;loadRoutes()}
+// Measures the service every way now; resolves with the method picked ("" for the default) or null
+function diagnoseDialog(key,name,own){return new Promise(resolve=>{
+ const dlg=el("dialog",{class:"alertd prefd","aria-label":"Диагностика"}),list=el("div",{class:"plist"},
+  el("div",{class:"diagwait"},el("span",{class:"spin"}),"Проверяю всеми способами…"));
+ const close=el("button",{type:"button",class:"def",text:"Закрыть"});
+ dlg.append(el("div",{class:"ab"},el("h3",{text:name}),el("p",{text:"Сервис измерен в своём туннеле каждым способом. Нажмите на способ, чтобы проверять сервис так."}),list),
+  el("div",{class:"abtns"},close));
+ (document.querySelector("dialog[open]")||document.body).append(dlg);dlg.showModal();
+ const done=v=>{dlg.close();dlg.remove();resolve(v)};
+ close.onclick=()=>done(null);dlg.addEventListener("cancel",e=>{e.preventDefault();done(null)});
+ api("/api/diagnose",{key}).then(r=>{list.textContent="";
+  list.append(el("div",{class:"psep",text:`Туннель ${r.tunnel}`}));
+  for(const m of r.methods){const on=r.own&&m.method===r.current;
+   const val=m.ms!=null?`${Math.round(m.ms)} мс · потери ${Math.round(m.loss*100)}%`:m.loss!=null?"нет ответа":"";
+   const row=el("div",{class:"prow"+(on?" on":""),role:"button",tabindex:"0"},
+    el("span",{class:"dot "+(m.ms==null?"bad":m.ok?"ok":"warn")}),
+    el("span",{class:"pt"},el("b",{text:m.name+(on?" · выбран":"")}),el("small",{text:[val,m.note].filter(Boolean).join(" · ")})));
+   const pick=()=>done(m.method);row.onclick=pick;row.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();pick()}};
+   list.append(row)}
+  if(r.own){const row=el("div",{class:"prow",role:"button",tabindex:"0"},el("span",{class:"dot"}),
+    el("span",{class:"pt"},el("b",{text:"Как у всех"}),el("small",{text:"Способ из настроек: "+METHODS[routesData.check_method||"page"][0].toLowerCase()})));
+   row.onclick=()=>done("");list.append(row)}})
+ .catch(e=>{list.textContent="";list.append(el("div",{class:"diagwait bad",text:"Ошибка: "+e.message}))})})}
 async function saveMode(key,mode,sw,was){const n=itemName(key);sw.disabled=true;
  const many=Array.isArray(mode);
  try{const r=await api("/api/pin",many?{key,mode:"preferred",tunnels:mode}:{key,mode});
@@ -4475,6 +4825,9 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "evacuated": {k: dict(e, new_node=tunnel_ip(e["from"]) in bad_ips(k, e["from"]))
                               for k, e in AUTO_STATE["evacuated"].items()},
                 "preferred": preferred_tunnels(),
+                "follows": {g["key"]: a["app"] for g in service_groups(ROUTES["whitelist"])
+                            for a in [app_follower(g["key"])] if a},
+                "methods": service_check_methods(), "check_method": CHECK_METHOD,
                 # Tunnels a check judged to have only a minority of bad services: the node stays, those services move
                 "node_verdict": dict(NODE_VERDICT),
             })
@@ -4558,6 +4911,34 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 return self._send(400, {"error": "Неизвестный сайт, приложение или туннель"})
             name = domain.split(":", 1)[-1]
             self._queued(queue_action(f"Перенос {name} в {to}", lambda: move_job(domain, to)))
+        elif self.path == "/api/check-method":
+            # A service's own check method; "" for the default one (CHECK_METHOD)
+            key, method = (body.get("key"), body.get("method")) if isinstance(body, dict) else (None, None)
+            if not isinstance(key, str) or not key or "=" in key or "\n" in key \
+                    or not isinstance(method, str) or (method and method not in CHECK_METHODS):
+                return self._send(400, {"error": "Неверный сервис или способ проверки"})
+            methods = service_check_methods()
+            was = methods.get(key, "")
+            methods.pop(key, None)
+            if method:
+                methods[key] = method
+            errors = save_settings({"SERVICE_CHECK_METHODS": "\n".join(f"{k}={v}" for k, v in sorted(methods.items()))})
+            if errors:
+                return self._send(400, {"errors": errors})
+            if was != method:
+                name = key.split(":", 1)[-1]
+                log_event("info", f"{name}: проверка — {METHOD_NAMES[method or CHECK_METHOD].lower()}"
+                                  + ("" if method else " (как у всех)"))
+                # Its results by the old method say nothing now: it is judged anew
+                BAD_STREAK.pop(key, None)
+                STAY_PINGS.pop(key, None)
+            self._send(200, {"ok": True})
+        elif self.path == "/api/diagnose":
+            key = body.get("key") if isinstance(body, dict) else None
+            found = service_sites(key) if isinstance(key, str) else None
+            if not found:
+                return self._send(400, {"error": "Неизвестный сервис"})
+            self._send(200, diagnose(key, *found))
         elif self.path == "/api/pin":
             # mode: "auto", "manual", or the preferred tunnels in order: "tunnels": [codes] (older pages: a code
             # or "NL,GB" as the mode); "" from older pages is manual
@@ -4770,7 +5151,11 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 return (200, {"ok": True, "changed": changed, "message": f"{what}: изменено {len(changed)}"})
             self._queued(queue_action("Восстановление копии" if restoring else "Загрузка файла", restore_job, tunnel=None))
         elif self.path == "/api/check-now":
-            request_check()
+            # {"tunnel": code}: just that tunnel (the "⋯" menu of its card); otherwise every one
+            code = body.get("tunnel") if isinstance(body, dict) else None
+            if code is not None and code not in {t["code"] for t in ROUTES["all_tunnels"]} | set(ROUTES["tunnels"]):
+                return self._send(400, {"error": "Неизвестный туннель"})
+            request_check([code] if code else None, user=True)
             self._send(200, {"ok": True})
         elif self.path == "/api/events/clear":
             with STATE_LOCK:
@@ -5065,6 +5450,7 @@ def main():
                 only = set(CHECK_ONLY) if CHECK_ONLY and not CHECK_ALL[0] and time.time() < next_run else None
                 CHECK_ONLY.clear()
                 CHECK_ALL[0] = False
+                user, USER_CHECK[0] = USER_CHECK[0], False
                 if client_params() != last_params:
                     last_params = client_params()
                     host, user, password = last_params
@@ -5072,7 +5458,7 @@ def main():
                     client = DeeperClient(host=host, username=user, password=password)
                 try:
                     with route_turn("Проверка туннелей" if only is None else f"Проверка {', '.join(sorted(only))}"):
-                        run_watchdog_iteration(client, max_latency_ms=args.max_latency, only=only)
+                        run_watchdog_iteration(client, max_latency_ms=args.max_latency, only=only, user=user)
                 except Exception as e:
                     logger.error(f"Ошибка итерации: {e}")
                 if only is None:
