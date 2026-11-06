@@ -38,6 +38,7 @@ public class MainActivity extends Activity {
     static final String DEFAULT_URL = "http://192.168.31.10:8787/";
     static final String ACTION_SETTINGS = "com.escvratar.deeperwatchdog.SETTINGS";
     private static final int FILE_REQUEST = 1;
+    private static final int INSTALL_REQUEST = 3;
 
     private WebView web;
     private LinearLayout errorView;
@@ -69,7 +70,7 @@ public class MainActivity extends Activity {
         setupWeb();
 
         // First run: the address first (the dialog comes back if the activity is recreated meanwhile)
-        if (!prefs(this).contains("url")) showSettings(true);
+        if (!prefs(this).contains("url")) showStart();
         else if (state == null || web.restoreState(state) == null) web.loadUrl(baseUrl(this));
         handleIntent(getIntent());
         if (prefs(this).contains("url") && prefs(this).getBoolean("notify", true)) {
@@ -105,7 +106,7 @@ public class MainActivity extends Activity {
         s.setDomStorageEnabled(true);
         s.setTextZoom(100);
         s.setSupportZoom(false);
-        s.setUserAgentString(s.getUserAgentString() + " DeeperWatchdogApp/1.1");
+        s.setUserAgentString(s.getUserAgentString() + " DeeperWatchdogApp/1.2");
         CookieManager.getInstance().setAcceptCookie(true);
         web.setBackgroundColor(night() ? Color.BLACK : Color.rgb(242, 242, 247));
 
@@ -235,6 +236,31 @@ public class MainActivity extends Activity {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
+    /** First run: connect to a running watchdog or install one on a server over SSH. */
+    private void showStart() {
+        new AlertDialog.Builder(this)
+                .setTitle("Deeper Watchdog")
+                .setMessage("Watchdog уже работает на сервере, NAS, роутере или компьютере?\n\n"
+                        + "Если нет — приложение установит его в Docker на ваше устройство по SSH.")
+                .setPositiveButton("Ввести адрес", (d, w) -> showSettings(true))
+                .setNegativeButton("Установить на сервер", (d, w) -> startInstall())
+                .setCancelable(false)
+                .show();
+    }
+
+    private void startInstall() {
+        startActivityForResult(new Intent(this, InstallActivity.class), INSTALL_REQUEST);
+    }
+
+    private void useUrl(String u) {
+        SharedPreferences.Editor e = prefs(this).edit();
+        // Another server: its log numbers start anew
+        if (!u.equals(prefs(this).getString("url", null))) e.remove("seq").remove("cookie");
+        e.putString("url", u).apply();
+        errorView.setVisibility(View.GONE);
+        web.loadUrl(u);
+    }
+
     /** The server address, whether to notify and about which kinds of events. */
     void showSettings(boolean firstRun) {
         LinearLayout box = new LinearLayout(this);
@@ -287,15 +313,12 @@ public class MainActivity extends Activity {
                     boolean on = notify.isChecked();
                     java.util.Set<String> cats = new java.util.HashSet<>();
                     for (CheckBox cb : boxes) if (cb.isChecked()) cats.add((String) cb.getTag());
-                    SharedPreferences.Editor e = prefs(this).edit().putBoolean("notify", on).putStringSet("cats", cats);
-                    // Another server: its log numbers start anew
-                    if (!u.equals(prefs(this).getString("url", null))) e.remove("seq").remove("cookie");
-                    e.putString("url", u).apply();
+                    prefs(this).edit().putBoolean("notify", on).putStringSet("cats", cats).apply();
+                    useUrl(u);
                     if (on) askNotificationPermission();
                     StatusJob.schedule(this, on);
-                    errorView.setVisibility(View.GONE);
-                    web.loadUrl(u);
                 });
+        b.setNeutralButton("Установить на сервер", (d, w) -> startInstall());
         if (!firstRun) b.setNegativeButton("Отмена", null);
         else b.setCancelable(false);
         b.show();
@@ -319,6 +342,16 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
+        if (request == INSTALL_REQUEST) {
+            if (result == RESULT_OK && data != null && data.getData() != null) {
+                useUrl(data.getData().toString());
+                if (prefs(this).getBoolean("notify", true)) {
+                    askNotificationPermission();
+                    StatusJob.schedule(this, true);
+                }
+            } else if (!prefs(this).contains("url")) showStart();
+            return;
+        }
         if (request == FILE_REQUEST && fileCallback != null) {
             fileCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(result, data));
             fileCallback = null;

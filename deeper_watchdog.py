@@ -463,6 +463,54 @@ M1V7WIu1I6gw463luLs6NFCdrY/fiXoSrXRf6sOTZClXeRhKjA6c0wLIxizgw6ll
 FwIDAQAB
 -----END PUBLIC KEY-----"""
 
+
+def _der(buf, i):
+    """One DER element at i -> (tag, content start, content end)."""
+    tag, ln = buf[i], buf[i + 1]
+    i += 2
+    if ln & 0x80:
+        k = ln & 0x7F
+        ln = int.from_bytes(buf[i:i + k], "big")
+        i += k
+    return tag, i, i + ln
+
+
+def rsa_public_key(pem):
+    """(n, e) from a PEM 'PUBLIC KEY' (SubjectPublicKeyInfo) or 'RSA PUBLIC KEY' (PKCS#1)."""
+    body = "".join(l for l in pem.strip().splitlines() if not l.startswith("-----"))
+    der = base64.b64decode(body)
+    _, i, end = _der(der, 0)
+    tag, j, k = _der(der, i)
+    if tag == 0x30:  # SubjectPublicKeyInfo: skip the algorithm, open the BIT STRING
+        _, j, k = _der(der, k)
+        der, i = der[j + 1:k], 0
+        _, i, end = _der(der, 0)
+    _, a, b = _der(der, i)
+    _, c, d = _der(der, b)
+    return int.from_bytes(der[a:b], "big"), int.from_bytes(der[c:d], "big")
+
+
+def rsa_oaep_sha1(n, e, msg):
+    """RSAES-OAEP (RFC 8017) with SHA-1 and MGF1-SHA-1, empty label."""
+    k = (n.bit_length() + 7) // 8
+    h = 20
+    if len(msg) > k - 2 * h - 2:
+        raise ValueError("message too long for the key")
+
+    def mgf1(seed, length):
+        out = b""
+        for c in range((length + h - 1) // h):
+            out += hashlib.sha1(seed + c.to_bytes(4, "big")).digest()
+        return out[:length]
+
+    db = hashlib.sha1(b"").digest() + b"\x00" * (k - len(msg) - 2 * h - 2) + b"\x01" + msg
+    seed = secrets.token_bytes(h)
+    masked_db = bytes(x ^ y for x, y in zip(db, mgf1(seed, k - h - 1)))
+    masked_seed = bytes(x ^ y for x, y in zip(seed, mgf1(masked_db, h)))
+    em = b"\x00" + masked_seed + masked_db
+    return pow(int.from_bytes(em, "big"), e, n).to_bytes(k, "big")
+
+
 def preferred_tunnels():
     """key -> its preferred tunnels in order (the first one is its home)."""
     result = {}
@@ -999,41 +1047,9 @@ class DeeperClient:
         self._auth_checked_at = 0
 
     def _encrypt_password(self):
-        """Encrypt password using RSA-OAEP SHA-1. Uses cryptography if present, else openssl CLI."""
-        try:
-            from cryptography.hazmat.primitives.asymmetric import padding
-            from cryptography.hazmat.primitives import serialization, hashes
-            pub = serialization.load_pem_public_key(DEEPER_PUB_KEY.encode("utf-8"))
-            encrypted = pub.encrypt(
-                self.password.encode("utf-8"),
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA1()),
-                    algorithm=hashes.SHA1(),
-                    label=None
-                )
-            )
-            return base64.b64encode(encrypted).decode("utf-8")
-        except ImportError:
-            import tempfile
-            with tempfile.NamedTemporaryFile("w+", delete=False) as tf:
-                tf.write(DEEPER_PUB_KEY)
-                tf_path = tf.name
-            try:
-                p = subprocess.Popen(
-                    ["openssl", "pkeyutl", "-encrypt", "-pubin", "-inkey", tf_path,
-                     "-pkeyopt", "rsa_padding_mode:oaep", "-pkeyopt", "rsa_oaep_md:sha1", "-pkeyopt", "rsa_mgf1_md:sha1"],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                )
-                out, err = p.communicate(self.password.encode("utf-8"))
-                if p.returncode != 0:
-                    raise RuntimeError(f"OpenSSL encryption failed: {err.decode()}")
-                return base64.b64encode(out).decode("utf-8")
-            finally:
-                if os.path.exists(tf_path):
-                    try:
-                        os.remove(tf_path)
-                    except OSError:
-                        pass
+        """Encrypt the password with RSA-OAEP SHA-1 for Deeper's login. Pure Python (no openssl, works on Windows)."""
+        n, e = rsa_public_key(DEEPER_PUB_KEY)
+        return base64.b64encode(rsa_oaep_sha1(n, e, self.password.encode("utf-8"))).decode("utf-8")
 
     def _request(self, endpoint, method="GET", payload=None):
         url = f"{self.base_url}{endpoint}"
@@ -5821,11 +5837,120 @@ def start_web_server():
         server = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), SettingsHandler)
     except OSError as e:
         logger.error(f"Не удалось запустить веб-интерфейс на порту {WEB_PORT}: {e}")
-        return
+        return False
     threading.Thread(target=server.serve_forever, daemon=True).start()
     threading.Thread(target=queue_worker, daemon=True).start()  # The user's actions, one after another
     note = "" if password_is_set() else " (пароль ещё не задан: его попросит задать первая открытая страница)"
     logger.info(f"Веб-интерфейс настроек: http://<IP-сервера>:{WEB_PORT}/{note}")
+    return True
+
+
+def interactive_setup(env_path=None):
+    """First run without Docker (--setup): asks for Deeper's address and passwords in the console, checks them, writes .env."""
+    import getpass
+    import tempfile
+    env_path = env_path or os.path.join(SCRIPT_DIR, ".env")
+    old = {}
+    if os.path.isfile(env_path):
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, v = line.rstrip("\r\n").split("=", 1)
+                    old[k.strip()] = v.strip().strip("'\"")
+
+    def ask(text, default=""):
+        a = input(f"{text}{f' [{default}]' if default else ''}: ").strip()
+        return a or default
+
+    def yes(text, default=True):
+        a = input(f"{text} [{'Д/н' if default else 'д/Н'}]: ").strip().lower()
+        return default if not a else a[0] in "дyд"
+
+    print("\n=== Deeper Watchdog: настройка ===")
+    print("Enter оставляет значение в скобках. Пароли при вводе не видны.\n")
+    host = old.get("DEEPER_HOST", "34.34.34.34")
+    user = old.get("DEEPER_USER", "admin")
+    pw = old.get("DEEPER_PASS", "")
+    while True:
+        host = ask("1. IP-адрес Deeper Connect (как в браузере, по умолчанию 34.34.34.34)", host)
+        try:
+            urllib.request.urlopen(f"http://{host}/", timeout=6).close()
+            reachable = True
+        except urllib.error.HTTPError:
+            reachable = True  # It answered: that's enough
+        except Exception as e:
+            reachable = False
+            print(f"   ! Deeper Connect по адресу {host} не отвечает ({e}).")
+            print("     Проверьте, что этот компьютер в той же сети, что и Deeper, и адрес верный.")
+            if yes("   Ввести адрес заново?"):
+                continue
+        break
+    while True:
+        a = getpass.getpass(f"2. Пароль администратора Deeper Connect{' [Enter: прежний]' if pw else ''}: ")
+        pw = a or pw
+        if not pw:
+            print("   ! Без пароля Watchdog не сможет управлять туннелями (его можно задать потом в веб-интерфейсе).")
+            if yes("   Ввести пароль?"):
+                continue
+            break
+        if not reachable:
+            break
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                DeeperClient(host, user, pw, cookie_path=os.path.join(tmp, "c")).ensure_authenticated()
+                print("   ✓ Вход в Deeper Connect выполнен")
+                break
+            except RuntimeError as e:
+                print("   ! Deeper Connect не принял пароль." if "Login failed" in str(e) else f"   ! Ошибка входа: {e}")
+            except Exception as e:
+                print(f"   ! Не удалось проверить пароль: {e}")
+        if not yes("   Ввести пароль заново?"):
+            break
+    port = old.get("WEB_PORT", "8787")
+    while True:
+        port = ask("3. Порт веб-интерфейса", port)
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            print("   ! Нужно число от 1 до 65535")
+            continue
+        s = socket.socket()
+        try:
+            s.bind(("0.0.0.0", int(port)))
+            break
+        except OSError:
+            print(f"   ! Порт {port} занят другой программой (или Watchdog уже запущен). Выберите другой, например 8788.")
+            if not yes("   Выбрать другой порт?"):
+                break
+        finally:
+            s.close()
+    web = old.get("WEB_PASSWORD", "")
+    print("4. Пароль для входа в веб-интерфейс Watchdog (не путать с паролем Deeper).")
+    while True:
+        a = getpass.getpass("   Новый пароль (Enter: " + ("оставить прежний" if web else "задать потом в браузере") + "): ")
+        if not a:
+            break
+        if len(a) < 4:
+            print("   ! Слишком короткий: нужно хотя бы 4 символа")
+            continue
+        if getpass.getpass("   Повторите пароль: ") != a:
+            print("   ! Пароли не совпали")
+            continue
+        web = a
+        break
+    new = dict(old, DEEPER_HOST=host, DEEPER_USER=user, DEEPER_PASS=pw, WEB_PORT=port, WEB_PASSWORD=web)
+    tmp = env_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("# Deeper Watchdog. Остальные настройки задаются в веб-интерфейсе\n")
+        f.writelines(f"{k}={v}\n" for k, v in new.items() if v != "")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, env_path)
+    for k, v in new.items():
+        os.environ[k] = v
+    print(f"\n✓ Настройки сохранены в {env_path}")
+    print(f"  Веб-интерфейс: http://127.0.0.1:{port}/ (с других устройств: http://<IP этого компьютера>:{port}/)\n")
+    return new
 
 
 def main():
@@ -5841,7 +5966,13 @@ def main():
     parser.add_argument("--refresh", help="Manually force tunnel refresh for given tunnel (e.g. --refresh NL)")
     parser.add_argument("--test-email", action="store_true", help="Send a test email notification to verify SMTP settings")
     parser.add_argument("--log-file", help="Path to write log output")
+    parser.add_argument("--setup", action="store_true", help="Ask for Deeper's address and the passwords in the console, write .env and exit")
+    parser.add_argument("--open-browser", action="store_true", help="Open the web UI in the browser once it is up (portable versions)")
     args = parser.parse_args()
+
+    if args.setup:
+        interactive_setup()
+        return
 
     handlers = [logging.StreamHandler(sys.stdout)]
     if args.log_file:
@@ -5908,8 +6039,20 @@ def main():
         logger.error("Пароль Deeper Connect не задан: укажите DEEPER_PASS в .env или в настройках веб-интерфейса")
 
     if args.daemon:
+        if WEB_ENABLED and not start_web_server():
+            # Usually a second copy (the portable versions): two watchdogs must never steer one Deeper
+            logger.error("Порт занят: возможно, Watchdog уже запущен. Остановите его или задайте другой WEB_PORT")
+            sys.exit(1)
+        try:
+            # For Stop.bat of the Windows portable version
+            with open(os.path.join(DATA_DIR, "watchdog.pid"), "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
         if WEB_ENABLED:
-            start_web_server()
+            if args.open_browser:
+                import webbrowser
+                threading.Timer(1.5, webbrowser.open, [f"http://127.0.0.1:{WEB_PORT}/"]).start()
         threading.Thread(target=watch_nodes, daemon=True).start()
         old = sorted(k for k in load_saved_settings() if k not in SETTINGS_SCHEMA)
         if old:

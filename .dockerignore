@@ -5,3 +5,7 @@ docs/
 __pycache__/
 *.bak
 .github/
+android/
+install/
+portable/
+dist/
