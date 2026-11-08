@@ -179,6 +179,7 @@ CHECK_NOW = threading.Event()
 CHECK_ONLY = set()  # Tunnels asked to be checked by themselves (request_check); the daemon checks just them
 CHECK_ALL = [False]  # A check of every tunnel was asked for
 USER_CHECK = [False]  # The user pressed "check now": its failures count like a regular check's
+BEST_NOW = set()  # Best-mode services the user asked to measure now (/api/best-now), before the others
 USER_FAIL_GAP = 60  # Seconds between failures counted from such checks, so a double click isn't two failures
 
 
@@ -1778,7 +1779,7 @@ def failover_target(key, exclude, tunnels):
 def next_target(key, exclude, tunnels):
     """Where a service leaving `exclude` (a code or a set of them) goes: the first of its preferred tunnels that has
     nodes, passes its checks and isn't on a node the service already had to leave; only when none of them can take
-    it, any other tunnel (failover_target)."""
+    it, any other tunnel (failover_target). Best mode never leaves its list: None then."""
     exclude = {exclude} if isinstance(exclude, str) else set(exclude)
     by_code = {t.get("tunnelCode"): t for t in tunnels}
     ok = [c for c in preferred_tunnels().get(key, [])
@@ -1786,7 +1787,7 @@ def next_target(key, exclude, tunnels):
           and by_code[c].get("activeIp") not in bad_ips(key, c) and (STATUS["tunnels"].get(c) or {}).get("healthy", True)]
     if ok:
         return best_of(key, ok) if best_mode(key) else ok[0]
-    return failover_target(key, exclude, tunnels)
+    return None if best_mode(key) else failover_target(key, exclude, tunnels)
 
 
 def best_mode(key):
@@ -1805,7 +1806,11 @@ def best_of(key, codes):
 
 
 def best_due():
-    """The best-mode service waiting longest for its measurement, or None."""
+    """The best-mode service the user asked to measure now, else the one waiting longest for its measurement, or None."""
+    for k in list(BEST_NOW):
+        BEST_NOW.discard(k)
+        if best_mode(k) and not app_follower(k):
+            return k
     now, due = time.time(), []
     for k in preferred_tunnels():
         at = (AUTO_STATE["best"].get(k) or {}).get("at", 0)
@@ -1985,7 +1990,7 @@ def evacuate(client, code, only=None, reason="", why="нет нод", mail="no_n
 def _evacuate(client, code, only, reason, why, mail):
     tunnels = client.list_tunnels()
     prefs = preferred_tunnels()
-    moved, failed, kept = [], [], []
+    moved, failed, kept, in_list = [], [], [], []
     for key, move_to in tunnel_services(client, code):
         if only is not None and key not in only:
             continue
@@ -1997,7 +2002,7 @@ def _evacuate(client, code, only, reason, why, mail):
             continue  # Goes after its app (follow_apps below)
         target = next_target(key, code, tunnels)
         if target is None:
-            failed.append(name)
+            (in_list if best_mode(key) else failed).append(name)
             continue
         if move_to(target):
             mark_moved(key)
@@ -2010,7 +2015,7 @@ def _evacuate(client, code, only, reason, why, mail):
         else:
             failed.append(name)
     # Services that can't go anywhere are reported once per outage, not on every retry
-    stuck = failed + kept
+    stuck = failed + kept + in_list
     if stuck and not moved and set(stuck) <= EVAC_NOTIFIED.get(code, set()):
         return moved
     EVAC_NOTIFIED[code] = EVAC_NOTIFIED.get(code, set()) | set(stuck)
@@ -2018,10 +2023,11 @@ def _evacuate(client, code, only, reason, why, mail):
         save_auto_state()
         parts = ([f"Переехали: {', '.join(moved)}"] if moved else []) \
             + ([f"Не удалось перенести: {', '.join(failed)}"] if failed else []) \
-            + ([f"Остаются («Вручную»): {', '.join(kept)}"] if kept else [])
+            + ([f"Остаются («Вручную»): {', '.join(kept)}"] if kept else []) \
+            + ([f"Остаются (лучший из списка, в остальных туннелях списка места нет): {', '.join(in_list)}"] if in_list else [])
         text = f"{code}: {why}{reason}. " + ". ".join(parts)
         logger.warning(text)
-        log_event("bad" if failed or kept else "warn", text)
+        log_event("bad" if failed or kept or in_list else "warn", text)
         notify(mail, f"[Deeper Connect] {COUNTRY_NAMES.get(code, code)}: {why}", text + "\n")
         if moved:
             client.get_routed_domains()
@@ -3331,6 +3337,10 @@ svg.i{width:1em;height:1em;flex:none;stroke:currentColor;fill:none;stroke-width:
 :focus{outline:none}
 :focus-visible{outline:3px solid color-mix(in srgb,var(--accent) 55%,transparent);outline-offset:2px;border-radius:10px}
 .muted{color:var(--muted)}.small{font-size:13px}
+details.help summary{cursor:pointer;list-style:none;font-size:13px;color:var(--accent-text);font-weight:500}
+details.help summary::-webkit-details-marker{display:none}
+details.help summary::after{content:"›";display:inline-block;margin-left:5px;transition:transform .2s}details.help[open] summary::after{transform:rotate(90deg)}
+details.help[open] summary{margin-bottom:6px}
 .ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--orange)}
 
 /* Navigation bar */
@@ -3882,8 +3892,8 @@ body[data-view="dark"] .tcard.st-warn{box-shadow:0 0 0 1px rgba(255,165,36,.22),
   <div class="card list" id="rtTests"></div>
   <div class="ghead">Сайты и приложения</div>
   <div class="card" style="padding:14px 16px">
-   <div class="small muted">Сравнение меряет все сервисы там, где они сейчас, затем по очереди переносит их все в каждый туннель и меряет разом, а в конце возвращает обратно. Во время сравнения сайты могут подтормаживать.
-   Пинг сервиса считается как средний по его доменам. Справа у каждого сервиса выбирается режим. «Авто» (по умолчанию): если в его туннеле плохая связь или нет нод, сервис переезжает в лучший туннель, где есть ноды, и остаётся там; просто потому, что где-то быстрее, не переезжает. «Вручную»: никогда не переносится сам, даже из туннеля без нод, при сбое приходит письмо. Предпочтительные туннели (📌): один или несколько по порядку. Если сервису плохо, сначала меняется нода, затем он уходит в следующий предпочтительный туннель, в остальные — только если не подошёл ни один; возвращается вверх по списку, когда там новая нода и она 5 минут подряд в норме.</div>
+   <details class="help" id="rtHelp"><summary>Как работают сравнение и режимы</summary><div class="small muted">Сравнение меряет все сервисы там, где они сейчас, затем по очереди переносит их все в каждый туннель и меряет разом, а в конце возвращает обратно. Во время сравнения сайты могут подтормаживать.
+   Пинг сервиса считается как средний по его доменам. Справа у каждого сервиса выбирается режим. «Авто» (по умолчанию): если в его туннеле плохая связь или нет нод, сервис переезжает в лучший туннель, где есть ноды, и остаётся там; просто потому, что где-то быстрее, не переезжает. «Вручную»: никогда не переносится сам, даже из туннеля без нод, при сбое приходит письмо. Предпочтительные туннели (📌): один или несколько по порядку. Если сервису плохо, сначала меняется нода, затем он уходит в следующий предпочтительный туннель, в остальные — только если не подошёл ни один; возвращается вверх по списку, когда там новая нода и она 5 минут подряд в норме.</div></details>
    <div class="toolbar">
     <label class="selall"><input type="checkbox" class="check" id="selAll">Выбрать все</label>
     <input class="field" id="rtFilter" type="search" placeholder="Поиск" aria-label="Поиск сайта">
@@ -3923,6 +3933,8 @@ body[data-view="dark"] .tcard.st-warn{box-shadow:0 0 0 1px rgba(255,165,36,.22),
 </dialog>
 
 <script>
+// The long help is open on wide screens, a tap away on phones
+document.getElementById("rtHelp").open=matchMedia("(min-width:701px)").matches;
 const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые сайты":["globe","#30b0c7"],"Приложения":["grid","#5856d6"],"Вид":["chart","#ff9f0a"],"Телефон":["bell","#34c759"],
  "Перестроение туннелей":["refresh","#ff9500"],"Предпочтительные туннели":["pin","#ff3b30"],
  "Резервные копии и перенос":["archive","#8e8e93"],"Доступ":["lock","#34c759"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
@@ -3941,7 +3953,7 @@ const GROUPS=[
     ["fast","Быстрый уход очень плохих","Как «Сначала уезжают плохие», и сервис без ответа или вдвое медленнее допустимого уезжает уже после одной проверки"],
     ["stats","Только статистика","Туннель оценивается по доменам, как раньше, но сервисы, у которых уже сбой, не портят его пинг и статус"]]],
   ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Туннель не прошёл столько проверок подряд, и в нём больше одной ноды — меняется нода и туннель проверяется заново. Его сервисы ждут смены ноды и уезжают, только если не помогло"]]},
- {title:"Предпочтительные туннели",foot:"Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 200 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка. На время замера сервис ненадолго переносится в другие туннели.",fields:[
+ {title:"Предпочтительные туннели",foot:"Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 200 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка, в туннели вне списка не уходит. На время замера сервис ненадолго переносится в другие туннели.",fields:[
   ["BEST_PREFERRED","switch","Лучший из списка для всех","Выключено — лестница по порядку списка, лучший из списка только у сервисов, где он включён в меню режима. Включено — у всех сервисов с несколькими предпочтительными туннелями"],
   ["BEST_CHECK_MINUTES","number","Замеры в туннелях списка, раз в, мин","Как часто сервис в режиме «Лучший из списка» меряется в каждом своём туннеле, 10–1440"]]},
  {title:"Вид",fields:[
@@ -4624,6 +4636,10 @@ function renderItems(box,items,results,d){box.textContent="";
   const sw=el("select",{class:"mini","aria-label":"Режим для "+name,title:"«Авто», «Вручную» или предпочтительные туннели"});
   sw.append(el("option",{value:"auto","data-ic":"sparkle","data-sub":"При плохой связи или без нод переезжает туда, где есть ноды",text:"Авто"}),
    el("option",{value:"manual","data-ic":"hand","data-sub":"Никогда не переносится сам, только письмо при сбое",text:"Вручную"}));
+  const best=(d.best||{})[key];
+  sw.append(el("option",{value:"__best","data-ic":"sparkle","data-again":"1","data-menu":"Лучший из списка",
+   "data-short":"✨ "+(best?prefs.join(" › "):"Лучший"),
+   "data-sub":d.best_all&&best?"Включён для всех в настройках":best?"Нажмите, чтобы вернуть порядок списка":prefs.length>1?"Оставаться в туннеле списка, где лучше всего":"Выбрать туннели и оставаться там, где лучше всего",text:"Лучший"}));
   const pg=el("optgroup",{label:"Предпочтительный туннель"});
   const tl=[...d.all_tunnels];if(pin&&!tl.some(t=>t.code===pin))tl.push({code:pin,nodes:0});
   for(const t of tl)pg.append(el("option",{value:t.code,"data-ic":"pin","data-short":`${flag(t.code)} ${t.code}`,"data-menu":`${flag(t.code)} ${t.code} · ${tname(t.code)}`,
@@ -4631,13 +4647,16 @@ function renderItems(box,items,results,d){box.textContent="";
   // Several preferred tunnels in order: picked in a dialog, also when the list is already chosen (data-again)
   pg.append(el("option",{value:"__multi","data-ic":"pin","data-again":"1","data-menu":prefs.length>1?"Изменить список…":"Несколько туннелей…",
    "data-short":prefs.length>1?"📌 "+prefs.join(" › "):"Несколько…","data-sub":prefs.length>1?prefs.join(" › "):"По порядку: сначала первый, потом следующие",text:"Несколько"}));
-  const best=(d.best||{})[key];
-  if(prefs.length>1)pg.append(el("option",{value:"__best","data-ic":"sparkle","data-again":"1","data-menu":best?"✓ Лучший из списка":"Лучший из списка",
-   "data-sub":d.best_all?"Включён для всех в настройках":best?"Нажмите, чтобы вернуть порядок списка":"Оставаться в туннеле списка, где лучше всего",text:"Лучший"}));
-  sw.append(pg);sw.dataset.tone=mode==="auto"?"on":pin?"pin":"";
-  const cur=prefs.length>1?"__multi":pin||(mode==="preferred"?"auto":mode);
+  sw.append(pg);sw.dataset.tone=mode==="auto"||best?"on":pin?"pin":"";
+  const cur=best?"__best":prefs.length>1?"__multi":pin||(mode==="preferred"?"auto":mode);
   sw.value=cur;sw.onchange=async()=>{
-   if(sw.value==="__best"){sw.value=cur;return d.best_all?toast("Лучший из списка включён для всех в настройках"):saveBest(key,!best,sw)}
+   if(sw.value==="__best"){sw.value=cur;
+    if(d.best_all&&prefs.length>1)return toast("Лучший из списка включён для всех в настройках");
+    if(prefs.length>1)return saveBest(key,!best,sw);
+    // No list yet: pick the tunnels first, then best of them
+    const list=await pickPreferred(name,prefs,d);if(!list)return;
+    if(list.length<2)return toast("Для лучшего из списка нужно хотя бы два туннеля",true);
+    await saveMode(key,list,sw,cur);if(!d.best_all)saveBest(key,true,sw);return}
    if(sw.value!=="__multi")return saveMode(key,sw.value,sw,cur);
    const list=await pickPreferred(name,prefs.length?prefs:[],d);
    if(list)saveMode(key,list,sw,cur);else sw.value=cur};
@@ -4646,7 +4665,9 @@ function renderItems(box,items,results,d){box.textContent="";
    :el("span",{class:"chip",text:tunnelLabel(tunnel)});
   const main=el("div",{class:"li-main"},el("div",{class:"li-title"},name,tchip));
   if(best&&prefs.includes(tunnel)){const sc=best.scores||{},at=best.at?Math.max(0,Math.round((Date.now()/1000-best.at)/60)):null;
-   main.append(el("div",{class:"warnline"},icon("sparkle"),Object.keys(sc).length?`Лучший из списка: ${Object.entries(sc).map(([c,p])=>`${c} ${p.ms!=null?Math.round(p.ms):"—"}`).join(" · ")}, замер ${at} мин назад`:"Лучший из списка: замеров ещё не было"))}
+   const now=el("button",{type:"button",class:"btn sm",text:"Проверить сейчас"});now.onclick=()=>bestNow(key,now);
+   main.append(el("div",{class:"warnline"},icon("sparkle"),Object.keys(sc).length?`Лучший из списка: ${Object.entries(sc).map(([c,p])=>`${c} ${p.ms!=null?Math.round(p.ms):"—"}`).join(" · ")}, замер ${at} мин назад`:"Лучший из списка: замеров ещё не было"),
+    el("div",{class:"rec"},now))}
   else if(pin&&ev&&ev.from)main.append(el("div",{class:"warnline"},icon("clock"),ev.new_node
    ?`Временно в ${ev.to}: на ноде ${ev.from} ему было плохо. Вернётся, когда в ${ev.from} будет другая нода и она ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`
    :`Временно в ${ev.to}: в ${ev.from} был сбой. Вернётся, когда ${ev.from} ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`));
@@ -4740,6 +4761,9 @@ function methodSelect(key,name,d){
 async function saveBest(key,on,sw){sw.disabled=true;
  try{await api("/api/best",{key,on});toast(`${itemName(key)}: `+(on?"лучший из списка":"по порядку списка"))}
  catch(e){toastErr(e)}sw.disabled=false;loadRoutes()}
+async function bestNow(key,btn){btn.disabled=true;
+ try{await api("/api/best-now",{key});toast(`${itemName(key)}: замер во всех туннелях списка начнётся через несколько секунд`)}
+ catch(e){toastErr(e);btn.disabled=false}}
 async function saveMethod(key,method,ms,was){ms.disabled=true;
  try{await api("/api/check-method",{key,method});
   toast(`${itemName(key)}: проверка — ${METHODS[method||routesData.check_method||"page"][0].toLowerCase()}`+(method?"":" (как у всех)"))}
@@ -4866,7 +4890,7 @@ const I18N=[
 ["Переезд при сбое","Move on failure","故障时迁移"],["Серверы Telegram","Telegram servers","Telegram 服务器"],["Пароль приложения","App password","应用密码"],["Только статистика","Statistics only","仅统计"],
 ["Не чаще раза в, ч","At most once per, h","最多每（小时）一次"],["Действие при сбое","Action on failure","故障时操作"],["Ничего не найдено","Nothing found","未找到"],["Нет нод в туннеле","No nodes in the tunnel","隧道中无节点"],
 ["Проверка туннелей","Tunnel checks","隧道检测"],["проверка не прошла","check failed","检测未通过"],["Проверка не прошла","Check failed","检测未通过"],["Удалить все домены","Delete all domains","删除所有域名"],
-["Настройки сброшены","Settings reset","设置已重置"],["Сайты и приложения","Sites and apps","网站和应用"],["Проверка завершена","Check finished","检测完成"],["Коды через запятую","Codes, comma separated","代码，用逗号分隔"],
+["Настройки сброшены","Settings reset","设置已重置"],["Сайты и приложения","Sites and apps","网站和应用"],["Как работают сравнение и режимы","How comparison and modes work","比较和模式如何工作"],["Проверка завершена","Check finished","检测完成"],["Коды через запятую","Codes, comma separated","代码，用逗号分隔"],
 ["Не удалось вернуть","Could not return","无法恢复"],["Сравнение запущено","Comparison started","比较已开始"],["Способ из настроек","Method from settings","设置中的方式"],["Нет связи с Deeper","No connection to Deeper","无法连接 Deeper"],
 ["Пинг по соединению","Connection ping","连接延迟"],["Только этот туннель","This tunnel only","仅此隧道"],["Сравнение завершено","Comparison finished","比较完成"],["Замеров за проверку","Samples per check","每次检测采样数"],
 ["Пинг и рекомендации","Ping and recommendations","延迟与建议"],["Сбросить настройки?","Reset settings?","重置设置？"],["Другая нода из пула","Another node from the pool","池中的另一个节点"],["Все туннели в норме","All tunnels are fine","所有隧道正常"],
@@ -4978,8 +5002,8 @@ const I18N=[
 ["Замеры в туннелях списка, раз в, мин","Measure in the list's tunnels every, min","在列表隧道中测量，间隔分钟"],
 ["Как часто сервис в режиме «Лучший из списка» меряется в каждом своём туннеле, 10–1440","How often a service in the “Best of the list” mode is measured in each of its tunnels, 10–1440","“列表中最佳”模式下的服务在其每个隧道中测量的频率，10–1440"],
 ["Выключено — лестница по порядку списка, лучший из списка только у сервисов, где он включён в меню режима. Включено — у всех сервисов с несколькими предпочтительными туннелями","Off: a ladder in the list's order, best of the list only for services where it is on in the mode menu. On: for every service with several preferred tunnels","关闭：按列表顺序逐级切换，仅在模式菜单中启用的服务使用列表中最佳。开启：所有有多个首选隧道的服务"],
-["Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 200 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка. На время замера сервис ненадолго переносится в другие туннели.","Ladder: the service lives in the list's first tunnel, on a failure it goes to the next one and climbs back once the first is fine for 5 minutes. Best of the list: the service is measured in each of its tunnels regularly and stays where it works clearly better (30% and 200 ms faster, or less loss); on a failure it goes to the best one by the last measurements, without them in the list's order. While measured, the service briefly moves to the other tunnels.","逐级：服务位于列表第一个隧道，故障时转到下一个，第一个正常 5 分钟后返回。列表中最佳：定期在每个隧道中测量服务，留在明显更好的隧道（快 30% 且 200 毫秒，或丢包更少）；故障时按最近测量转到最佳隧道，无测量时按列表顺序。测量期间服务会短暂转到其他隧道。"],
-["Лучший из списка","Best of the list","列表中最佳"],["✓ Лучший из списка","✓ Best of the list","✓ 列表中最佳"],["Лучший","Best","最佳"],
+["Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 200 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка, в туннели вне списка не уходит. На время замера сервис ненадолго переносится в другие туннели.","Ladder: the service lives in the list's first tunnel, on a failure it goes to the next one and climbs back once the first is fine for 5 minutes. Best of the list: the service is measured in each of its tunnels regularly and stays where it works clearly better (30% and 200 ms faster, or less loss); on a failure it goes to the best one by the last measurements, without them in the list's order, never to a tunnel outside the list. While measured, the service briefly moves to the other tunnels.","逐级：服务位于列表第一个隧道，故障时转到下一个，第一个正常 5 分钟后返回。列表中最佳：定期在每个隧道中测量服务，留在明显更好的隧道（快 30% 且 200 毫秒，或丢包更少）；故障时按最近测量转到最佳隧道，无测量时按列表顺序，不会转到列表外的隧道。测量期间服务会短暂转到其他隧道。"],
+["Лучший из списка","Best of the list","列表中最佳"],["Выбрать туннели и оставаться там, где лучше всего","Pick tunnels and stay where it works best","选择隧道并留在表现最好的隧道"],["Для лучшего из списка нужно хотя бы два туннеля","Best of the list needs at least two tunnels","列表中最佳至少需要两个隧道"],["{0}: замер во всех туннелях списка начнётся через несколько секунд","{0}: measuring in every tunnel of the list starts in a few seconds","{0}：几秒后开始在列表所有隧道中测量"],["✓ Лучший из списка","✓ Best of the list","✓ 列表中最佳"],["Лучший","Best","最佳"],
 ["Включён для всех в настройках","On for all in the settings","已在设置中为全部启用"],["Нажмите, чтобы вернуть порядок списка","Tap to go back to the list's order","点击恢复列表顺序"],
 ["Оставаться в туннеле списка, где лучше всего","Stay in the list's tunnel where it works best","留在列表中表现最好的隧道"],["Лучший из списка включён для всех в настройках","Best of the list is on for all in the settings","已在设置中为全部启用列表中最佳"],
 ["Лучший из списка: {0}, замер {1} мин назад","Best of the list: {0}, measured {1} min ago","列表中最佳：{0}，{1} 分钟前测量"],["Лучший из списка: замеров ещё не было","Best of the list: not measured yet","列表中最佳：尚未测量"],
@@ -5626,6 +5650,13 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 return self._send(400, {"errors": errors})
             log_event("info", f"{key.split(':', 1)[-1]}: " + ("остаётся в лучшем из предпочтительных туннелей" if on
                                                             else "предпочтительные туннели по порядку"))
+            self._send(200, {"ok": True})
+        elif self.path == "/api/best-now":
+            key = body.get("key") if isinstance(body, dict) else None
+            if not isinstance(key, str) or not best_mode(key):
+                return self._send(400, {"error": "У сервиса не включён лучший из списка"})
+            BEST_NOW.add(key)  # The daemon's next tick (within 5 s) measures it
+            log_event("info", f"{key.split(':', 1)[-1]}: замер в предпочтительных туннелях по запросу")
             self._send(200, {"ok": True})
         elif self.path == "/api/diagnose":
             key = body.get("key") if isinstance(body, dict) else None

@@ -181,6 +181,12 @@ class BestMode(unittest.TestCase):
         dw.BEST_SERVICES, dw.BEST_PREFERRED = "", True
         self.assertEqual(dw.next_target(self.KEY, "SG", self.TUNNELS), "US")
 
+    def test_list_exhausted_ladder_goes_anywhere_best_stays_in_list(self):
+        tunnels = self.TUNNELS + [{"tunnelCode": "SG", "activeNum": 2, "activeIp": "3.3.3.3"}]
+        self.assertEqual(dw.next_target(self.KEY, {"NL", "US"}, tunnels), "SG")
+        dw.BEST_PREFERRED = True
+        self.assertIsNone(dw.next_target(self.KEY, {"NL", "US"}, tunnels))
+
     def test_scores_of_another_node_or_stale_dont_count(self):
         dw.BEST_PREFERRED = True
         dw.ROUTES["all_tunnels"][1]["ip"] = "9.9.9.9"
@@ -227,6 +233,13 @@ class BestMode(unittest.TestCase):
             self.assertEqual((client.moves, client.tunnel), (["NL", "US"], "US"))  # Not clearly better: stays
         dw.AUTO_STATE["best"].pop(key, None)
         dw.AUTO_STATE["moved_at"].pop(key, None)
+
+    def test_asked_now_goes_first_even_when_held(self):
+        dw.BEST_PREFERRED = True
+        dw.BEST_NOW.add(self.KEY)
+        with mock.patch.dict(dw.AUTO_STATE["moved_at"], {self.KEY: dw.time.time()}):
+            self.assertEqual(dw.best_due(), self.KEY)
+        self.assertIsNone(dw.best_due())
 
     def test_due_after_the_interval(self):
         dw.BEST_PREFERRED = True
