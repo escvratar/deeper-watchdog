@@ -3,7 +3,7 @@
 set -e
 cd "$(dirname "$0")"
 SDK=${ANDROID_HOME:-/root/Android/Sdk}; BT=$SDK/build-tools/35.0.0; JAR=$SDK/platforms/android-34/android.jar
-VERSION=${VERSION:-1.2}; CODE=${CODE:-3}
+VERSION=${VERSION:-1.3}; CODE=${CODE:-4}
 # SSH for installing on a server: JSch (BSD), its Java 8 classes only (the jar's META-INF/versions are for newer JDKs)
 JSCH=2.28.8; JSCH_JAR=libs/jsch-$JSCH.jar
 [ -f $JSCH_JAR ] || { mkdir -p libs; curl -fsSL -o $JSCH_JAR https://repo1.maven.org/maven2/com/github/mwiede/jsch/$JSCH/jsch-$JSCH.jar; }
