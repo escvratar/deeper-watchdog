@@ -166,6 +166,7 @@ FIXED_SETTINGS = {
     "EMPTY_REBUILD_AFTER": 3600,  # A tunnel without nodes is rebuilt only after an hour: Deeper finds nodes itself
     "AUTO_MIN_GAIN_PCT": 30,      # A comparison recommends a tunnel better by this much...
     "AUTO_MIN_GAIN_MS": 200,      # ...and by at least this many ms
+    "BEST_MIN_GAIN_MS": 50,       # The same for best-of-the-list: its tunnels were all picked by the user
     "HOLD_DOWN": 300,             # Seconds a service stays put after a move, unless it stops answering at all
     "PREFERRED_RETURN_AFTER": 300,  # Seconds a preferred tunnel must be green before its services come back
     "COMPARE_SAMPLES": 3,
@@ -1845,9 +1846,10 @@ def measure_preferred(client, key):
     codes = preferred_tunnels().get(key, [])
     if base not in codes:
         return  # Away from its list: enforce_preferred brings it back first
-    usable = [c for c in codes if (by_code.get(c) or {}).get("activeNum", 0) > 0
+    # Where it is is always measured (in place, first): without it there is nothing to compare with
+    usable = [c for c in codes if c == base or (by_code.get(c) or {}).get("activeNum", 0) > 0
               and by_code[c].get("activeIp") not in bad_ips(key, c) and (STATUS["tunnels"].get(c) or {}).get("healthy", True)]
-    usable = sorted(usable, key=lambda c: c != base)  # Where it is first: measured in place
+    usable = sorted(usable, key=lambda c: c != base)
     tcp_only, pings, moved = check_method(key) != "page", {}, False
     with MOVE_LOCK:
         try:
@@ -1857,13 +1859,16 @@ def measure_preferred(client, key):
                         continue
                     moved = True
                     time.sleep(ROUTE_SETTLE)
-                pings[c] = dict(measure_urls(urls, COMPARE_SAMPLES, tcp_only), ip=by_code[c].get("activeIp"), at=time.time())
+                pings[c] = dict(measure_urls(urls, COMPARE_SAMPLES, tcp_only), ip=(by_code.get(c) or {}).get("activeIp"), at=time.time())
                 logger.info(f"Лучший туннель для {name}: {c} {fmt_ms(pings[c]['ms'])}, потери {pings[c]['loss']:.0%}")
         finally:
             back = not moved or restore()
         with STATE_LOCK:
             AUTO_STATE["best"][key] = {"at": time.time(), "scores": pings}
-        to = pick_better_tunnel(pings, base) if back and base in pings else None
+        to = pick_better_tunnel(pings, base, BEST_MIN_GAIN_MS) if back and base in pings else None
+        if back and not to and len(pings) > 1:
+            logger.info(f"{name}: остаётся в {base}, заметно лучше нигде нет (нужно быстрее на {AUTO_MIN_GAIN_PCT}% "
+                        f"и на {BEST_MIN_GAIN_MS} мс или меньше потерь)")
         if not back:
             log_event("bad", f"{name}: не удалось вернуть в {base} после замеров в предпочтительных туннелях", mail="rollback")
         elif to and not move_to(to):
@@ -2228,9 +2233,10 @@ def measure_site(url, samples, tcp_only=False):
     return (answered[len(answered) // 2] if answered else None), status, 1 - len(answered) / len(probes)
 
 
-def pick_better_tunnel(pings, original):
+def pick_better_tunnel(pings, original, min_gain_ms=None):
     """Returns a tunnel clearly better than the original one, or None: a small gain isn't worth breaking sessions.
-    Better is a ping lower by AUTO_MIN_GAIN_PCT and AUTO_MIN_GAIN_MS without more loss, or far less loss."""
+    Better is a ping lower by AUTO_MIN_GAIN_PCT and min_gain_ms (AUTO_MIN_GAIN_MS) without more loss, or far less loss."""
+    min_gain_ms = AUTO_MIN_GAIN_MS if min_gain_ms is None else min_gain_ms
     base = pings.get(original, {})
     base_ms, base_loss, base_status = base.get("ms"), base.get("loss", 1), base.get("status")
 
@@ -2246,7 +2252,7 @@ def pick_better_tunnel(pings, original):
     b = pings[best]
     if base_ms is None or base.get("errors") or b["loss"] * 100 <= base_loss * 100 - SERVICE_LOSS_PCT:
         return best
-    if b["ms"] <= base_ms * (1 - AUTO_MIN_GAIN_PCT / 100) and base_ms - b["ms"] >= AUTO_MIN_GAIN_MS \
+    if b["ms"] <= base_ms * (1 - AUTO_MIN_GAIN_PCT / 100) and base_ms - b["ms"] >= min_gain_ms \
             and b["loss"] <= base_loss + 0.05:
         return best
     return None
@@ -3970,7 +3976,7 @@ const GROUPS=[
     ["fast","Быстрый уход очень плохих","Как «Сначала уезжают плохие», и сервис без ответа или вдвое медленнее допустимого уезжает уже после одной проверки"],
     ["stats","Только статистика","Туннель оценивается по доменам, как раньше, но сервисы, у которых уже сбой, не портят его пинг и статус"]]],
   ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Туннель не прошёл столько проверок подряд, и в нём больше одной ноды — меняется нода и туннель проверяется заново. Его сервисы ждут смены ноды и уезжают, только если не помогло"]]},
- {title:"Предпочтительные туннели",foot:"Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 200 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка, в туннели вне списка не уходит. На время замера сервис ненадолго переносится в другие туннели.",fields:[
+ {title:"Предпочтительные туннели",foot:"Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 50 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка, в туннели вне списка не уходит. На время замера сервис ненадолго переносится в другие туннели.",fields:[
   ["BEST_PREFERRED","switch","Лучший из списка для всех","Выключено — лестница по порядку списка, лучший из списка только у сервисов, где он включён в меню режима. Включено — у всех сервисов с несколькими предпочтительными туннелями"],
   ["BEST_CHECK_MINUTES","number","Замеры в туннелях списка, раз в, мин","Как часто сервис в режиме «Лучший из списка» меряется в каждом своём туннеле, 10–1440"]]},
  {title:"Вид",fields:[
@@ -5021,7 +5027,7 @@ const I18N=[
 ["Замеры в туннелях списка, раз в, мин","Measure in the list's tunnels every, min","在列表隧道中测量，间隔分钟"],
 ["Как часто сервис в режиме «Лучший из списка» меряется в каждом своём туннеле, 10–1440","How often a service in the “Best of the list” mode is measured in each of its tunnels, 10–1440","“列表中最佳”模式下的服务在其每个隧道中测量的频率，10–1440"],
 ["Выключено — лестница по порядку списка, лучший из списка только у сервисов, где он включён в меню режима. Включено — у всех сервисов с несколькими предпочтительными туннелями","Off: a ladder in the list's order, best of the list only for services where it is on in the mode menu. On: for every service with several preferred tunnels","关闭：按列表顺序逐级切换，仅在模式菜单中启用的服务使用列表中最佳。开启：所有有多个首选隧道的服务"],
-["Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 200 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка, в туннели вне списка не уходит. На время замера сервис ненадолго переносится в другие туннели.","Ladder: the service lives in the list's first tunnel, on a failure it goes to the next one and climbs back once the first is fine for 5 minutes. Best of the list: the service is measured in each of its tunnels regularly and stays where it works clearly better (30% and 200 ms faster, or less loss); on a failure it goes to the best one by the last measurements, without them in the list's order, never to a tunnel outside the list. While measured, the service briefly moves to the other tunnels.","逐级：服务位于列表第一个隧道，故障时转到下一个，第一个正常 5 分钟后返回。列表中最佳：定期在每个隧道中测量服务，留在明显更好的隧道（快 30% 且 200 毫秒，或丢包更少）；故障时按最近测量转到最佳隧道，无测量时按列表顺序，不会转到列表外的隧道。测量期间服务会短暂转到其他隧道。"],
+["Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 50 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка, в туннели вне списка не уходит. На время замера сервис ненадолго переносится в другие туннели.","Ladder: the service lives in the list's first tunnel, on a failure it goes to the next one and climbs back once the first is fine for 5 minutes. Best of the list: the service is measured in each of its tunnels regularly and stays where it works clearly better (30% and 50 ms faster, or less loss); on a failure it goes to the best one by the last measurements, without them in the list's order, never to a tunnel outside the list. While measured, the service briefly moves to the other tunnels.","逐级：服务位于列表第一个隧道，故障时转到下一个，第一个正常 5 分钟后返回。列表中最佳：定期在每个隧道中测量服务，留在明显更好的隧道（快 30% 且 50 毫秒，或丢包更少）；故障时按最近测量转到最佳隧道，无测量时按列表顺序，不会转到列表外的隧道。测量期间服务会短暂转到其他隧道。"],
 ["Лучший из списка","Best of the list","列表中最佳"],["Выбрать туннели и оставаться там, где лучше всего","Pick tunnels and stay where it works best","选择隧道并留在表现最好的隧道"],["Для лучшего из списка нужно хотя бы два туннеля","Best of the list needs at least two tunnels","列表中最佳至少需要两个隧道"],["{0}: замер во всех туннелях списка начнётся через несколько секунд","{0}: measuring in every tunnel of the list starts in a few seconds","{0}：几秒后开始在列表所有隧道中测量"],["✓ Лучший из списка","✓ Best of the list","✓ 列表中最佳"],["Лучший","Best","最佳"],
 ["Включён для всех в настройках","On for all in the settings","已在设置中为全部启用"],["Нажмите, чтобы вернуть порядок списка","Tap to go back to the list's order","点击恢复列表顺序"],
 ["Оставаться в туннеле списка, где лучше всего","Stay in the list's tunnel where it works best","留在列表中表现最好的隧道"],["Лучший из списка включён для всех в настройках","Best of the list is on for all in the settings","已在设置中为全部启用列表中最佳"],

@@ -231,6 +231,22 @@ class BestMode(unittest.TestCase):
             client.moves.clear()
             dw.measure_preferred(client, key)
             self.assertEqual((client.moves, client.tunnel), (["NL", "US"], "US"))  # Not clearly better: stays
+            # Its own tunnel is measured even on a node it once had to leave: else there is nothing to compare with
+            ms["NL"] = 900
+            client.moves.clear()
+            dw.AUTO_STATE["bad_ips"][key] = {"US": {"2.2.2.2": dw.time.time()}}
+            dw.AUTO_STATE["moved_at"].pop(key, None)
+            client.tunnel = "NL"
+            ms["US"] = 200
+            dw.measure_preferred(client, key)
+            self.assertEqual(client.tunnel, "NL")  # US is on a bad node for it: not measured, not taken
+            ms["NL"], ms["US"] = 900, 900
+            client.tunnel = "US"
+            client.moves.clear()
+            ms["NL"] = 200
+            dw.measure_preferred(client, key)
+            self.assertEqual((client.moves, client.tunnel), (["NL", "US", "NL"], "NL"))  # Measured in US, moved
+        dw.AUTO_STATE["bad_ips"].pop(key, None)
         dw.AUTO_STATE["best"].pop(key, None)
         dw.AUTO_STATE["moved_at"].pop(key, None)
 
@@ -240,6 +256,14 @@ class BestMode(unittest.TestCase):
         with mock.patch.dict(dw.AUTO_STATE["moved_at"], {self.KEY: dw.time.time()}):
             self.assertEqual(dw.best_due(), self.KEY)
         self.assertIsNone(dw.best_due())
+
+    def test_best_gain_is_smaller_than_autos(self):
+        p = {"BS": {"ms": 150, "loss": 0, "status": 200}, "NL": {"ms": 62, "loss": 0, "status": 200},
+             "HK": {"ms": 140, "loss": 0, "status": 200}}
+        self.assertIsNone(dw.pick_better_tunnel(p, "BS"))  # 88 ms: not enough for Auto
+        self.assertEqual(dw.pick_better_tunnel(p, "BS", dw.BEST_MIN_GAIN_MS), "NL")
+        del p["NL"]
+        self.assertIsNone(dw.pick_better_tunnel(p, "BS", dw.BEST_MIN_GAIN_MS))  # 10 ms: stays
 
     def test_due_after_the_interval(self):
         dw.BEST_PREFERRED = True
