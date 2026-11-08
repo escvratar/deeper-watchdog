@@ -23,7 +23,6 @@ import logging
 import smtplib
 import argparse
 import threading
-import subprocess
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -50,7 +49,9 @@ def load_dotenv():
                             continue
                         k, v = line.split("=", 1)
                         k = k.strip()
-                        v = v.strip().strip("'\"")
+                        v = v.strip()
+                        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":  # Only a pair: a quote can be in a password
+                            v = v[1:-1]
                         if k not in os.environ:
                             os.environ[k] = v
                 break
@@ -1007,19 +1008,19 @@ def send_email_notification(subject, body, verbose=False):
         msg["To"] = ", ".join(recipients)
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
-        if SMTP_USE_SSL or SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20)
+        # smtplib checks no certificate without a context: anyone in the middle would get the mail password
+        ctx = ssl.create_default_context()
+        use_ssl = SMTP_USE_SSL or SMTP_PORT == 465
+        if use_ssl:
+            server = smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20, context=ctx)
         else:
             server = smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20)
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-
-        if SMTP_USER and SMTP_PASS:
-            server.login(SMTP_USER, SMTP_PASS)
-
-        server.sendmail(SMTP_FROM, recipients, msg.as_string())
-        server.quit()
+        with server:  # Closed on errors too
+            if not use_ssl:
+                server.starttls(context=ctx)
+            if SMTP_USER and SMTP_PASS:
+                server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_FROM, recipients, msg.as_string())
         logger.info(f"Email notification successfully sent to {SMTP_TO}!")
         STATUS["last_email"] = {"time": now_str, "ok": True, "error": None}
         return True
@@ -1095,6 +1096,7 @@ class DeeperClient:
                 if cookie_dir and not os.path.exists(cookie_dir):
                     os.makedirs(cookie_dir, exist_ok=True)
                 self.cookie_jar.save(ignore_discard=True, ignore_expires=True)
+                os.chmod(self.cookie_path, 0o600)  # It is Deeper's admin session: like the passwords, owner only
             except Exception as e:
                 logger.debug(f"Could not save cookies: {e}")
             return True
@@ -1116,11 +1118,14 @@ class DeeperClient:
     def list_tunnels(self):
         return self._api("/api/smartRoute/listTunnels")
 
-    def get_routed_domains(self):
-        """Fetches smart-routed domains from Deeper Connect to use as live canaries."""
+    def get_routed_domains(self, strict=False):
+        """Fetches smart-routed domains from Deeper Connect to use as live canaries. `strict`: an error is raised
+        instead of {} (a check must not take "no rules" for "no domains go through the tunnels")."""
         try:
             items = self.get_whitelist_domains()
         except Exception as e:
+            if strict:
+                raise
             logger.debug(f"Could not auto-discover domains: {e}")
             return {}
         grouped = {}
@@ -1224,6 +1229,7 @@ class DeeperClient:
 
 
 _SHARED = {"params": None, "client": None}
+CLI_DEEPER = {"host": None, "password": None}  # --host / --password: over the settings, for every Deeper session
 _SHARED_LOCK = threading.Lock()
 
 
@@ -1231,9 +1237,11 @@ def shared_client():
     """One Deeper session for the web UI, the node watcher and comparisons instead of a login check per
     request. A new one when the address, login or password changes in the settings."""
     with _SHARED_LOCK:
-        params = (DEEPER_HOST, DEEPER_USER, DEEPER_PASS)
+        params = (CLI_DEEPER["host"] or DEEPER_HOST, DEEPER_USER, CLI_DEEPER["password"] or DEEPER_PASS)
         if _SHARED["params"] != params:
-            _SHARED.update(params=params, client=DeeperClient(host=DEEPER_HOST, username=DEEPER_USER, password=DEEPER_PASS))
+            if _SHARED["params"]:
+                logger.info(f"Параметры подключения к Deeper Connect изменены ({params[0]}), переподключение...")
+            _SHARED.update(params=params, client=DeeperClient(*params))
         return _SHARED["client"]
 
 
@@ -1301,8 +1309,8 @@ def read_body(sock, first, limit, timeout):
                 if time.monotonic() >= deadline:
                     return slow
                 raise
-            if not chunk:  # Connection: close — the whole answer came
-                return None
+            if not chunk:  # Connection: close — the whole answer came, unless it is shorter than it said
+                return Stall(f"обрыв загрузки на {len(buf) // 1024} КБ", True) if sized and len(buf) < need else None
             buf += chunk
     except (OSError, ssl.SSLError):
         return Stall(f"обрыв загрузки на {len(buf) // 1024} КБ", sized)
@@ -2857,7 +2865,13 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
         failover_empty_tunnels(client, tunnels)
     except Exception as e:
         logger.error(f"Ошибка переноса из пустого туннеля: {e}")
-    routed_domains = client.get_routed_domains()  # After failover: rules may have moved
+    try:
+        routed_domains = client.get_routed_domains(strict=True)  # After failover: rules may have moved
+    except Exception as e:
+        # Without the rules every tunnel would look like one without domains: its failures would be reset
+        logger.error(f"Failed to fetch Smart Route rules from Deeper Connect: {e}")
+        STATUS["error"] = f"Не удалось получить правила Smart Route: {e}"
+        return
 
     # A tunnel added in Deeper joins monitoring by itself, also when the monitored list is set explicitly
     codes = [t.get("tunnelCode") for t in tunnels if t.get("tunnelCode")]
@@ -4076,13 +4090,14 @@ GROUPS.forEach((g,gi)=>{
     c.onchange=()=>{input.value=[...list.querySelectorAll("[data-cat]")].filter(x=>x.checked).map(x=>x.dataset.cat).join(",")};
     list.append(el("label",{class:"mc-row"},c,el("span",{},el("b",{text:title}),el("small",{text:sub}))))}
    card.append(el("div",{class:"row block","data-field":key},el("div",{class:"row-text"},el("label",{text:label})),list,input));continue}
-  if(type==="webauth"){const inp=el("input",{type:"password",class:"field",placeholder:"Новый пароль",autocomplete:"new-password","aria-label":"Новый пароль"});
+  if(type==="webauth"){const old=el("input",{type:"password",class:"field",placeholder:"Текущий пароль",autocomplete:"current-password","aria-label":"Текущий пароль"});
+   const inp=el("input",{type:"password",class:"field",placeholder:"Новый пароль",autocomplete:"new-password","aria-label":"Новый пароль"});
    const set=el("button",{type:"button",class:"btn"},"Сменить"),out=el("button",{type:"button",class:"btn danger"},"Выйти везде");
-   set.onclick=async()=>{try{await api("/api/password",{password:inp.value});inp.value="";toast("Пароль изменён, остальные устройства вышли")}catch(e){toastErr(e)}};
+   set.onclick=async()=>{try{await api("/api/password",{old_password:old.value,password:inp.value});old.value=inp.value="";toast("Пароль изменён, остальные устройства вышли")}catch(e){toastErr(e)}};
    out.onclick=async()=>{if(!await ask("Выйти на всех устройствах?","Пароль спросят заново везде, и на этом устройстве тоже.",{ok:"Выйти",danger:true}))return;
     try{await api("/api/logout",{everywhere:true})}catch(e){}location.reload()};
-   fetch("api/auth",{cache:"no-store"}).then(r=>r.json()).then(d=>{if(d.from_env){inp.disabled=set.disabled=true;inp.placeholder="Задан в .env (WEB_PASSWORD)"}}).catch(()=>{});
-   card.append(el("div",{class:"row block"},el("div",{class:"row-text"},el("label",{text:label})),el("div",{class:"addrow"},inp,set)),
+   fetch("api/auth",{cache:"no-store"}).then(r=>r.json()).then(d=>{if(d.from_env){old.disabled=inp.disabled=set.disabled=true;inp.placeholder="Задан в .env (WEB_PASSWORD)"}}).catch(()=>{});
+   card.append(el("div",{class:"row block"},el("div",{class:"row-text"},el("label",{text:label})),el("div",{class:"addrow"},old,inp,set)),
     el("div",{class:"row"},el("div",{class:"row-text"},el("label",{text:"Выйти на всех устройствах"}),el("div",{class:"help",text:"Включая это"})),el("div",{class:"row-ctl"},out)));continue}
   if(type==="appbtn"){const b=el("button",{type:"button",class:"btn gray"},icon("bell"),"Настроить");b.onclick=()=>window.DWApp.openSettings();
    card.append(el("div",{class:"row"},el("div",{class:"row-text"},el("label",{text:label}),el("div",{class:"help",text:help})),el("div",{class:"row-ctl"},b)));continue}
@@ -4726,7 +4741,7 @@ const I18N=[
 ["Диагностика","Diagnostics","诊断"],["Выбрать все","Select all","全选"],["Выйти везде","Log out everywhere","全部退出"],["Все туннели","All tunnels","所有隧道"],["Включая это","Including this one","包括此设备"],
 ["Нужно войти","Sign-in required","需要登录"],["Поиск сайта","Find a site","查找网站"],["Сравнить все","Compare all","全部比较"],["Новый сервис","New service","新服务"],["Диагностика…","Diagnosing…","诊断中…"],
 ["О чём писать","What to report","通知内容"],["По умолчанию","Default","默认"],["Скачать файл","Download file","下载文件"],["Сменить ноду","Change node","更换节点"],["Показать все","Show all","显示全部"],
-["Восстановить","Restore","恢复"],["Новый пароль","New password","新密码"],["(как у всех)","(same as all)","(同全局)"],["Письма-отчёты","Email reports","邮件报告"],["По соединению","By connection","按连接"],
+["Восстановить","Restore","恢复"],["Новый пароль","New password","新密码"],["Текущий пароль","Current password","当前密码"],["(как у всех)","(same as all)","(同全局)"],["Письма-отчёты","Email reports","邮件报告"],["По соединению","By connection","按连接"],
 ["Журнал очищен","Log cleared","日志已清空"],["Удалить домен","Delete domain","删除域名"],["Новый сервис…","New service…","新服务…"],["Для порта 465","For port 465","用于端口 465"],["Введите домен","Enter a domain","输入域名"],
 ["Не проверяется","Not checked","未检测"],["Будет добавлен","Will be added","将被添加"],["сейчас нет нод","no nodes now","当前无节点"],["Сброс настроек","Reset settings","重置设置"],["Ноды появились","Nodes are back","节点已出现"],
 ["Идёт сравнение","Comparison running","正在比较"],["Тестовые сайты","Test sites","测试网站"],["Проверка почты","Email test","邮件测试"],["Загрузить файл","Upload file","上传文件"],["⚠ разные страны","⚠ different countries","⚠ 不同国家"],
@@ -5075,6 +5090,40 @@ def password_is_set():
     return bool(WEB_PASSWORD) or bool(load_auth().get("hash"))
 
 
+LOGIN_FAILS = {}  # ip -> (wrong passwords in a row, time of the last one)
+LOGIN_FAILS_LOCK = threading.Lock()
+LOGIN_MAX_FAILS = 5  # Wrong passwords from one address before it waits LOGIN_LOCK_SECONDS
+LOGIN_LOCK_SECONDS = 60
+
+
+def login_blocked(ip):
+    """Too many wrong passwords from this address lately: no more tries for a while. The server answers many
+    requests at once, so a pause per request alone wouldn't slow down guessing."""
+    with LOGIN_FAILS_LOCK:
+        n, at = LOGIN_FAILS.get(ip, (0, 0))
+        return n >= LOGIN_MAX_FAILS and time.time() - at < LOGIN_LOCK_SECONDS
+
+
+def note_login(ip, ok):
+    now = time.time()
+    with LOGIN_FAILS_LOCK:
+        for k in [k for k, (_, at) in LOGIN_FAILS.items() if now - at >= LOGIN_LOCK_SECONDS]:
+            del LOGIN_FAILS[k]
+        if ok:
+            LOGIN_FAILS.pop(ip, None)
+        else:
+            LOGIN_FAILS[ip] = (LOGIN_FAILS.get(ip, (0, 0))[0] + 1, now)
+
+
+def checked_password(ip, password):
+    """password_ok with the limit on wrong passwords from one address."""
+    if login_blocked(ip):
+        return False
+    ok = password_ok(password)
+    note_login(ip, ok)
+    return ok
+
+
 def password_ok(password):
     if WEB_PASSWORD:
         return hmac.compare_digest(password, WEB_PASSWORD)
@@ -5201,7 +5250,8 @@ class SettingsHandler(BaseHTTPRequestHandler):
         header = self.headers.get("Authorization", "")
         if header.startswith("Basic ") and password_is_set():
             try:
-                return password_ok(base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[-1])
+                return checked_password(self.client_address[0],
+                                        base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[-1])
             except Exception:
                 return False
         return False
@@ -5231,7 +5281,10 @@ class SettingsHandler(BaseHTTPRequestHandler):
             log_event("info", "Задан пароль веб-интерфейса", mail="changes")
             return self._send(200, {"ok": True}, headers={"Set-Cookie": session_cookie(token)}) or True
         if self.path == "/api/login":
-            if not isinstance(password, str) or not password_is_set() or not password_ok(password):
+            ip = self.client_address[0]
+            if login_blocked(ip):
+                return self._send(429, {"error": f"Слишком много неверных паролей: попробуйте через {LOGIN_LOCK_SECONDS} с"}) or True
+            if not isinstance(password, str) or not password_is_set() or not checked_password(ip, password):
                 time.sleep(1)  # Slows down guessing
                 return self._send(403, {"error": "Неверный пароль"}) or True
             token = new_session()
@@ -5336,8 +5389,9 @@ class SettingsHandler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        # Requiring JSON forces a CORS preflight, so other sites can't post here
-        if "application/json" not in self.headers.get("Content-Type", ""):
+        # Requiring JSON forces a CORS preflight, so other sites can't post here. The type itself, not a part of the
+        # header: "text/plain; x=application/json" needs no preflight
+        if self.headers.get("Content-Type", "").split(";")[0].strip().lower() != "application/json":
             return self._send(415, {"error": "expected application/json"})
         try:
             length = int(self.headers.get("Content-Length", 0))
@@ -5354,6 +5408,12 @@ class SettingsHandler(BaseHTTPRequestHandler):
             password = body.get("password") if isinstance(body, dict) else None
             if WEB_PASSWORD:
                 return self._send(400, {"error": "Пароль задан в .env (WEB_PASSWORD): меняется там"})
+            # A session alone isn't enough: a phone left unlocked must not lock its owner out
+            old = body.get("old_password") if isinstance(body, dict) else None
+            if login_blocked(self.client_address[0]):
+                return self._send(429, {"error": f"Слишком много неверных паролей: попробуйте через {LOGIN_LOCK_SECONDS} с"})
+            if not isinstance(old, str) or not checked_password(self.client_address[0], old):
+                return self._send(403, {"error": "Неверный текущий пароль"})
             if not isinstance(password, str) or len(password) < MIN_PASSWORD:
                 return self._send(400, {"error": f"Пароль не короче {MIN_PASSWORD} символов"})
             session = self._session()
@@ -5364,7 +5424,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
             session = self._session()
             with AUTH_LOCK:
                 a = load_auth()
-                if body.get("everywhere"):
+                if isinstance(body, dict) and body.get("everywhere"):
                     a["sessions"] = {}
                 elif session:
                     a["sessions"].pop(token_key(session), None)
@@ -5999,11 +6059,8 @@ def main():
             print("Ошибка отправки! Проверьте параметры SMTP в веб-интерфейсе или в файле .env.")
         return
 
-    def client_params():
-        return (args.host or DEEPER_HOST, DEEPER_USER, args.password or DEEPER_PASS)
-
-    host, user, password = client_params()
-    client = DeeperClient(host=host, username=user, password=password)
+    CLI_DEEPER.update(host=args.host, password=args.password)
+    client = shared_client()
 
     if args.switch:
         tunnels = client.list_tunnels()
@@ -6061,7 +6118,6 @@ def main():
             logger.info(f"Удалены устаревшие настройки: {', '.join(old)}")
         logger.info(f"Запуск Deeper Watchdog в режиме демона (интервал: {args.interval or CHECK_INTERVAL}с, "
                     f"порог задержки: {args.max_latency or MAX_LATENCY_MS}мс, сбоев до восстановления: {FAIL_THRESHOLD})...")
-        last_params = client_params()
         last_run = None
         while True:
             # Interval is re-read every tick so changes from the web UI apply without a restart
@@ -6074,14 +6130,10 @@ def main():
                 CHECK_ONLY.clear()
                 CHECK_ALL[0] = False
                 user, USER_CHECK[0] = USER_CHECK[0], False
-                if client_params() != last_params:
-                    last_params = client_params()
-                    host, user, password = last_params
-                    logger.info(f"Параметры подключения к Deeper Connect изменены ({host}), переподключение...")
-                    client = DeeperClient(host=host, username=user, password=password)
                 try:
                     with route_turn("Проверка туннелей" if only is None else f"Проверка {', '.join(sorted(only))}"):
-                        run_watchdog_iteration(client, max_latency_ms=args.max_latency, only=only, user=user)
+                        # The web UI's session: a new one once the address or password changes in the settings
+                        run_watchdog_iteration(shared_client(), max_latency_ms=args.max_latency, only=only, user=user)
                 except Exception as e:
                     logger.error(f"Ошибка итерации: {e}")
                 if only is None:

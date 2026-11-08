@@ -35,7 +35,7 @@ import android.widget.Toast;
 
 /** The Deeper Watchdog web interface in a WebView: the sign-in stays (cookies), files download and upload. */
 public class MainActivity extends Activity {
-    static final String DEFAULT_URL = "http://192.168.31.10:8787/";
+    static final String EXAMPLE_URL = "http://192.168.1.10:8787/";  // A hint only: every home network has its own address
     static final String ACTION_SETTINGS = "com.escvratar.deeperwatchdog.SETTINGS";
     private static final int FILE_REQUEST = 1;
     private static final int INSTALL_REQUEST = 3;
@@ -51,7 +51,7 @@ public class MainActivity extends Activity {
     }
 
     static String baseUrl(Context c) {
-        return prefs(c).getString("url", DEFAULT_URL);
+        return prefs(c).getString("url", "");
     }
 
     private boolean night() {
@@ -270,9 +270,9 @@ public class MainActivity extends Activity {
         url.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         url.setSingleLine(true);
         url.setText(baseUrl(this));
-        url.setHint(DEFAULT_URL);
+        url.setHint(EXAMPLE_URL);
         TextView help = new TextView(this);
-        help.setText("Адрес веб-интерфейса Deeper Watchdog. Дома: http://192.168.31.10:8787. Через доменное имя "
+        help.setText("Адрес веб-интерфейса Deeper Watchdog, например " + EXAMPLE_URL + ". Через доменное имя "
                 + "(например https://имя.synology.me/) приложение и уведомления работают и вне дома.");
         help.setTextSize(13);
         CheckBox notify = new CheckBox(this);
@@ -307,7 +307,11 @@ public class MainActivity extends Activity {
                 .setView(scroll)
                 .setPositiveButton("Сохранить", (d, w) -> {
                     String u = url.getText().toString().trim();
-                    if (u.isEmpty()) u = DEFAULT_URL;
+                    if (u.isEmpty()) {
+                        android.widget.Toast.makeText(this, "Укажите адрес веб-интерфейса", android.widget.Toast.LENGTH_LONG).show();
+                        if (!prefs(this).contains("url")) showStart();
+                        return;
+                    }
                     if (!u.startsWith("http://") && !u.startsWith("https://")) u = "http://" + u;
                     if (!u.endsWith("/")) u += "/";
                     boolean on = notify.isChecked();

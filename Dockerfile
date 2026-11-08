@@ -1,7 +1,7 @@
 FROM python:3.11-alpine
 
-# openssl: RSA encryption of the Deeper Connect password; tzdata: local time in logs and the web UI
-RUN apk add --no-cache openssl tzdata
+# tzdata: local time in logs and the web UI (the Deeper password is encrypted in pure Python)
+RUN apk add --no-cache tzdata
 
 WORKDIR /app
 COPY deeper_watchdog.py /app/deeper_watchdog.py

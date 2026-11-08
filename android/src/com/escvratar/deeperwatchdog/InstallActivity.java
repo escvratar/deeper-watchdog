@@ -107,7 +107,7 @@ public class InstallActivity extends Activity {
         TextView s1 = text("Устройство", 17, true);
         s1.setPadding(0, dp(18), 0, 0);
         form.addView(s1);
-        host = field(form, "IP-адрес или имя устройства", "", "например 192.168.31.10", t | InputType.TYPE_TEXT_VARIATION_URI);
+        host = field(form, "IP-адрес или имя устройства", "", "например 192.168.1.10", t | InputType.TYPE_TEXT_VARIATION_URI);
         sshPort = field(form, "Порт SSH", "22", "22", num);
         user = field(form, "Пользователь SSH", "root", "root или администратор NAS", t);
         sshPass = field(form, "Пароль SSH (он же для sudo)", "", "", pass);
@@ -243,8 +243,33 @@ public class InstallActivity extends Activity {
         return "Ошибка SSH: " + m;
     }
 
+    /** Asks on the screen whether to trust the device's SSH key; called from the install thread, waits for the answer.
+     *  Without this anyone answering at the device's address in the network would get the passwords. */
+    private boolean confirmKey(String message) {
+        boolean changed = message.contains("CHANGED");
+        String fp = message.replaceAll("(?s).*?((SHA256|MD5):\\S+).*", "$1");
+        String text = (changed
+                ? "Ключ устройства ИЗМЕНИЛСЯ с прошлого подключения. Так бывает после переустановки системы, "
+                  + "но может быть и подмена устройства в сети. Продолжайте, только если знаете причину.\n\n"
+                : "Первое подключение к этому устройству. Пароли будут отправлены только после вашего согласия.\n\n")
+                + "Отпечаток ключа:\n" + fp + "\n\nЕго можно сверить на устройстве: ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub";
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        boolean[] yes = {false};
+        runOnUiThread(() -> new android.app.AlertDialog.Builder(this)
+                .setTitle(changed ? "Ключ устройства изменился" : "Проверка устройства")
+                .setMessage(text)
+                .setCancelable(false)
+                .setPositiveButton("Доверять", (d, w) -> { yes[0] = true; latch.countDown(); })
+                .setNegativeButton("Отмена", (d, w) -> latch.countDown())
+                .show());
+        try { latch.await(); } catch (InterruptedException e) { return false; }
+        add(yes[0] ? "✓ Ключ устройства принят: " + fp : "✗ Ключ устройства не принят, пароли не отправлены",
+                yes[0] ? GREEN : RED, false);
+        return yes[0];
+    }
+
     /** Answers the device's password questions (plain password and keyboard-interactive, as DSM asks). */
-    private static class Answers implements com.jcraft.jsch.UserInfo, com.jcraft.jsch.UIKeyboardInteractive {
+    private class Answers implements com.jcraft.jsch.UserInfo, com.jcraft.jsch.UIKeyboardInteractive {
         private final String password;
         private int asked;  // One try: repeating a wrong password only gets "too many authentication failures"
         Answers(String password) { this.password = password; }
@@ -252,7 +277,8 @@ public class InstallActivity extends Activity {
         public String getPassword() { return password; }
         public boolean promptPassword(String m) { return asked++ < 1; }
         public boolean promptPassphrase(String m) { return false; }
-        public boolean promptYesNo(String m) { return true; }
+        // A new or changed device key, before any password is sent: the user decides
+        public boolean promptYesNo(String m) { return confirmKey(m); }
         public void showMessage(String m) { }
         public String[] promptKeyboardInteractive(String dest, String name, String instruction, String[] prompt, boolean[] echo) {
             if (asked++ >= 1) return null;
@@ -273,11 +299,14 @@ public class InstallActivity extends Activity {
         try {
             add("▸ Подключение к " + u + "@" + h + ":" + sp, 0, true);
             JSch jsch = new JSch();
+            // Keys of devices the user trusted: a changed one is asked about again, before any password goes out
+            java.io.File known = new java.io.File(getFilesDir(), "known_hosts");
+            if (!known.exists()) known.createNewFile();
+            jsch.setKnownHosts(known.getPath());
             s = jsch.getSession(u, h, sp);
             s.setPassword(p);
             Properties cfg = new Properties();
-            // A home device: its key is taken on first use (shown below), there is no earlier key to compare with
-            cfg.put("StrictHostKeyChecking", "no");
+            cfg.put("StrictHostKeyChecking", "ask");
             cfg.put("PreferredAuthentications", "password,keyboard-interactive");
             s.setConfig(cfg);
             s.setUserInfo(new Answers(p));
