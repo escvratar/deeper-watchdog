@@ -112,6 +112,11 @@ SETTINGS_SCHEMA = {
     # One "service_key=CODE1,CODE2,..." per line: preferred tunnels, the first one first. A service that works badly
     # goes to the next of them, to other tunnels only when none of them works for it, and comes back up the list
     "PREFERRED_TUNNELS": ("text", "", None, None),
+    # Best mode instead of the ladder: the service is measured in each of its preferred tunnels every
+    # BEST_CHECK_MINUTES and stays in the one where it works best (best_mode). For all of them, or the listed ones
+    "BEST_PREFERRED": ("bool", "false", None, None),
+    "BEST_SERVICES": ("str", "", None, None),
+    "BEST_CHECK_MINUTES": ("int", "60", 10, 1440),
     # How services are checked unless set per service: "page" (an HTTPS request, as a browser makes) or "tcp" (only
     # the TCP handshake: for services that work but don't answer the check's request through some nodes)
     "CHECK_METHOD": ("choice", "page", ("page", "tcp"), None),
@@ -791,6 +796,7 @@ AUTO_STATE.setdefault("manual_away", {})  # key -> {"to", "at"}: preferred servi
 AUTO_STATE.setdefault("bad_ips", {})  # key -> {code: {ip: when}}: nodes a service had to leave for working badly
 AUTO_STATE.setdefault("node_bad", {})  # code -> {ip: when}: nodes the tunnel was switched away from (note_node_bad)
 AUTO_STATE.setdefault("hosts", {})  # host -> {"seen": last answer through any tunnel, "good": last non-error status}
+AUTO_STATE.setdefault("best", {})  # key -> {"at", "scores": {code: {"ms", "loss", "ip", "at", ...}}}: best mode's measurements
 # Only preferred services come back; auto ones stay where a failover took them
 AUTO_STATE["evacuated"] = {k: e for k, e in AUTO_STATE["evacuated"].items() if k in preferred_tunnels()}
 # How long tunnels have been green survives a short restart (an update, a container restart): saved after every
@@ -1775,13 +1781,101 @@ def next_target(key, exclude, tunnels):
     it, any other tunnel (failover_target)."""
     exclude = {exclude} if isinstance(exclude, str) else set(exclude)
     by_code = {t.get("tunnelCode"): t for t in tunnels}
-    for c in preferred_tunnels().get(key, []):
-        t = by_code.get(c) or {}
-        if c in exclude or t.get("activeNum", 0) == 0 or t.get("activeIp") in bad_ips(key, c) \
-                or not (STATUS["tunnels"].get(c) or {}).get("healthy", True):
-            continue
-        return c
+    ok = [c for c in preferred_tunnels().get(key, [])
+          if c not in exclude and (by_code.get(c) or {}).get("activeNum", 0) > 0
+          and by_code[c].get("activeIp") not in bad_ips(key, c) and (STATUS["tunnels"].get(c) or {}).get("healthy", True)]
+    if ok:
+        return best_of(key, ok) if best_mode(key) else ok[0]
     return failover_target(key, exclude, tunnels)
+
+
+def best_mode(key):
+    """Best mode (BEST_PREFERRED for all, BEST_SERVICES for some): the service stays in whichever of its preferred
+    tunnels works best for it, measured every BEST_CHECK_MINUTES (measure_preferred). Otherwise the list is a ladder."""
+    return (BEST_PREFERRED or key in listed(BEST_SERVICES)) and len(preferred_tunnels().get(key, [])) > 1
+
+
+def best_of(key, codes):
+    """Of these preferred tunnels (in list order), the one where the service measured best on the tunnel's current
+    node within the last two rounds; the first of them when none has such a score."""
+    scores = (AUTO_STATE["best"].get(key) or {}).get("scores", {})
+    fresh = [c for c in codes if (scores.get(c) or {}).get("ms") is not None and scores[c].get("ip") == tunnel_ip(c)
+             and time.time() - scores[c].get("at", 0) < 2 * BEST_CHECK_MINUTES * 60]
+    return fastest(fresh, lambda c: scores[c]["ms"], lambda c: scores[c]["loss"]) if fresh else codes[0]
+
+
+def best_due():
+    """The best-mode service waiting longest for its measurement, or None."""
+    now, due = time.time(), []
+    for k in preferred_tunnels():
+        at = (AUTO_STATE["best"].get(k) or {}).get("at", 0)
+        if best_mode(k) and now - at >= BEST_CHECK_MINUTES * 60 and not held(k) \
+                and k not in AUTO_STATE["manual_away"] and not app_follower(k):
+            due.append((at, k))
+    return min(due)[1] if due else None
+
+
+def measure_preferred(client, key):
+    """Best mode: measures the service in its tunnel and in each of its other preferred tunnels that has nodes and
+    passes its checks (moved there for a moment, as a comparison does), puts it back and moves it into a tunnel
+    where it works clearly better (pick_better_tunnel). Under ROUTE_LOCK."""
+    name = key.split(":", 1)[-1]
+    with STATE_LOCK:
+        old = AUTO_STATE["best"].get(key) or {}
+        AUTO_STATE["best"][key] = dict(old, at=time.time())  # Not again every tick if this fails
+    by_code = {t.get("tunnelCode"): t for t in client.list_tunnels()}
+    if key.startswith("app:"):
+        info = client.get_apps().get(name) or {}
+        if not info.get("website"):
+            return
+        base, urls = info.get("tunnel"), [info["website"]]
+        move_to, restore = (lambda t: client.set_app_tunnel(name, t)), (lambda: client.set_app_tunnel(name, base))
+    else:
+        rules = [{"domain": i.get("domainName"), "tunnel": i.get("tunnelCode")} for i in client.get_whitelist_domains()]
+        g = next((g for g in service_groups(rules) if g["key"] == key), None)
+        if g is None or g["split"]:
+            return
+        base, urls = g["main"], [f"https://{d['domain']}" for d in g["domains"][:COMPARE_GROUP_DOMAINS]]
+        move_to, restore = group_mover(client, g)
+    codes = preferred_tunnels().get(key, [])
+    if base not in codes:
+        return  # Away from its list: enforce_preferred brings it back first
+    usable = [c for c in codes if (by_code.get(c) or {}).get("activeNum", 0) > 0
+              and by_code[c].get("activeIp") not in bad_ips(key, c) and (STATUS["tunnels"].get(c) or {}).get("healthy", True)]
+    usable = sorted(usable, key=lambda c: c != base)  # Where it is first: measured in place
+    tcp_only, pings, moved = check_method(key) != "page", {}, False
+    with MOVE_LOCK:
+        try:
+            for c in usable:
+                if c != base:
+                    if not move_to(c):
+                        continue
+                    moved = True
+                    time.sleep(ROUTE_SETTLE)
+                pings[c] = dict(measure_urls(urls, COMPARE_SAMPLES, tcp_only), ip=by_code[c].get("activeIp"), at=time.time())
+                logger.info(f"Лучший туннель для {name}: {c} {fmt_ms(pings[c]['ms'])}, потери {pings[c]['loss']:.0%}")
+        finally:
+            back = not moved or restore()
+        with STATE_LOCK:
+            AUTO_STATE["best"][key] = {"at": time.time(), "scores": pings}
+        to = pick_better_tunnel(pings, base) if back and base in pings else None
+        if not back:
+            log_event("bad", f"{name}: не удалось вернуть в {base} после замеров в предпочтительных туннелях", mail="rollback")
+        elif to and not move_to(to):
+            log_event("bad", f"{name}: не удалось перенести в {to}, где ему лучше")
+        elif to:
+            mark_moved(key)
+            with STATE_LOCK:
+                AUTO_STATE["evacuated"].pop(key, None)
+                AUTO_STATE["tours"].pop(key, None)
+            text = f"{name}: перенесён из {base} в {to}, там лучше: {fmt_ms(pings[to]['ms'])} против {fmt_ms(pings[base]['ms'])}"
+            logger.info(text)
+            log_event("ok", text)
+        save_auto_state()
+        if moved or to:
+            client.get_routed_domains()
+            client.refresh_apps_cache()
+            follow_apps(client)
 
 
 def mark_moved(key):
@@ -1966,6 +2060,8 @@ def enforce_preferred(client, green_since, only=None):
     service moves only up its list: from a lower preferred tunnel or from any other one. `only`: the user just set
     the mode of these services, they go to the first of their tunnels that has nodes right away."""
     now, todo = time.time(), {}
+    if LINK_APP_GROUPS and configured_apps() and not ROUTES["apps"]:
+        client.refresh_apps_cache()  # Not known yet whom services follow: they'd climb their list, then follow back
     for k, codes in preferred_tunnels().items():
         if only is not None and k not in only:
             continue
@@ -1975,21 +2071,26 @@ def enforce_preferred(client, green_since, only=None):
             continue  # Goes with its app: its own list waits until it is unlinked
         evac = AUTO_STATE["evacuated"].get(k) or {}
         left = evac.get("left") or ({evac["from"]: evac.get("at", 0)} if evac.get("from") else {})
+        ready = []
         for c in codes:
             if c not in green_since:
                 continue
             if only is not None:
-                todo[k] = c
+                ready.append(c)
                 break
             if tunnel_ip(c) in bad_ips(k, c):
                 continue  # Back only to another node: the one it left worked badly for it
             if c in left:
-                ready = now - max(green_since[c], left[c]) >= evac.get("wait", PREFERRED_RETURN_AFTER)
+                ok = now - max(green_since[c], left[c]) >= evac.get("wait", PREFERRED_RETURN_AFTER)
             else:
-                ready = now - green_since[c] >= NODES_STABLE
-            if ready:
-                todo[k] = c
-                break
+                ok = now - green_since[c] >= NODES_STABLE
+            if ok:
+                ready.append(c)
+                if not best_mode(k):
+                    break
+        if ready:
+            # Best mode: out of its list it comes back to the one it measured best in (best_of), within it it stays
+            todo[k] = best_of(k, ready) if only is None else ready[0]
     if not todo or COMPARE["running"]:
         return
     with MOVE_LOCK:
@@ -2006,6 +2107,8 @@ def _enforce_preferred(client, todo):
         name = key.split(":", 1)[-1]
         codes = prefs.get(key) or [code]
         rank = lambda c: codes.index(c) if c in codes else len(codes)
+        if best_mode(key):
+            rank = lambda c: 0 if c in codes else 1  # Any tunnel of its list is as good as the target
         if key.startswith("app:"):
             cur = (apps.get(name) or {}).get("tunnel")
             if cur is None or rank(cur) <= rank(code):
@@ -2026,7 +2129,7 @@ def _enforce_preferred(client, todo):
             mark_moved(key)
             with STATE_LOCK:
                 AUTO_STATE["tours"].pop(key, None)  # A new node: a fresh start
-                if code == codes[0] or not left:
+                if code == codes[0] or not left or best_mode(key):
                     AUTO_STATE["evacuated"].pop(key, None)
                 else:
                     rest = {c: t for c, t in left.items() if rank(c) < rank(code)}
@@ -2038,7 +2141,7 @@ def _enforce_preferred(client, todo):
                     AUTO_STATE["returned"][key] = {"at": time.time(), "wait": evac.get("wait", PREFERRED_RETURN_AFTER)}
             changed = True
             where = "в предпочтительный туннель" if len(codes) == 1 else \
-                "в главный предпочтительный туннель" if code == codes[0] else f"в предпочтительный туннель №{rank(code) + 1}"
+                "в главный предпочтительный туннель" if code == codes[0] else f"в предпочтительный туннель №{codes.index(code) + 1}"
             logger.info(f"{name}: {cur} -> {where} {code}")
             log_event("ok", f"{name}: вернулся из {cur} в {code}, он в норме {span(evac.get('wait', 0))}" if code in left
                       else f"{name}: перенесён из {cur} {where} {code}", mail="nodes_back")
@@ -3821,7 +3924,7 @@ body[data-view="dark"] .tcard.st-warn{box-shadow:0 0 0 1px rgba(255,165,36,.22),
 
 <script>
 const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые сайты":["globe","#30b0c7"],"Приложения":["grid","#5856d6"],"Вид":["chart","#ff9f0a"],"Телефон":["bell","#34c759"],
- "Перестроение туннелей":["refresh","#ff9500"],
+ "Перестроение туннелей":["refresh","#ff9500"],"Предпочтительные туннели":["pin","#ff3b30"],
  "Резервные копии и перенос":["archive","#8e8e93"],"Доступ":["lock","#34c759"],"Почта":["mail","#1e8cff"],"Журнал":["clock","#ff2d55"],"Deeper Connect":["shield","#af52de"]};
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
@@ -3838,6 +3941,9 @@ const GROUPS=[
     ["fast","Быстрый уход очень плохих","Как «Сначала уезжают плохие», и сервис без ответа или вдвое медленнее допустимого уезжает уже после одной проверки"],
     ["stats","Только статистика","Туннель оценивается по доменам, как раньше, но сервисы, у которых уже сбой, не портят его пинг и статус"]]],
   ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Туннель не прошёл столько проверок подряд, и в нём больше одной ноды — меняется нода и туннель проверяется заново. Его сервисы ждут смены ноды и уезжают, только если не помогло"]]},
+ {title:"Предпочтительные туннели",foot:"Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 200 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка. На время замера сервис ненадолго переносится в другие туннели.",fields:[
+  ["BEST_PREFERRED","switch","Лучший из списка для всех","Выключено — лестница по порядку списка, лучший из списка только у сервисов, где он включён в меню режима. Включено — у всех сервисов с несколькими предпочтительными туннелями"],
+  ["BEST_CHECK_MINUTES","number","Замеры в туннелях списка, раз в, мин","Как часто сервис в режиме «Лучший из списка» меряется в каждом своём туннеле, 10–1440"]]},
  {title:"Вид",fields:[
   ["UI_VIEW","choice","Вид главной страницы","Как показывать обзор. Язык меняется кнопками RU / EN / 中文 в шапке",
    [["standard","Стандартный","Карточки туннелей, как раньше"],["table","Пульт управления","Сводка и таблица проверяемых туннелей с графиком пинга"],
@@ -4525,9 +4631,13 @@ function renderItems(box,items,results,d){box.textContent="";
   // Several preferred tunnels in order: picked in a dialog, also when the list is already chosen (data-again)
   pg.append(el("option",{value:"__multi","data-ic":"pin","data-again":"1","data-menu":prefs.length>1?"Изменить список…":"Несколько туннелей…",
    "data-short":prefs.length>1?"📌 "+prefs.join(" › "):"Несколько…","data-sub":prefs.length>1?prefs.join(" › "):"По порядку: сначала первый, потом следующие",text:"Несколько"}));
+  const best=(d.best||{})[key];
+  if(prefs.length>1)pg.append(el("option",{value:"__best","data-ic":"sparkle","data-again":"1","data-menu":best?"✓ Лучший из списка":"Лучший из списка",
+   "data-sub":d.best_all?"Включён для всех в настройках":best?"Нажмите, чтобы вернуть порядок списка":"Оставаться в туннеле списка, где лучше всего",text:"Лучший"}));
   sw.append(pg);sw.dataset.tone=mode==="auto"?"on":pin?"pin":"";
   const cur=prefs.length>1?"__multi":pin||(mode==="preferred"?"auto":mode);
   sw.value=cur;sw.onchange=async()=>{
+   if(sw.value==="__best"){sw.value=cur;return d.best_all?toast("Лучший из списка включён для всех в настройках"):saveBest(key,!best,sw)}
    if(sw.value!=="__multi")return saveMode(key,sw.value,sw,cur);
    const list=await pickPreferred(name,prefs.length?prefs:[],d);
    if(list)saveMode(key,list,sw,cur);else sw.value=cur};
@@ -4535,7 +4645,9 @@ function renderItems(box,items,results,d){box.textContent="";
    ?el("span",{class:"chip bad",text:"⚠ "+Object.entries(group.tunnels).map(([t,n])=>`${t} ${n}`).join(" · ")})
    :el("span",{class:"chip",text:tunnelLabel(tunnel)});
   const main=el("div",{class:"li-main"},el("div",{class:"li-title"},name,tchip));
-  if(pin&&ev&&ev.from)main.append(el("div",{class:"warnline"},icon("clock"),ev.new_node
+  if(best&&prefs.includes(tunnel)){const sc=best.scores||{},at=best.at?Math.max(0,Math.round((Date.now()/1000-best.at)/60)):null;
+   main.append(el("div",{class:"warnline"},icon("sparkle"),Object.keys(sc).length?`Лучший из списка: ${Object.entries(sc).map(([c,p])=>`${c} ${p.ms!=null?Math.round(p.ms):"—"}`).join(" · ")}, замер ${at} мин назад`:"Лучший из списка: замеров ещё не было"))}
+  else if(pin&&ev&&ev.from)main.append(el("div",{class:"warnline"},icon("clock"),ev.new_node
    ?`Временно в ${ev.to}: на ноде ${ev.from} ему было плохо. Вернётся, когда в ${ev.from} будет другая нода и она ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`
    :`Временно в ${ev.to}: в ${ev.from} был сбой. Вернётся, когда ${ev.from} ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`));
   else if(pin&&tunnel&&tunnel!==pin&&!(group&&group.split))main.append(el("div",{class:"warnline"},icon("pin"),prefs.includes(tunnel)
@@ -4625,6 +4737,9 @@ function methodSelect(key,name,d){
   if(ms.value!=="__diag")return saveMethod(key,ms.value,ms,own);
   ms.value=own;const m=await diagnoseDialog(key,name,own);if(m!==null&&m!==own)saveMethod(key,m,ms,own)};
  return ms}
+async function saveBest(key,on,sw){sw.disabled=true;
+ try{await api("/api/best",{key,on});toast(`${itemName(key)}: `+(on?"лучший из списка":"по порядку списка"))}
+ catch(e){toastErr(e)}sw.disabled=false;loadRoutes()}
 async function saveMethod(key,method,ms,was){ms.disabled=true;
  try{await api("/api/check-method",{key,method});
   toast(`${itemName(key)}: проверка — ${METHODS[method||routesData.check_method||"page"][0].toLowerCase()}`+(method?"":" (как у всех)"))}
@@ -4859,6 +4974,16 @@ const I18N=[
 ["Как у всех: {0}","Same as all: {0}","同全局：{0}"],["Добавить домены в {0}","Add domains to {0}","添加域名到 {0}"],["Действия с туннелем {0}","Tunnel actions: {0}","隧道操作：{0}"],["{0}: готово","{0}: done","{0}：完成"],
 ["{0} через {1}","{0} via {1}","{0} 经由 {1}"],["{0} · сбой","{0} · failure","{0} · 故障"],["{0} · обход","{0} · bypass","{0} · 绕行"],["{0} · соед.","{0} · conn.","{0} · 连接"],["{0} · выбран","{0} · chosen","{0} · 已选"],["{0} · лучший","{0} · best","{0} · 最佳"],
 ["{0} · сравните","{0} · compare","{0} · 请比较"],["{0} · нет нод","{0} · no nodes","{0} · 无节点"],["{0} (как у всех)","{0} (same as all)","{0}（同全局）"],["Deeper рекомендует: {0}","Deeper recommends: {0}","Deeper 推荐：{0}"],["{0} · {1}","{0} · {1}","{0} · {1}"],
+["Предпочтительные туннели","Preferred tunnels","首选隧道"],["Лучший из списка для всех","Best of the list for all","全部使用列表中最佳"],
+["Замеры в туннелях списка, раз в, мин","Measure in the list's tunnels every, min","在列表隧道中测量，间隔分钟"],
+["Как часто сервис в режиме «Лучший из списка» меряется в каждом своём туннеле, 10–1440","How often a service in the “Best of the list” mode is measured in each of its tunnels, 10–1440","“列表中最佳”模式下的服务在其每个隧道中测量的频率，10–1440"],
+["Выключено — лестница по порядку списка, лучший из списка только у сервисов, где он включён в меню режима. Включено — у всех сервисов с несколькими предпочтительными туннелями","Off: a ladder in the list's order, best of the list only for services where it is on in the mode menu. On: for every service with several preferred tunnels","关闭：按列表顺序逐级切换，仅在模式菜单中启用的服务使用列表中最佳。开启：所有有多个首选隧道的服务"],
+["Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 200 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка. На время замера сервис ненадолго переносится в другие туннели.","Ladder: the service lives in the list's first tunnel, on a failure it goes to the next one and climbs back once the first is fine for 5 minutes. Best of the list: the service is measured in each of its tunnels regularly and stays where it works clearly better (30% and 200 ms faster, or less loss); on a failure it goes to the best one by the last measurements, without them in the list's order. While measured, the service briefly moves to the other tunnels.","逐级：服务位于列表第一个隧道，故障时转到下一个，第一个正常 5 分钟后返回。列表中最佳：定期在每个隧道中测量服务，留在明显更好的隧道（快 30% 且 200 毫秒，或丢包更少）；故障时按最近测量转到最佳隧道，无测量时按列表顺序。测量期间服务会短暂转到其他隧道。"],
+["Лучший из списка","Best of the list","列表中最佳"],["✓ Лучший из списка","✓ Best of the list","✓ 列表中最佳"],["Лучший","Best","最佳"],
+["Включён для всех в настройках","On for all in the settings","已在设置中为全部启用"],["Нажмите, чтобы вернуть порядок списка","Tap to go back to the list's order","点击恢复列表顺序"],
+["Оставаться в туннеле списка, где лучше всего","Stay in the list's tunnel where it works best","留在列表中表现最好的隧道"],["Лучший из списка включён для всех в настройках","Best of the list is on for all in the settings","已在设置中为全部启用列表中最佳"],
+["Лучший из списка: {0}, замер {1} мин назад","Best of the list: {0}, measured {1} min ago","列表中最佳：{0}，{1} 分钟前测量"],["Лучший из списка: замеров ещё не было","Best of the list: not measured yet","列表中最佳：尚未测量"],
+["{0}: лучший из списка","{0}: best of the list","{0}：列表中最佳"],["{0}: по порядку списка","{0}: in the list's order","{0}：按列表顺序"],
 ];
 // Words after a number: "3 домена" → "3 domains"
 const I18N_NOUNS={"нода":["node","个节点"],"ноды":["nodes","个节点"],"нод":["nodes","个节点"],"домен":["domain","个域名"],"домена":["domains","个域名"],"доменов":["domains","个域名"],
@@ -5377,6 +5502,7 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 "follows": {g["key"]: a["app"] for g in service_groups(ROUTES["whitelist"])
                             for a in [app_follower(g["key"])] if a},
                 "methods": service_check_methods(), "check_method": CHECK_METHOD,
+                "best_all": BEST_PREFERRED, "best": {k: AUTO_STATE["best"].get(k) or {} for k in preferred_tunnels() if best_mode(k)},
                 # Tunnels a check judged to have only a minority of bad services: the node stays, those services move
                 "node_verdict": dict(NODE_VERDICT),
             })
@@ -5488,6 +5614,18 @@ class SettingsHandler(BaseHTTPRequestHandler):
                 # Its results by the old method say nothing now: it is judged anew
                 BAD_STREAK.pop(key, None)
                 STAY_PINGS.pop(key, None)
+            self._send(200, {"ok": True})
+        elif self.path == "/api/best":
+            # Best mode for one service (BEST_SERVICES); with BEST_PREFERRED every service with several tunnels has it
+            key, on = (body.get("key"), body.get("on")) if isinstance(body, dict) else (None, None)
+            if not isinstance(key, str) or not key or "," in key or "\n" in key or not isinstance(on, bool):
+                return self._send(400, {"error": "Неверный сервис"})
+            keys = listed(BEST_SERVICES) - {key} | ({key} if on else set())
+            errors = save_settings({"BEST_SERVICES": ",".join(sorted(keys))})
+            if errors:
+                return self._send(400, {"errors": errors})
+            log_event("info", f"{key.split(':', 1)[-1]}: " + ("остаётся в лучшем из предпочтительных туннелей" if on
+                                                            else "предпочтительные туннели по порядку"))
             self._send(200, {"ok": True})
         elif self.path == "/api/diagnose":
             key = body.get("key") if isinstance(body, dict) else None
@@ -6139,6 +6277,14 @@ def main():
                 if only is None:
                     last_run = time.time()
                     next_run = last_run + interval
+            # Best mode: one service per tick, so checks and the user's actions don't wait long
+            due = best_due() if last_run and not COMPARE["running"] else None
+            if due:
+                try:
+                    with route_turn(f"Поиск лучшего туннеля: {due.split(':', 1)[-1]}"):
+                        measure_preferred(shared_client(), due)
+                except Exception as e:
+                    logger.error(f"Ошибка поиска лучшего туннеля для {due}: {e}")
             STATUS["next_run"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(next_run))
             CHECK_NOW.wait(min(5, max(0.1, next_run - time.time())))
     else:

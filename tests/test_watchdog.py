@@ -156,5 +156,85 @@ class CheckWithoutRules(unittest.TestCase):
         self.assertIn("Smart Route", dw.STATUS["error"])
 
 
+class BestMode(unittest.TestCase):
+    KEY = "group:Example"
+    TUNNELS = [{"tunnelCode": c, "activeNum": 2, "activeIp": ip} for c, ip in (("NL", "1.1.1.1"), ("US", "2.2.2.2"))]
+
+    def setUp(self):
+        self.patch = mock.patch.multiple(dw, PREFERRED_TUNNELS=self.KEY + "=NL,US", BEST_PREFERRED=False,
+                                         BEST_SERVICES="", BEST_CHECK_MINUTES=60)
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+        dw.STATUS["tunnels"].clear()
+        dw.ROUTES["all_tunnels"] = [{"code": t["tunnelCode"], "nodes": 2, "ip": t["activeIp"]} for t in self.TUNNELS]
+        now = dw.time.time()
+        dw.AUTO_STATE["best"][self.KEY] = {"at": now, "scores": {
+            "NL": {"ms": 900, "loss": 0, "ip": "1.1.1.1", "at": now}, "US": {"ms": 200, "loss": 0, "ip": "2.2.2.2", "at": now}}}
+        self.addCleanup(dw.AUTO_STATE["best"].pop, self.KEY, None)
+
+    def test_ladder_takes_the_list_order(self):
+        self.assertEqual(dw.next_target(self.KEY, "SG", self.TUNNELS), "NL")
+
+    def test_best_takes_the_fastest_measured(self):
+        dw.BEST_SERVICES = self.KEY
+        self.assertEqual(dw.next_target(self.KEY, "SG", self.TUNNELS), "US")
+        dw.BEST_SERVICES, dw.BEST_PREFERRED = "", True
+        self.assertEqual(dw.next_target(self.KEY, "SG", self.TUNNELS), "US")
+
+    def test_scores_of_another_node_or_stale_dont_count(self):
+        dw.BEST_PREFERRED = True
+        dw.ROUTES["all_tunnels"][1]["ip"] = "9.9.9.9"
+        self.assertEqual(dw.next_target(self.KEY, "SG", self.TUNNELS), "NL")
+        dw.ROUTES["all_tunnels"][1]["ip"] = "2.2.2.2"
+        dw.AUTO_STATE["best"][self.KEY]["scores"]["US"]["at"] -= 3 * 3600
+        self.assertEqual(dw.next_target(self.KEY, "SG", self.TUNNELS), "NL")
+
+    def test_measure_moves_only_when_clearly_better(self):
+        class Apps:
+            tunnel, moves = "NL", []
+
+            def list_tunnels(_):
+                return BestMode.TUNNELS
+
+            def get_apps(c):
+                return {"example": {"tunnel": c.tunnel, "website": "https://example.com"}}
+
+            def set_app_tunnel(c, app, t):
+                c.moves.append(t)
+                c.tunnel = t
+                return True
+
+            def get_routed_domains(_):
+                return {}
+
+            def refresh_apps_cache(_):
+                return {}
+
+            def get_whitelist_domains(_):
+                return []
+
+        key = "app:example"
+        client = Apps()
+        ms = {"NL": 900, "US": 200}
+        with mock.patch.multiple(dw, PREFERRED_TUNNELS=key + "=NL,US", BEST_PREFERRED=True, ROUTE_SETTLE=0, APPS="example"), \
+                mock.patch.object(dw, "measure_urls", lambda urls, n, tcp: {"ms": ms[client.tunnel], "loss": 0, "errors": 0, "status": 200}), \
+                mock.patch.object(dw, "save_auto_state"), mock.patch.object(dw, "log_event"):
+            dw.measure_preferred(client, key)
+            self.assertEqual(client.moves, ["US", "NL", "US"])  # Measured, put back, moved
+            ms["NL"] = 250
+            client.moves.clear()
+            dw.measure_preferred(client, key)
+            self.assertEqual((client.moves, client.tunnel), (["NL", "US"], "US"))  # Not clearly better: stays
+        dw.AUTO_STATE["best"].pop(key, None)
+        dw.AUTO_STATE["moved_at"].pop(key, None)
+
+    def test_due_after_the_interval(self):
+        dw.BEST_PREFERRED = True
+        self.assertIsNone(dw.best_due())
+        dw.AUTO_STATE["best"][self.KEY]["at"] -= 3601
+        with mock.patch.dict(dw.AUTO_STATE["moved_at"], clear=True):
+            self.assertEqual(dw.best_due(), self.KEY)
+
+
 if __name__ == "__main__":
     unittest.main()
