@@ -3710,6 +3710,23 @@ details.doms li>span:last-child{display:inline-flex;align-items:center;gap:6px;m
 .tpings{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
 .tp{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:550;background:var(--fill);border-radius:7px;padding:3px 8px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .tp b{font-weight:700;color:var(--muted)}
+.li-right>.mode,.li-right>.meth{display:contents}
+.bestline{display:flex;flex-wrap:wrap;align-items:center;gap:5px;margin-top:8px;font-size:13px}
+.bestline .ago{margin-left:auto;color:var(--muted);font-size:12.5px;white-space:nowrap;display:inline-flex;align-items:center;gap:8px}
+.rbtn{width:28px;height:28px;border-radius:50%;border:0;padding:0;display:inline-flex;align-items:center;justify-content:center;background:var(--accent-soft);color:var(--accent-text);cursor:pointer;flex:none}
+.rbtn svg{width:15px;height:15px}.rbtn.busy svg{animation:spin .9s linear infinite}.rbtn:disabled{opacity:.6;cursor:default}
+/* Phone: name and check method on top, the mode under it, everything else full width */
+@media (max-width:700px){
+ .li.svc{grid-template-columns:auto minmax(0,1fr) auto;align-items:start;row-gap:0}
+ .li.svc>.check{grid-row:1;grid-column:1;align-self:center}
+ .li.svc .li-main,.li.svc .li-right{display:contents}
+ .li.svc .li-title{grid-row:1;grid-column:2;flex-wrap:nowrap;min-width:0;align-self:center}
+ .li.svc .li-title .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+ .li.svc .meth{display:block;grid-row:1;grid-column:3;align-self:center}
+ .li.svc .mode{display:flex;grid-row:2;grid-column:2/-1;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+ .li.svc .li-main>:not(.li-title){grid-column:2/-1}
+ .li.svc .mode>select:first-child,.li.svc .mode>select:first-child+.popup,.li.svc .mode>.tseg{order:1}
+}
 .warnline{font-size:13px;margin-top:5px;color:var(--orange);display:flex;gap:6px;align-items:center;font-weight:500}
 .tcard .tpick+.popup{width:100%;margin-top:16px}
 .li-right .tsel+.popup{max-width:230px;min-height:28px;padding:4px 8px 4px 11px;border-radius:999px;font-size:13px;font-weight:600}
@@ -4663,11 +4680,13 @@ function renderItems(box,items,results,d){box.textContent="";
   const tchip=group&&group.split
    ?el("span",{class:"chip bad",text:"⚠ "+Object.entries(group.tunnels).map(([t,n])=>`${t} ${n}`).join(" · ")})
    :el("span",{class:"chip",text:tunnelLabel(tunnel)});
-  const main=el("div",{class:"li-main"},el("div",{class:"li-title"},name,tchip));
+  const main=el("div",{class:"li-main"},el("div",{class:"li-title"},el("span",{class:"nm",text:name}),tchip));
   if(best&&prefs.includes(tunnel)){const sc=best.scores||{},at=best.at?Math.max(0,Math.round((Date.now()/1000-best.at)/60)):null;
-   const now=el("button",{type:"button",class:"btn sm",text:"Проверить сейчас"});now.onclick=()=>bestNow(key,now);
-   main.append(el("div",{class:"warnline"},icon("sparkle"),Object.keys(sc).length?`Лучший из списка: ${Object.entries(sc).map(([c,p])=>`${c} ${p.ms!=null?Math.round(p.ms):"—"}`).join(" · ")}, замер ${at} мин назад`:"Лучший из списка: замеров ещё не было"),
-    el("div",{class:"rec"},now))}
+   const now=el("button",{type:"button",class:"rbtn",title:"Проверить сейчас","aria-label":"Проверить сейчас"},icon("refresh"));now.onclick=()=>bestNow(key,now);
+   const ent=Object.entries(sc),top=ent.filter(([,p])=>p.ms!=null).sort((a,b)=>a[1].ms-b[1].ms)[0];
+   main.append(el("div",{class:"bestline",title:"Лучший из списка: замеры в туннелях списка"},
+    ...(ent.length?ent.map(([c,p])=>el("span",{class:"chip"+(top&&top[0]===c?" best":"")+(p.ms==null?" bad":""),text:`${c} ${p.ms!=null?Math.round(p.ms):"—"}`})):[el("span",{class:"muted",text:"Замеров ещё не было"})]),
+    el("span",{class:"ago",title:"Последний замер"},ent.length?`${at} мин`:"",now)))}
   else if(pin&&ev&&ev.from)main.append(el("div",{class:"warnline"},icon("clock"),ev.new_node
    ?`Временно в ${ev.to}: на ноде ${ev.from} ему было плохо. Вернётся, когда в ${ev.from} будет другая нода и она ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`
    :`Временно в ${ev.to}: в ${ev.from} был сбой. Вернётся, когда ${ev.from} ${Math.round((ev.wait||300)/60)} мин подряд будет в норме`));
@@ -4695,9 +4714,9 @@ function renderItems(box,items,results,d){box.textContent="";
    else rec.append(el("span",{class:"muted",text:"Текущий туннель подходит"}));
    main.append(rec)}
   else if(group&&group.split)main.append(moveButtons(key,"Домены в разных странах. Собрать в:",null));
-  const right=el("div",{class:"li-right"},sw,methodSelect(key,name,d));
-  if(mode==="manual"&&!(group&&group.split)){right.classList.add("inline");right.prepend(tunnelSeg(key,tunnel,d))}
-  box.append(el("div",{class:"li"},sel,main,right))}}
+  const modeBox=el("span",{class:"mode"},sw),right=el("div",{class:"li-right"},modeBox,el("span",{class:"meth"},methodSelect(key,name,d)));
+  if(mode==="manual"&&!(group&&group.split)){right.classList.add("inline");modeBox.prepend(tunnelSeg(key,tunnel,d))}
+  box.append(el("div",{class:"li svc"},sel,main,right))}}
 // More tunnels than this don't fit a phone's width as buttons: a pop-up menu instead
 const SEG_MAX=4;
 function tunnelSelect(tunnel,tl,onPick,label){
@@ -4761,9 +4780,9 @@ function methodSelect(key,name,d){
 async function saveBest(key,on,sw){sw.disabled=true;
  try{await api("/api/best",{key,on});toast(`${itemName(key)}: `+(on?"лучший из списка":"по порядку списка"))}
  catch(e){toastErr(e)}sw.disabled=false;loadRoutes()}
-async function bestNow(key,btn){btn.disabled=true;
+async function bestNow(key,btn){btn.disabled=true;btn.classList.add("busy");
  try{await api("/api/best-now",{key});toast(`${itemName(key)}: замер во всех туннелях списка начнётся через несколько секунд`)}
- catch(e){toastErr(e);btn.disabled=false}}
+ catch(e){toastErr(e);btn.disabled=false;btn.classList.remove("busy")}}
 async function saveMethod(key,method,ms,was){ms.disabled=true;
  try{await api("/api/check-method",{key,method});
   toast(`${itemName(key)}: проверка — ${METHODS[method||routesData.check_method||"page"][0].toLowerCase()}`+(method?"":" (как у всех)"))}
@@ -5006,7 +5025,7 @@ const I18N=[
 ["Лучший из списка","Best of the list","列表中最佳"],["Выбрать туннели и оставаться там, где лучше всего","Pick tunnels and stay where it works best","选择隧道并留在表现最好的隧道"],["Для лучшего из списка нужно хотя бы два туннеля","Best of the list needs at least two tunnels","列表中最佳至少需要两个隧道"],["{0}: замер во всех туннелях списка начнётся через несколько секунд","{0}: measuring in every tunnel of the list starts in a few seconds","{0}：几秒后开始在列表所有隧道中测量"],["✓ Лучший из списка","✓ Best of the list","✓ 列表中最佳"],["Лучший","Best","最佳"],
 ["Включён для всех в настройках","On for all in the settings","已在设置中为全部启用"],["Нажмите, чтобы вернуть порядок списка","Tap to go back to the list's order","点击恢复列表顺序"],
 ["Оставаться в туннеле списка, где лучше всего","Stay in the list's tunnel where it works best","留在列表中表现最好的隧道"],["Лучший из списка включён для всех в настройках","Best of the list is on for all in the settings","已在设置中为全部启用列表中最佳"],
-["Лучший из списка: {0}, замер {1} мин назад","Best of the list: {0}, measured {1} min ago","列表中最佳：{0}，{1} 分钟前测量"],["Лучший из списка: замеров ещё не было","Best of the list: not measured yet","列表中最佳：尚未测量"],
+["Лучший из списка: {0}, замер {1} мин назад","Best of the list: {0}, measured {1} min ago","列表中最佳：{0}，{1} 分钟前测量"],["Лучший из списка: замеров ещё не было","Best of the list: not measured yet","列表中最佳：尚未测量"],["Замеров ещё не было","Not measured yet","尚未测量"],["Последний замер","Last measurement","最近测量"],["{0} мин","{0} min","{0} 分钟"],["Лучший из списка: замеры в туннелях списка","Best of the list: measurements in the list's tunnels","列表中最佳：列表隧道中的测量"],
 ["{0}: лучший из списка","{0}: best of the list","{0}：列表中最佳"],["{0}: по порядку списка","{0}: in the list's order","{0}：按列表顺序"],
 ];
 // Words after a number: "3 домена" → "3 domains"
