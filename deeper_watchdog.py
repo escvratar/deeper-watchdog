@@ -2044,6 +2044,10 @@ def _evacuate(client, code, only, reason, why, mail):
         if moved:
             client.get_routed_domains()
             client.refresh_apps_cache()
+            targets = {m.split(" → ")[1] for m in moved if " → " in m}
+            if targets:
+                logger.info(f"Эвакуация сервисов в {', '.join(sorted(targets))}, запускаю контрольную проверку")
+                request_check(list(targets), user=True)
     follow_apps(client)
     return moved
 
@@ -2713,6 +2717,7 @@ def decide_services(client, current):
             todo.append((key, r, mode))
     if not todo:
         return
+    moved_targets = set()
     with MOVE_LOCK:
         tunnels = client.list_tunnels()
         movers = service_movers(client)
@@ -2754,6 +2759,7 @@ def decide_services(client, current):
                 log_event("bad", f"{name}: в {cur} {why_bad(r)}, но перенести в {target} не удалось", mail="failover")
                 continue
             mark_moved(key)
+            moved_targets.add(target)
             with STATE_LOCK:
                 note_bad_ip(key, cur, tunnels)
                 if not stays:
@@ -2775,6 +2781,9 @@ def decide_services(client, current):
         save_auto_state()
         client.get_routed_domains()
         client.refresh_apps_cache()
+    if moved_targets:
+        logger.info(f"Сервисы мигрировали в {', '.join(sorted(moved_targets))}, запускаю контрольную проверку")
+        request_check(list(moved_targets), user=True)
 
 
 def service_movers(client):
@@ -3114,10 +3123,8 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
                     logger.info(f"  [FAST-RETRY OK] [{code} - {country}] Контрольная проверка успешна ({d2})")
                     healthy, lat, details = h2, l2, d2
                 else:
-                    logger.warning(f"  [FAST-RETRY FAIL] [{code} - {country}] Сбой подтвержден: {d2}. Восстановление без ожидания!")
+                    logger.warning(f"  [FAST-RETRY FAIL] [{code} - {country}] Сбой подтвержден: {d2}")
                     healthy, lat, details = False, l2, f"Fast-Retry подтвердил: {d2}"
-                    fails[code] = FAIL_THRESHOLD
-                    LAST_FAIL_AT[code] = 0
         finally:
             set_action(code)
         if not LAST_CHECK.get(code, {}).get("counted", 1):
@@ -3144,7 +3151,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
             # at most once per check interval, so FAIL_THRESHOLD means minutes, not seconds. A check the user
             # asked for counts like a regular one
             if globals().get("REACTION_MODE") == "fast_retry":
-                fails[code] = FAIL_THRESHOLD
+                fails[code] = fails.get(code, 0) + 1
                 LAST_FAIL_AT[code] = 0
             else:
                 gap = USER_FAIL_GAP if user else CHECK_INTERVAL * 0.75
@@ -3267,10 +3274,7 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
     # Bad checks in a row, in the tunnel the service is in now (a move starts the count anew)
     for k, r in current.items():
         is_bad = bad_now(r)
-        if is_bad and globals().get("REACTION_MODE") == "fast_retry":
-            BAD_STREAK[k] = [True] * (FAIL_CHECKS + 1)
-        else:
-            BAD_STREAK[k] = (BAD_STREAK.get(k, []) + [is_bad])[-(FAIL_CHECKS + 1):]
+        BAD_STREAK[k] = (BAD_STREAK.get(k, []) + [is_bad])[-(FAIL_CHECKS + 1):]
         r["bad_checks"] = sum(BAD_STREAK[k])
         STAY_PINGS[k] = (STAY_PINGS.get(k, []) + [r["latency"] if r["ok"] else None])[-20:]
     # A tunnel rebuilt in this check starts its history anew: its services keep their last status meanwhile
@@ -4018,10 +4022,6 @@ const GROUPS=[
   ["FAIL_CHECKS","number","Сбой сервиса — после, плохих проверок","Сервис переезжает, если ему плохо (медленно, потери, нет ответа, ошибки) в стольких из последних проверок (на одну больше этого числа): при 2 — в 2 из 3. Одна плохая проверка — ещё не сбой, а сервис на грани порога («плохо, хорошо, плохо») переезжает"],
   ["CHECK_METHOD","choice","Как проверять сервисы","Для всех сервисов, у которых не выбран свой способ (меню «Проверка» у сервиса в «Пинг и рекомендации»)",
    [["page","Страница","Запрос к сайту, как у браузера. Точнее всего"],["tcp","Соединение","Только соединение с сервером. Для сервисов, которые работают, но не отвечают на запрос проверки через некоторые ноды"]]],
-  ["BAD_SERVICES","choice","Если плохо части сервисов","Что делать, когда в туннеле плохо нескольким сервисам, а остальным хорошо",
-   [["first","Сначала уезжают плохие","Туннель оценивается по сервисам, а не по доменам. Плохие уезжают, не дожидаясь смены ноды, и не портят пинг туннеля"],
-    ["fast","Быстрый уход очень плохих","Как «Сначала уезжают плохие», и сервис без ответа или вдвое медленнее допустимого уезжает уже после одной проверки"],
-    ["stats","Только статистика","Туннель оценивается по доменам, как раньше, но сервисы, у которых уже сбой, не портят его пинг и статус"]]],
   ["FAIL_THRESHOLD","number","Смена ноды — после, сбоев подряд","Туннель не прошёл столько проверок подряд, и в нём больше одной ноды — меняется нода и туннель проверяется заново. Его сервисы ждут смены ноды и уезжают, только если не помогло"]]},
  {title:"Предпочтительные туннели",foot:"Лестница: сервис живёт в первом туннеле списка, при сбое уходит в следующий и возвращается вверх, когда первый 5 минут в норме. Лучший из списка: сервис регулярно меряется в каждом своём туннеле и остаётся там, где ему заметно лучше (быстрее на 30% и на 50 мс или меньше потерь); при сбое уходит в лучший по последним замерам, без замеров — по порядку списка, в туннели вне списка не уходит. На время замера сервис ненадолго переносится в другие туннели.",fields:[
   ["BEST_PREFERRED","switch","Лучший из списка для всех","Выключено — лестница по порядку списка, лучший из списка только у сервисов, где он включён в меню режима. Включено — у всех сервисов с несколькими предпочтительными туннелями"],
@@ -4068,9 +4068,7 @@ const SHOW_IF={
  HEARTBEAT_TIMEOUT:["REACTION_MODE",["heartbeat"]],
  CONNTRACK_THRESHOLD:["REACTION_MODE",["conntrack"]],
  CONNTRACK_INTERVAL:["REACTION_MODE",["conntrack"]],
- PANIC_ACTION:["REACTION_MODE",["panic_button"]],
- FAIL_CHECKS:["REACTION_MODE",["classic"]],
- FAIL_THRESHOLD:["REACTION_MODE",["classic"]]};
+ PANIC_ACTION:["REACTION_MODE",["panic_button"]]};
 // Email categories: [key, title, what it covers]
 const MAIL_CATS=[
  ["recovery","Восстановление туннеля","Смена ноды или перестроение после сбоев проверки"],

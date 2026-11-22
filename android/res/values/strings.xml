@@ -7,4 +7,8 @@
     <string name="widget_status_desc">Статус туннелей и быстрое управление</string>
     <string name="widget_compact_name">Deeper Watchdog: Кнопка</string>
     <string name="widget_compact_desc">Компактная кнопка починки и статус</string>
+    <string name="widget_buttons_name">Deeper Watchdog: Пульт действий</string>
+    <string name="widget_buttons_desc">Быстрые кнопки Сравнить и Перестроить</string>
+    <string name="widget_apps_name">Deeper Watchdog: Приложения</string>
+    <string name="widget_apps_desc">Туннели Instagram, Telegram, YouTube и переключение</string>
 </resources>

@@ -73,5 +73,34 @@
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_compact_info" />
         </receiver>
+
+        <receiver
+            android:name=".ButtonsWidget"
+            android:label="@string/widget_buttons_name"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_PANIC" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_COMPARE" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_REFRESH" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_buttons_info" />
+        </receiver>
+
+        <receiver
+            android:name=".AppsWidget"
+            android:label="@string/widget_apps_name"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_CYCLE_APP" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_REFRESH" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_apps_info" />
+        </receiver>
     </application>
 </manifest>

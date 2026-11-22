@@ -11,6 +11,7 @@ import android.os.Looper;
 import android.widget.RemoteViews;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
@@ -28,10 +29,12 @@ import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-/** Helper for home screen widgets: background sync, panic and check actions, UI updates. */
+/** Helper for home screen widgets: background sync, actions and UI updates. */
 public class WidgetHelper {
     public static final String ACTION_PANIC = "com.escvratar.deeperwatchdog.ACTION_PANIC";
     public static final String ACTION_CHECK = "com.escvratar.deeperwatchdog.ACTION_CHECK";
+    public static final String ACTION_COMPARE = "com.escvratar.deeperwatchdog.ACTION_COMPARE";
+    public static final String ACTION_CYCLE_APP = "com.escvratar.deeperwatchdog.ACTION_CYCLE_APP";
     public static final String ACTION_REFRESH = "com.escvratar.deeperwatchdog.ACTION_REFRESH";
 
     public static final int STATE_OK = 0;
@@ -53,7 +56,75 @@ public class WidgetHelper {
         int dotRes = state == STATE_BAD ? R.drawable.ic_dot_red :
                 (state == STATE_WARN ? R.drawable.ic_dot_yellow : R.drawable.ic_dot_green);
 
-        // 1. StatusWidget (full)
+        // Intent to open the main app
+        PendingIntent openApp = PendingIntent.getActivity(context, 0,
+                new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+
+        // 1. ButtonsWidget (2 buttons: СРАВНИТЬ and ПЕРЕСТРОИТЬ)
+        ComponentName buttonsComp = new ComponentName(context, ButtonsWidget.class);
+        int[] buttonsIds = wm.getAppWidgetIds(buttonsComp);
+        if (buttonsIds != null && buttonsIds.length > 0) {
+            for (int id : buttonsIds) {
+                RemoteViews rv = new RemoteViews(context.getPackageName(), R.layout.widget_buttons);
+                rv.setTextViewText(R.id.widget_buttons_status, time + " · " + (state == STATE_OK ? "В норме" : "Внимание"));
+                rv.setOnClickPendingIntent(R.id.widget_buttons_header, openApp);
+
+                PendingIntent compareIntent = PendingIntent.getBroadcast(context, 20,
+                        new Intent(context, ButtonsWidget.class).setAction(ACTION_COMPARE),
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                rv.setOnClickPendingIntent(R.id.widget_btn_compare, compareIntent);
+
+                PendingIntent rebuildIntent = PendingIntent.getBroadcast(context, 21,
+                        new Intent(context, ButtonsWidget.class).setAction(ACTION_PANIC),
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                rv.setOnClickPendingIntent(R.id.widget_btn_rebuild, rebuildIntent);
+
+                wm.updateAppWidget(id, rv);
+            }
+        }
+
+        // 2. AppsWidget (Instagram, Telegram, YouTube tunnel switcher)
+        ComponentName appsComp = new ComponentName(context, AppsWidget.class);
+        int[] appsIds = wm.getAppWidgetIds(appsComp);
+        if (appsIds != null && appsIds.length > 0) {
+            String tunInsta = p.getString("app_instagram", "US").toUpperCase(Locale.ROOT);
+            String tunTele = p.getString("app_telegram", "NL").toUpperCase(Locale.ROOT);
+            String tunYt = p.getString("app_youtube", "GB").toUpperCase(Locale.ROOT);
+
+            for (int id : appsIds) {
+                RemoteViews rv = new RemoteViews(context.getPackageName(), R.layout.widget_apps);
+                rv.setTextViewText(R.id.widget_app_instagram_tunnel, tunInsta);
+                rv.setTextViewText(R.id.widget_app_telegram_tunnel, tunTele);
+                rv.setTextViewText(R.id.widget_app_youtube_tunnel, tunYt);
+
+                rv.setOnClickPendingIntent(R.id.widget_apps_header, openApp);
+
+                PendingIntent refIntent = PendingIntent.getBroadcast(context, 30,
+                        new Intent(context, AppsWidget.class).setAction(ACTION_REFRESH),
+                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                rv.setOnClickPendingIntent(R.id.widget_apps_refresh, refIntent);
+
+                // Switch Instagram
+                Intent swInsta = new Intent(context, AppsWidget.class).setAction(ACTION_CYCLE_APP).putExtra("app", "instagram");
+                PendingIntent piInsta = PendingIntent.getBroadcast(context, 31, swInsta, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                rv.setOnClickPendingIntent(R.id.widget_app_instagram_switch, piInsta);
+
+                // Switch Telegram
+                Intent swTele = new Intent(context, AppsWidget.class).setAction(ACTION_CYCLE_APP).putExtra("app", "telegram");
+                PendingIntent piTele = PendingIntent.getBroadcast(context, 32, swTele, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                rv.setOnClickPendingIntent(R.id.widget_app_telegram_switch, piTele);
+
+                // Switch YouTube
+                Intent swYt = new Intent(context, AppsWidget.class).setAction(ACTION_CYCLE_APP).putExtra("app", "youtube");
+                PendingIntent piYt = PendingIntent.getBroadcast(context, 33, swYt, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                rv.setOnClickPendingIntent(R.id.widget_app_youtube_switch, piYt);
+
+                wm.updateAppWidget(id, rv);
+            }
+        }
+
+        // 3. StatusWidget (full)
         ComponentName statusComponent = new ComponentName(context, StatusWidget.class);
         int[] statusIds = wm.getAppWidgetIds(statusComponent);
         if (statusIds != null && statusIds.length > 0) {
@@ -64,20 +135,14 @@ public class WidgetHelper {
                 rv.setTextViewText(R.id.widget_time, time);
                 rv.setImageViewResource(R.id.widget_status_dot, dotRes);
 
-                // Open app on click
-                PendingIntent openApp = PendingIntent.getActivity(context, 0,
-                        new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
                 rv.setOnClickPendingIntent(R.id.widget_header, openApp);
                 rv.setOnClickPendingIntent(R.id.widget_center, openApp);
 
-                // Panic action
                 PendingIntent panicIntent = PendingIntent.getBroadcast(context, 10,
                         new Intent(context, StatusWidget.class).setAction(ACTION_PANIC),
                         PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
                 rv.setOnClickPendingIntent(R.id.widget_btn_panic, panicIntent);
 
-                // Check action
                 PendingIntent checkIntent = PendingIntent.getBroadcast(context, 11,
                         new Intent(context, StatusWidget.class).setAction(ACTION_CHECK),
                         PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
@@ -87,7 +152,7 @@ public class WidgetHelper {
             }
         }
 
-        // 2. CompactWidget
+        // 4. CompactWidget
         ComponentName compactComponent = new ComponentName(context, CompactWidget.class);
         int[] compactIds = wm.getAppWidgetIds(compactComponent);
         if (compactIds != null && compactIds.length > 0) {
@@ -96,9 +161,6 @@ public class WidgetHelper {
                 rv.setTextViewText(R.id.widget_compact_status, compact);
                 rv.setImageViewResource(R.id.widget_compact_dot, dotRes);
 
-                PendingIntent openApp = PendingIntent.getActivity(context, 1,
-                        new Intent(context, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
                 rv.setOnClickPendingIntent(R.id.widget_compact_click, openApp);
 
                 PendingIntent panicIntent = PendingIntent.getBroadcast(context, 12,
@@ -176,13 +238,46 @@ public class WidgetHelper {
                     details = "Средний пинг " + (avgLatency > 0 ? avgLatency + " мс" : "—") + " · Ошибок: 0";
                 }
 
-                MainActivity.prefs(context).edit()
-                        .putInt("w_state", state)
+                SharedPreferences.Editor edit = MainActivity.prefs(context).edit();
+                edit.putInt("w_state", state)
                         .putString("w_status", status)
                         .putString("w_compact", compact)
                         .putString("w_details", details)
-                        .putString("w_time", time)
-                        .apply();
+                        .putString("w_time", time);
+
+                // Also fetch apps and available tunnels from /api/routes
+                try {
+                    JSONObject routesObj = httpGet(context, "api/routes");
+                    JSONArray apps = routesObj.optJSONArray("apps");
+                    if (apps != null) {
+                        for (int i = 0; i < apps.length(); i++) {
+                            JSONObject a = apps.optJSONObject(i);
+                            if (a != null) {
+                                String appName = a.optString("app");
+                                String tun = a.optString("tunnel", "");
+                                if (!appName.isEmpty()) {
+                                    edit.putString("app_" + appName.toLowerCase(Locale.ROOT), tun);
+                                }
+                            }
+                        }
+                    }
+                    JSONArray allTunnels = routesObj.optJSONArray("all_tunnels");
+                    if (allTunnels != null) {
+                        List<String> codes = new ArrayList<>();
+                        for (int i = 0; i < allTunnels.length(); i++) {
+                            JSONObject tun = allTunnels.optJSONObject(i);
+                            if (tun != null && tun.optInt("nodes", 0) > 0) {
+                                String c = tun.optString("code");
+                                if (!c.isEmpty() && !codes.contains(c)) codes.add(c);
+                            }
+                        }
+                        if (!codes.isEmpty()) {
+                            edit.putString("w_tunnels", String.join(",", codes));
+                        }
+                    }
+                } catch (Exception ignored) {}
+
+                edit.apply();
             } catch (SecurityException se) {
                 MainActivity.prefs(context).edit()
                         .putInt("w_state", STATE_WARN)
@@ -205,14 +300,34 @@ public class WidgetHelper {
 
     public static void performPanic(Context context) {
         EXECUTOR.execute(() -> {
-            setLoading(context, "Починка…");
+            setLoading(context, "Перестроение…");
             try {
                 JSONObject res = httpPost(context, "api/panic-action", new JSONObject());
                 boolean ok = res.optBoolean("ok", true);
-                String msg = res.optString("message", ok ? "Починка завершена" : "Ошибка починки");
+                String msg = res.optString("message", ok ? "Перестроение запущено" : "Ошибка перестроения");
                 toast(context, msg);
             } catch (Exception e) {
                 toast(context, "Ошибка: " + e.getMessage());
+            }
+
+            try {
+                Thread.sleep(1500);
+            } catch (InterruptedException ignored) {}
+
+            fetchAndUpdate(context);
+        });
+    }
+
+    public static void performCompare(Context context) {
+        EXECUTOR.execute(() -> {
+            setLoading(context, "Сравнение…");
+            try {
+                JSONObject body = new JSONObject();
+                body.put("domains", new JSONArray());
+                httpPost(context, "api/compare", body);
+                toast(context, "Сравнение всех туннелей запущено!");
+            } catch (Exception e) {
+                toast(context, "Ошибка запуска сравнения: " + e.getMessage());
             }
 
             try {
@@ -236,6 +351,42 @@ public class WidgetHelper {
             try {
                 Thread.sleep(2500);
             } catch (InterruptedException ignored) {}
+
+            fetchAndUpdate(context);
+        });
+    }
+
+    public static void cycleAppTunnel(Context context, String app) {
+        EXECUTOR.execute(() -> {
+            SharedPreferences p = MainActivity.prefs(context);
+            String current = p.getString("app_" + app, "").toUpperCase(Locale.ROOT);
+            String tunnelsStr = p.getString("w_tunnels", "US,NL,GB,RS,CA");
+            String[] tunnels = tunnelsStr.split(",");
+            if (tunnels.length == 0) tunnels = new String[]{"US", "NL", "GB"};
+
+            int idx = -1;
+            for (int i = 0; i < tunnels.length; i++) {
+                if (tunnels[i].trim().equalsIgnoreCase(current)) {
+                    idx = i;
+                    break;
+                }
+            }
+            int nextIdx = (idx + 1) % tunnels.length;
+            String nextTunnel = tunnels[nextIdx].trim().toUpperCase(Locale.ROOT);
+
+            p.edit().putString("app_" + app, nextTunnel).apply();
+            updateAll(context);
+            toast(context, app + " → " + nextTunnel + "…");
+
+            try {
+                JSONObject body = new JSONObject();
+                body.put("domain", "app:" + app);
+                body.put("to", nextTunnel);
+                httpPost(context, "api/move", body);
+                toast(context, app + " перенесён в " + nextTunnel);
+            } catch (Exception e) {
+                toast(context, "Ошибка переноса " + app + ": " + e.getMessage());
+            }
 
             fetchAndUpdate(context);
         });

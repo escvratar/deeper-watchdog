@@ -33,9 +33,17 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+
 /** The Deeper Watchdog web interface in a WebView: the sign-in stays (cookies), files download and upload. */
 public class MainActivity extends Activity {
-    static final String EXAMPLE_URL = "http://192.168.1.10:8787/";  // A hint only: every home network has its own address
+    static final String DEFAULT_URL = "http://192.168.1.10:8787/";
     static final String ACTION_SETTINGS = "com.escvratar.deeperwatchdog.SETTINGS";
     private static final int FILE_REQUEST = 1;
     private static final int INSTALL_REQUEST = 3;
@@ -51,7 +59,7 @@ public class MainActivity extends Activity {
     }
 
     static String baseUrl(Context c) {
-        return prefs(c).getString("url", "");
+        return prefs(c).getString("url", DEFAULT_URL);
     }
 
     private boolean night() {
@@ -273,9 +281,9 @@ public class MainActivity extends Activity {
         url.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         url.setSingleLine(true);
         url.setText(baseUrl(this));
-        url.setHint(EXAMPLE_URL);
+        url.setHint(DEFAULT_URL);
         TextView help = new TextView(this);
-        help.setText("Адрес веб-интерфейса Deeper Watchdog, например " + EXAMPLE_URL + ". Через доменное имя "
+        help.setText("Адрес веб-интерфейса Deeper Watchdog. Дома: http://192.168.1.10:8787. Через доменное имя "
                 + "(например https://имя.synology.me/) приложение и уведомления работают и вне дома.");
         help.setTextSize(13);
         CheckBox notify = new CheckBox(this);
@@ -303,6 +311,12 @@ public class MainActivity extends Activity {
             for (CheckBox cb : boxes) cb.setEnabled(on);
         });
         for (CheckBox cb : boxes) cb.setEnabled(notify.isChecked());
+
+        Button checkUpdateBtn = new Button(this);
+        checkUpdateBtn.setText("Проверить обновления на GitHub");
+        checkUpdateBtn.setOnClickListener(v -> checkUpdate(true));
+        box.addView(checkUpdateBtn);
+
         android.widget.ScrollView scroll = new android.widget.ScrollView(this);
         scroll.addView(box);
         AlertDialog.Builder b = new AlertDialog.Builder(this)
@@ -310,11 +324,7 @@ public class MainActivity extends Activity {
                 .setView(scroll)
                 .setPositiveButton("Сохранить", (d, w) -> {
                     String u = url.getText().toString().trim();
-                    if (u.isEmpty()) {
-                        android.widget.Toast.makeText(this, "Укажите адрес веб-интерфейса", android.widget.Toast.LENGTH_LONG).show();
-                        if (!prefs(this).contains("url")) showStart();
-                        return;
-                    }
+                    if (u.isEmpty()) u = DEFAULT_URL;
                     if (!u.startsWith("http://") && !u.startsWith("https://")) u = "http://" + u;
                     if (!u.endsWith("/")) u += "/";
                     boolean on = notify.isChecked();
@@ -334,6 +344,88 @@ public class MainActivity extends Activity {
     private void askNotificationPermission() {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != android.content.pm.PackageManager.PERMISSION_GRANTED)
             requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 2);
+    }
+
+    public void checkUpdate(boolean manual) {
+        if (manual) {
+            Toast.makeText(this, "Проверка обновлений на GitHub…", Toast.LENGTH_SHORT).show();
+        }
+        new Thread(() -> {
+            try {
+                HttpURLConnection con = (HttpURLConnection) new URL("https://api.github.com/repos/escvratar/deeper-watchdog/releases/latest").openConnection();
+                con.setConnectTimeout(8000);
+                con.setReadTimeout(12000);
+                con.setRequestProperty("User-Agent", "DeeperWatchdogAndroid");
+                con.setRequestProperty("Accept", "application/vnd.github.v3+json");
+                int code = con.getResponseCode();
+                if (code != 200) {
+                    throw new Exception("HTTP " + code);
+                }
+                InputStream in = con.getInputStream();
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+                in.close();
+                JSONObject rel = new JSONObject(out.toString("UTF-8"));
+                String tag = rel.optString("tag_name", "");
+                String body = rel.optString("body", "");
+                String htmlUrl = rel.optString("html_url", "");
+                String apkUrl = null;
+                JSONArray assets = rel.optJSONArray("assets");
+                if (assets != null) {
+                    for (int i = 0; i < assets.length(); i++) {
+                        JSONObject a = assets.optJSONObject(i);
+                        if (a != null && a.optString("name", "").endsWith(".apk")) {
+                            apkUrl = a.optString("browser_download_url");
+                            break;
+                        }
+                    }
+                }
+                if (apkUrl == null && !htmlUrl.isEmpty()) {
+                    apkUrl = htmlUrl;
+                }
+
+                String currentVer = "v1.5";
+                try {
+                    currentVer = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+                    if (!currentVer.startsWith("v")) currentVer = "v" + currentVer;
+                } catch (Exception ignored) {}
+
+                final String finalTag = tag;
+                final String finalApk = apkUrl;
+                final String finalBody = body;
+                final String myVer = currentVer;
+
+                boolean hasNew = !tag.isEmpty() && !tag.equalsIgnoreCase(currentVer);
+                runOnUiThread(() -> {
+                    if (hasNew && finalApk != null) {
+                        new AlertDialog.Builder(this)
+                                .setTitle("Доступна новая версия: " + finalTag)
+                                .setMessage((finalBody.isEmpty() ? "Новая версия доступна на GitHub." : finalBody) + "\n\nТекущая версия: " + myVer)
+                                .setPositiveButton("Скачать APK", (d, w) -> {
+                                    try {
+                                        Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse(finalApk));
+                                        startActivity(browserIntent);
+                                    } catch (Exception e) {
+                                        Toast.makeText(this, "Не удалось открыть ссылку: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                                    }
+                                })
+                                .setNegativeButton("Позже", null)
+                                .show();
+                    } else if (manual) {
+                        new AlertDialog.Builder(this)
+                                .setTitle("У вас последняя версия")
+                                .setMessage("Установлена версия " + myVer + ". Обновлений на GitHub нет.")
+                                .setPositiveButton("OK", null)
+                                .show();
+                    }
+                });
+            } catch (Exception e) {
+                if (manual) {
+                    runOnUiThread(() -> Toast.makeText(this, "Ошибка проверки: " + e.getMessage(), Toast.LENGTH_LONG).show());
+                }
+            }
+        }).start();
     }
 
     private void handleIntent(Intent i) {
