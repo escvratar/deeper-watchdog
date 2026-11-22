@@ -5985,37 +5985,60 @@ class SettingsHandler(BaseHTTPRequestHandler):
                     client = shared_client()
                     if action == "switch":
                         tunnels = client.list_tunnels()
-                        target = None
-                        for t in tunnels:
-                            c = t.get("tunnelCode")
-                            if (STATUS.get("tunnels", {}).get(c) or {}).get("healthy") is False and t.get("activeNum", 0) >= 2:
-                                target = c
-                                break
-                        if not target:
+                        target = body.get("tunnel") if isinstance(body, dict) else None
+                        if not target or target not in {t["tunnelCode"] for t in tunnels}:
+                            target = None
                             for t in tunnels:
                                 c = t.get("tunnelCode")
-                                if (not MONITOR_TUNNELS or c in MONITOR_TUNNELS) and t.get("activeNum", 0) >= 2:
+                                if (STATUS.get("tunnels", {}).get(c) or {}).get("healthy") is False and t.get("activeNum", 0) >= 2:
                                     target = c
                                     break
-                        if not target and tunnels:
-                            for t in tunnels:
-                                if t.get("activeNum", 0) >= 2:
-                                    target = t.get("tunnelCode")
-                                    break
+                            if not target:
+                                for c, st in (STATUS.get("tunnels") or {}).items():
+                                    if st.get("fails", 0) > 0:
+                                        t = next((x for x in tunnels if x.get("tunnelCode") == c), None)
+                                        if t and t.get("activeNum", 0) >= 2:
+                                            target = c
+                                            break
+                            if not target:
+                                routed_codes = [c for c, doms in ROUTES.get("routed", {}).items() if doms]
+                                for c in routed_codes:
+                                    t = next((x for x in tunnels if x.get("tunnelCode") == c), None)
+                                    if t and t.get("activeNum", 0) >= 2:
+                                        target = c
+                                        break
+                            if not target:
+                                for t in tunnels:
+                                    c = t.get("tunnelCode")
+                                    if (not MONITOR_TUNNELS or c in MONITOR_TUNNELS) and t.get("activeNum", 0) >= 2:
+                                        target = c
+                                        break
+                            if not target and tunnels:
+                                for t in tunnels:
+                                    if t.get("activeNum", 0) >= 2:
+                                        target = t.get("tunnelCode")
+                                        break
                         if not target:
                             return (409, {"error": "Нет доступных туннелей с несколькими нодами"})
                         before = get_tunnel(client, target) or {}
                         set_action(target, "Экстренная смена ноды…")
-                        old_ip = before.get("activeIp") or ""
-                        note_node_bad(target, old_ip)
-                        res = client.switch_node(target, old_ip)
-                        time.sleep(VERIFY_PAUSE)
-                        after = get_tunnel(client, target) or {}
-                        new_ip = after.get("activeIp") or old_ip
-                        fresh_node(client, target)
-                        log_event("ok", f"Кнопка спасения: нода {target} сменена ({old_ip} → {new_ip})", mail="changes")
-                        request_check([target], user=True)
-                        return (200, {"ok": True, "message": f"Нода {target} сменена: {old_ip} → {new_ip}"})
+                        try:
+                            old_ip = before.get("activeIp") or ""
+                            note_node_bad(target, old_ip)
+                            res = client.switch_node(target, old_ip)
+                            time.sleep(2)
+                            after = get_tunnel(client, target) or {}
+                            if after:
+                                live_pool(target, after)
+                            new_ip = after.get("activeIp") or old_ip
+                            fresh_node(client, target)
+                            client.refresh_apps_cache()
+                            log_event("ok", f"Кнопка спасения: нода {target} сменена ({old_ip} → {new_ip})", mail="changes")
+                            request_check([target], user=True)
+                            return (200, {"ok": True, "old_ip": old_ip, "new_ip": new_ip, "target": target,
+                                          "message": f"Нода {target}: {old_ip} → {new_ip}"})
+                        finally:
+                            set_action(target)
                     elif action == "evacuate":
                         current = service_results(time.time() - 300)
                         decide_services(client, current)
