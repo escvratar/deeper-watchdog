@@ -43,5 +43,35 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".StatusWidget"
+            android:label="@string/widget_status_name"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_PANIC" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_CHECK" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_REFRESH" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_status_info" />
+        </receiver>
+
+        <receiver
+            android:name=".CompactWidget"
+            android:label="@string/widget_compact_name"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_PANIC" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_CHECK" />
+                <action android:name="com.escvratar.deeperwatchdog.ACTION_REFRESH" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_compact_info" />
+        </receiver>
     </application>
 </manifest>

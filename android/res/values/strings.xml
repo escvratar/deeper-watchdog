@@ -3,4 +3,8 @@
     <string name="app_name">Deeper Watchdog</string>
     <string name="settings">Адрес сервера</string>
     <string name="settings_long">Адрес Deeper Watchdog и уведомления</string>
+    <string name="widget_status_name">Deeper Watchdog: Статус</string>
+    <string name="widget_status_desc">Статус туннелей и быстрое управление</string>
+    <string name="widget_compact_name">Deeper Watchdog: Кнопка</string>
+    <string name="widget_compact_desc">Компактная кнопка починки и статус</string>
 </resources>

@@ -85,6 +85,13 @@ WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "")  # Set in .env: it is the pass
 
 # Settings editable from the web UI: key -> (type, default, min, max)
 SETTINGS_SCHEMA = {
+    "REACTION_MODE": ("choice", "classic", ("fast_retry", "heartbeat", "conntrack", "panic_button", "classic"), None),
+    "FAST_RETRY_DELAY": ("int", "2", 1, 15),
+    "HEARTBEAT_INTERVAL": ("int", "15", 5, 60),
+    "HEARTBEAT_TIMEOUT": ("int", "2", 1, 10),
+    "CONNTRACK_THRESHOLD": ("int", "5", 2, 50),
+    "CONNTRACK_INTERVAL": ("int", "5", 2, 30),
+    "PANIC_ACTION": ("choice", "switch", ("switch", "evacuate", "check"), None),
     "DEEPER_HOST": ("str", "34.34.34.34", None, None),
     "DEEPER_USER": ("str", "admin", None, None),
     "DEEPER_PASS": ("secret", "", None, None),  # Only from .env or the web UI, never in the code
@@ -3095,6 +3102,22 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
             CHECK_PLAN[code] = (methods, keys)
             healthy, lat, details = check_tunnel_health(code, canaries=canaries, max_latency_ms=max_latency_ms,
                                                         methods=methods, services=keys)
+            # Fast-Retry: if degraded, verify immediately after FAST_RETRY_DELAY seconds
+            if not healthy and globals().get("REACTION_MODE") == "fast_retry" and LAST_CHECK.get(code, {}).get("counted", 1):
+                delay = max(1, globals().get("FAST_RETRY_DELAY", 2))
+                logger.info(f"  [FAST-RETRY] [{code} - {country}] Не пройден замер ({details}). Контрольная перепроверка через {delay}с...")
+                set_action(code, f"Контроль ({delay}с)…")
+                time.sleep(delay)
+                h2, l2, d2 = check_tunnel_health(code, canaries=canaries, max_latency_ms=max_latency_ms,
+                                                 methods=methods, services=keys)
+                if h2:
+                    logger.info(f"  [FAST-RETRY OK] [{code} - {country}] Контрольная проверка успешна ({d2})")
+                    healthy, lat, details = h2, l2, d2
+                else:
+                    logger.warning(f"  [FAST-RETRY FAIL] [{code} - {country}] Сбой подтвержден: {d2}. Восстановление без ожидания!")
+                    healthy, lat, details = False, l2, f"Fast-Retry подтвердил: {d2}"
+                    fails[code] = FAIL_THRESHOLD
+                    LAST_FAIL_AT[code] = 0
         finally:
             set_action(code)
         if not LAST_CHECK.get(code, {}).get("counted", 1):
@@ -3120,10 +3143,14 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
             # Automatic extra checks (nodes coming back, a new node) don't bring a recovery closer: fails count
             # at most once per check interval, so FAIL_THRESHOLD means minutes, not seconds. A check the user
             # asked for counts like a regular one
-            gap = USER_FAIL_GAP if user else CHECK_INTERVAL * 0.75
-            if time.time() - LAST_FAIL_AT.get(code, 0) >= gap:
-                fails[code] = fails.get(code, 0) + 1
-                LAST_FAIL_AT[code] = time.time()
+            if globals().get("REACTION_MODE") == "fast_retry":
+                fails[code] = FAIL_THRESHOLD
+                LAST_FAIL_AT[code] = 0
+            else:
+                gap = USER_FAIL_GAP if user else CHECK_INTERVAL * 0.75
+                if time.time() - LAST_FAIL_AT.get(code, 0) >= gap:
+                    fails[code] = fails.get(code, 0) + 1
+                    LAST_FAIL_AT[code] = time.time()
             logger.warning(f"  [FAIL #{fails.get(code, 0)}] [{code} - {country}] (IP: {active_ip}) -> {details}")
 
         tunnel_status[code] = {
@@ -3239,7 +3266,11 @@ def run_watchdog_iteration(client, max_latency_ms=None, state_file=STATE_FILE, o
     current = service_results(started)
     # Bad checks in a row, in the tunnel the service is in now (a move starts the count anew)
     for k, r in current.items():
-        BAD_STREAK[k] = (BAD_STREAK.get(k, []) + [bad_now(r)])[-(FAIL_CHECKS + 1):]
+        is_bad = bad_now(r)
+        if is_bad and globals().get("REACTION_MODE") == "fast_retry":
+            BAD_STREAK[k] = [True] * (FAIL_CHECKS + 1)
+        else:
+            BAD_STREAK[k] = (BAD_STREAK.get(k, []) + [is_bad])[-(FAIL_CHECKS + 1):]
         r["bad_checks"] = sum(BAD_STREAK[k])
         STAY_PINGS[k] = (STAY_PINGS.get(k, []) + [r["latency"] if r["ok"] else None])[-20:]
     # A tunnel rebuilt in this check starts its history anew: its services keep their last status meanwhile
@@ -3872,6 +3903,7 @@ body[data-view="dark"] .tcard.st-warn{box-shadow:0 0 0 1px rgba(255,165,36,.22),
   <div class="hero-ic" id="heroIc"><i data-ic="shield"></i></div>
   <div class="hero-t"><b id="heroTitle">Загрузка…</b><span id="runInfo"></span><span class="small muted" id="emailInfo"></span><span class="queue" id="queueInfo" hidden></span></div>
   <div class="actions">
+   <button class="btn danger" id="panicBtn" type="button" style="display:none"><i data-ic="bolt"></i><span>Починить сейчас</span></button>
    <button class="btn primary" id="checkNow" type="button"><i data-ic="refresh"></i><span>Проверить сейчас</span></button>
    <button class="btn gray" id="openRoutes" type="button"><i data-ic="chart"></i><span>Пинг и рекомендации</span></button>
   </div>
@@ -3964,6 +3996,21 @@ const GROUP_ICONS={"Проверка":["gauge","#007aff"],"Тестовые са
 const tile=title=>{const [ic,c]=GROUP_ICONS[title]||["sliders","#8e8e93"];const t=el("span",{class:"tile",style:"background:"+c});t.append(icon(ic));return t};
 const GROUPS=[
  {title:"Проверка",foot:"Каждый туннель проверяется по доменам своих сервисов и сайтам своих приложений. Сервис переезжает в другой туннель только когда оба условия выполнены: в его туннеле плохая связь (медленнее допустимого пинга в 2 из 3 последних проверок, теряет запросы, не отвечает, отдаёт ошибки) или нет нод — и в новом туннеле есть ноды. Просто потому, что где-то быстрее, сервисы не переезжают.",fields:[
+  ["REACTION_MODE","choice","Режим реакции на зависания","Как watchdog обнаруживает зависание и восстанавливает связь",
+   [["fast_retry","Быстрое подтверждение (Fast-Retry)","При сбое не ждёт минуты: сразу перепроверяет через пару секунд и мгновенно чинит"],
+    ["heartbeat","Частый пульс туннелей (Heartbeat)","Фоновый опрос туннелей каждые 15 сек по короткому TCP-соединению. Смена ноды за секунды"],
+    ["conntrack","Контроль зависаний в сети (Conntrack)","Следит за зависшими соединениями ядра роутера (SYN_SENT) и сразу запускает восстановление"],
+    ["panic_button","Кнопка спасения (По требованию)","Кнопка экстренного переключения в интерфейсе по требованию. Проверки идут спокойно"],
+    ["classic","Классический (Текущий способ)","Периодические проверки раз в интервал, смена ноды после накопления серии сбоев подряд"]]],
+  ["FAST_RETRY_DELAY","number","Пауза перед перепроверкой, сек","Время ожидания перед контрольной проверкой при сбое (1–15 сек)"],
+  ["HEARTBEAT_INTERVAL","number","Интервал пульса туннелей, сек","Как часто опрашивать туннели коротким TCP-запросом (5–60 сек)"],
+  ["HEARTBEAT_TIMEOUT","number","Таймаут ответа пульса, сек","Если ответ не получен за это время, нода считается зависшей (1–10 сек)"],
+  ["CONNTRACK_THRESHOLD","number","Порог зависших соединений","Количество соединений без ответа в ядре роутера для вызова экстренной починки"],
+  ["CONNTRACK_INTERVAL","number","Интервал контроля соединений, сек","Как часто опрашивать таблицу соединений роутера (2–30 сек)"],
+  ["PANIC_ACTION","choice","Действие кнопки спасения","Что делать при нажатии кнопки «Экстренная починка»",
+   [["switch","Сменить ноду и перепроверить","Сменить текущую ноду туннеля на следующую из пула и выполнить контрольный замер"],
+    ["evacuate","Перенести сервисы","Перенести сервисы на резервный или следующий предпочтительный туннель"],
+    ["check","Экстренная полная проверка","Вне очереди проверить все туннели и немедленно восстановить проблемные"]]],
   ["MAX_LATENCY_MS","number","Допустимый пинг, мс","Сервис медленнее этого в 2 из 3 последних проверок переезжает в туннель с нодами. Для способа проверки «Страница»"],
   ["MAX_TCP_LATENCY_MS","number","Допустимый пинг «Соединения», мс","То же для сервисов со способом «Соединение» или «Серверы Telegram». Их пинг в 3–4 раза меньше: меряется одно соединение, а не загрузка страницы"],
   ["CHECK_INTERVAL","number","Интервал проверки, сек","Как часто проверять туннели, от 30 сек"],
@@ -4015,7 +4062,15 @@ const GROUPS=[
 const SHOW_IF={
  REBUILD_EVERY_HOURS:["REBUILD_ENABLED",[true]],
  SMTP_TO:["SMTP_ENABLED",[true]],SMTP_HOST:["SMTP_ENABLED",[true]],SMTP_PORT:["SMTP_ENABLED",[true]],SMTP_USE_SSL:["SMTP_ENABLED",[true]],
- SMTP_USER:["SMTP_ENABLED",[true]],SMTP_PASS:["SMTP_ENABLED",[true]],SMTP_FROM:["SMTP_ENABLED",[true]],EMAIL_EVENTS:["SMTP_ENABLED",[true]]};
+ SMTP_USER:["SMTP_ENABLED",[true]],SMTP_PASS:["SMTP_ENABLED",[true]],SMTP_FROM:["SMTP_ENABLED",[true]],EMAIL_EVENTS:["SMTP_ENABLED",[true]],
+ FAST_RETRY_DELAY:["REACTION_MODE",["fast_retry"]],
+ HEARTBEAT_INTERVAL:["REACTION_MODE",["heartbeat"]],
+ HEARTBEAT_TIMEOUT:["REACTION_MODE",["heartbeat"]],
+ CONNTRACK_THRESHOLD:["REACTION_MODE",["conntrack"]],
+ CONNTRACK_INTERVAL:["REACTION_MODE",["conntrack"]],
+ PANIC_ACTION:["REACTION_MODE",["panic_button"]],
+ FAIL_CHECKS:["REACTION_MODE",["classic"]],
+ FAIL_THRESHOLD:["REACTION_MODE",["classic"]]};
 // Email categories: [key, title, what it covers]
 const MAIL_CATS=[
  ["recovery","Восстановление туннеля","Смена ноды или перестроение после сбоев проверки"],
@@ -4251,7 +4306,7 @@ GROUPS.forEach((g,gi)=>{
   if(type==="switch"){input=el("input",{type:"checkbox",class:"switch",id:key,role:"switch"});input.onchange=updateVisibility}
   else if(type==="textarea"){row.className="row block";input=el("textarea",{id:key,class:"field",spellcheck:"false",placeholder:"Название=домен1,домен2"});
    input.dataset.key=key;row.append(text,input);card.append(row);continue}
-  else if(type==="choice"){row.classList.add("wide","choice");input=el("select",{id:key,class:"field"});
+  else if(type==="choice"){row.classList.add("wide","choice");input=el("select",{id:key,class:"field"});input.onchange=updateVisibility;
    for(const [v,t,sub] of opts)input.append(el("option",{value:v,"data-sub":sub,text:t}))}
   else if(type==="segmented"){row.className="row block";input=el("input",{type:"hidden",id:key});const s=segmented(key,opts);s.dataset.seg=key;
    text.append(el("div",{class:"help",id:"modeHelp"}));row.append(text,s,input);input.dataset.key=key;card.append(row);continue}
@@ -4270,7 +4325,8 @@ navUpdate();if(!navBound){navBound=true;addEventListener("scroll",navUpdate,{pas
 const inputs=[...document.querySelectorAll("[data-key]")];
 function val(key){const i=$(key);return i.type==="checkbox"?i.checked:i.value}
 function updateVisibility(){
- for(const k in SHOW_IF){const [dep,vals]=SHOW_IF[k];document.querySelector(`[data-field="${k}"]`).hidden=!vals.includes(val(dep))}
+ for(const k in SHOW_IF){const [dep,vals]=SHOW_IF[k];const r=document.querySelector(`[data-field="${k}"]`);if(r)r.hidden=!vals.includes(val(dep))}
+ if($("panicBtn"))$("panicBtn").style.display=(val("REACTION_MODE")==="panic_button"?"":"none");
 }
 async function loadSettings(){
  const s=await api("/api/settings");
@@ -4568,6 +4624,12 @@ async function switchNode(tunnel,btn){
  btn.disabled=true;toast(`Меняю ноду ${tunnel}…`);
  try{const r=await api("/api/switch-node",{tunnel});toast(`Нода ${tunnel}: ${r.old_ip} → ${r.new_ip}`)}catch(e){toastErr(e)}
  btn.disabled=false;loadRoutes();loadStatus()}
+
+if($("panicBtn"))$("panicBtn").onclick=async()=>{
+ const btn=$("panicBtn");btn.disabled=true;setBtn(btn,"spin","Починка…");
+ try{const r=await api("/api/panic-action",{});toast(r.message||"Готово",!r.ok);await loadRoutes();await loadStatus()}
+ catch(e){toastErr(e)}
+ btn.disabled=false;setBtn(btn,"bolt","Починить сейчас")};
 
 $("checkNow").onclick=async()=>{const btn=$("checkNow"),before=lastStatus&&lastStatus.last_run;btn.disabled=true;setBtn(btn,"spin","Проверяем…");
  try{await api("/api/check-now",{});
@@ -5033,6 +5095,22 @@ const I18N=[
 ["Оставаться в туннеле списка, где лучше всего","Stay in the list's tunnel where it works best","留在列表中表现最好的隧道"],["Лучший из списка включён для всех в настройках","Best of the list is on for all in the settings","已在设置中为全部启用列表中最佳"],
 ["Лучший из списка: {0}, замер {1} мин назад","Best of the list: {0}, measured {1} min ago","列表中最佳：{0}，{1} 分钟前测量"],["Лучший из списка: замеров ещё не было","Best of the list: not measured yet","列表中最佳：尚未测量"],["Замеров ещё не было","Not measured yet","尚未测量"],["Последний замер","Last measurement","最近测量"],["{0} мин","{0} min","{0} 分钟"],["Лучший из списка: замеры в туннелях списка","Best of the list: measurements in the list's tunnels","列表中最佳：列表隧道中的测量"],
 ["{0}: лучший из списка","{0}: best of the list","{0}：列表中最佳"],["{0}: по порядку списка","{0}: in the list's order","{0}：按列表顺序"],
+["Починить сейчас","Fix now","立即修复"],
+["Режим реакции на зависания","Freeze reaction mode","卡顿应对模式"],
+["Быстрое подтверждение (Fast-Retry)","Fast confirmation (Fast-Retry)","快速确认 (Fast-Retry)"],
+["Частый пульс туннелей (Heartbeat)","Frequent tunnel pulse (Heartbeat)","高频隧道心跳 (Heartbeat)"],
+["Контроль зависаний в сети (Conntrack)","Network freeze monitor (Conntrack)","网络连接监控 (Conntrack)"],
+["Кнопка спасения (По требованию)","Rescue button (On demand)","应急按钮 (按需)"],
+["Классический (Текущий способ)","Classic (Current method)","经典模式 (当前方式)"],
+["Пауза перед перепроверкой, сек","Pause before retry, s","重试前等待，秒"],
+["Интервал пульса туннелей, сек","Tunnel pulse interval, s","隧道心跳间隔，秒"],
+["Таймаут ответа пульса, сек","Pulse response timeout, s","心跳响应超时，秒"],
+["Порог зависших соединений","Stuck connections threshold","连接停滞阈值"],
+["Интервал контроля соединений, сек","Connection monitor interval, s","连接监控间隔，秒"],
+["Действие кнопки спасения","Rescue button action","应急按钮动作"],
+["Сменить ноду и перепроверить","Switch node and verify","更换节点并验证"],
+["Перенести сервисы","Move services","迁移服务"],
+["Экстренная полная проверка","Emergency full check","紧急完整检测"],
 ];
 // Words after a number: "3 домена" → "3 domains"
 const I18N_NOUNS={"нода":["node","个节点"],"ноды":["nodes","个节点"],"нод":["nodes","个节点"],"домен":["domain","个域名"],"домена":["domains","个域名"],"доменов":["domains","个域名"],
@@ -5900,6 +5978,59 @@ class SettingsHandler(BaseHTTPRequestHandler):
                     return (502, {"error": error or f"Deeper не принял: {', '.join(failed[:10])}", "changed": changed})
                 return (200, {"ok": True, "changed": changed, "message": f"{what}: изменено {len(changed)}"})
             self._queued(queue_action("Восстановление копии" if restoring else "Загрузка файла", restore_job, tunnel=None))
+        elif self.path == "/api/panic-action":
+            def panic_job():
+                try:
+                    action = globals().get("PANIC_ACTION", "switch")
+                    client = shared_client()
+                    if action == "switch":
+                        tunnels = client.list_tunnels()
+                        target = None
+                        for t in tunnels:
+                            c = t.get("tunnelCode")
+                            if (STATUS.get("tunnels", {}).get(c) or {}).get("healthy") is False and t.get("activeNum", 0) >= 2:
+                                target = c
+                                break
+                        if not target:
+                            for t in tunnels:
+                                c = t.get("tunnelCode")
+                                if (not MONITOR_TUNNELS or c in MONITOR_TUNNELS) and t.get("activeNum", 0) >= 2:
+                                    target = c
+                                    break
+                        if not target and tunnels:
+                            for t in tunnels:
+                                if t.get("activeNum", 0) >= 2:
+                                    target = t.get("tunnelCode")
+                                    break
+                        if not target:
+                            return (409, {"error": "Нет доступных туннелей с несколькими нодами"})
+                        before = get_tunnel(client, target) or {}
+                        set_action(target, "Экстренная смена ноды…")
+                        old_ip = before.get("activeIp") or ""
+                        note_node_bad(target, old_ip)
+                        res = client.switch_node(target, old_ip)
+                        time.sleep(VERIFY_PAUSE)
+                        after = get_tunnel(client, target) or {}
+                        new_ip = after.get("activeIp") or old_ip
+                        fresh_node(client, target)
+                        log_event("ok", f"Кнопка спасения: нода {target} сменена ({old_ip} → {new_ip})", mail="changes")
+                        request_check([target], user=True)
+                        return (200, {"ok": True, "message": f"Нода {target} сменена: {old_ip} → {new_ip}"})
+                    elif action == "evacuate":
+                        current = service_results(time.time() - 300)
+                        decide_services(client, current)
+                        enforce_preferred(client, dict(GREEN_SINCE))
+                        follow_apps(client)
+                        log_event("ok", "Кнопка спасения: перенос сервисов выполнен", mail="changes")
+                        return (200, {"ok": True, "message": "Сервисы перенесены в резервные туннели"})
+                    else:  # "check"
+                        request_check(None, user=True)
+                        log_event("info", "Кнопка спасения: запущена экстренная проверка", mail="changes")
+                        return (200, {"ok": True, "message": "Запущена экстренная проверка всех туннелей"})
+                except Exception as e:
+                    logger.error(f"Ошибка экстренного действия: {e}")
+                    return (502, {"error": str(e)})
+            self._queued(queue_action("Экстренное действие", panic_job, tunnel=None))
         elif self.path == "/api/check-now":
             # {"tunnel": code}: just that tunnel (the "⋯" menu of its card); otherwise every one
             code = body.get("tunnel") if isinstance(body, dict) else None
@@ -6084,6 +6215,104 @@ def watch_nodes():
                 logger.warning(f"Ошибка наблюдателя нод: {msg}")
         else:
             WATCH_ERROR["last"] = None
+
+
+HEARTBEAT_FAILS = {}
+LAST_CONNTRACK_TRIGGER = 0
+
+
+def heartbeat_worker():
+    """Background worker for 'heartbeat' mode: checks tunnels via fast TCP handshake."""
+    logger.info("Heartbeat worker started")
+    while True:
+        try:
+            interval = max(5, globals().get("HEARTBEAT_INTERVAL", 15))
+            time.sleep(interval)
+            if globals().get("REACTION_MODE") != "heartbeat":
+                continue
+            if ROUTE_LOCK.locked() or COMPARE["running"]:
+                continue
+            client = shared_client()
+            try:
+                tunnels = {t.get("tunnelCode"): t for t in client.list_tunnels()}
+            except Exception:
+                continue
+            monitored = [c for c in (MONITOR_TUNNELS or tunnels.keys()) if c in tunnels]
+            for code in monitored:
+                t = tunnels[code]
+                if t.get("activeNum", 0) < 2:
+                    continue
+                active_ip = t.get("activeIp")
+                canaries = ROUTES.get("routed", {}).get(code, [])
+                if not canaries:
+                    continue
+                target_host = host_of(canaries[0]).removeprefix("www.")
+                timeout = max(1, globals().get("HEARTBEAT_TIMEOUT", 2))
+                ok = False
+                try:
+                    s = socket.create_connection((target_host, 443), timeout=timeout)
+                    s.close()
+                    ok = True
+                except Exception:
+                    ok = False
+                if ok:
+                    HEARTBEAT_FAILS[code] = 0
+                else:
+                    HEARTBEAT_FAILS[code] = HEARTBEAT_FAILS.get(code, 0) + 1
+                    logger.warning(f"  [HEARTBEAT FAIL #{HEARTBEAT_FAILS[code]}] {code} ({active_ip}) -> {target_host}:443")
+                    if HEARTBEAT_FAILS[code] >= 2:
+                        HEARTBEAT_FAILS[code] = 0
+                        logger.warning(f"Heartbeat: туннель {code} ({active_ip}) не отвечает на TCP-пульс! Ротация ноды...")
+                        note_node_bad(code, active_ip)
+                        with MOVE_LOCK:
+                            client.switch_node(code, active_ip)
+                        log_event("warn", f"Heartbeat: потерян пульс {code} ({active_ip}), ротация ноды", mail="recovery")
+                        request_check([code], user=True)
+        except Exception as e:
+            logger.debug(f"Heartbeat worker error: {e}")
+
+
+def conntrack_worker():
+    """Background worker for 'conntrack' mode: monitors router connection table for hung connections."""
+    global LAST_CONNTRACK_TRIGGER
+    logger.info("Conntrack worker started")
+    paths = ["/host/proc/net/nf_conntrack", "/proc/net/nf_conntrack"]
+    while True:
+        try:
+            interval = max(2, globals().get("CONNTRACK_INTERVAL", 5))
+            time.sleep(interval)
+            if globals().get("REACTION_MODE") != "conntrack":
+                continue
+            if time.time() - LAST_CONNTRACK_TRIGGER < 30:
+                continue
+            lines = None
+            for p in paths:
+                if os.path.exists(p):
+                    try:
+                        with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                            lines = f.readlines()
+                        break
+                    except Exception:
+                        pass
+            if not lines:
+                continue
+            threshold = max(2, globals().get("CONNTRACK_THRESHOLD", 5))
+            stuck = 0
+            for l in lines:
+                if "tcp" in l and ("SYN_SENT" in l or "[UNREPLIED]" in l):
+                    parts = l.split()
+                    dsts = [part.split("=")[1] for part in parts if part.startswith("dst=")]
+                    if dsts:
+                        target = dsts[0]
+                        if not (target.startswith("192.168.") or target.startswith("10.") or target.startswith("127.") or target.startswith("172.")):
+                            stuck += 1
+            if stuck >= threshold:
+                LAST_CONNTRACK_TRIGGER = time.time()
+                logger.warning(f"Conntrack: зафиксировано {stuck} зависших соединений (порог {threshold})! Экстренное восстановление...")
+                log_event("warn", f"Conntrack: {stuck} зависших соединений в сети (порог {threshold}), экстренная проверка и починка", mail="recovery")
+                request_check(None, user=True)
+        except Exception as e:
+            logger.debug(f"Conntrack worker error: {e}")
 
 
 def start_web_server():
@@ -6305,6 +6534,8 @@ def main():
                 import webbrowser
                 threading.Timer(1.5, webbrowser.open, [f"http://127.0.0.1:{WEB_PORT}/"]).start()
         threading.Thread(target=watch_nodes, daemon=True).start()
+        threading.Thread(target=heartbeat_worker, daemon=True).start()
+        threading.Thread(target=conntrack_worker, daemon=True).start()
         old = sorted(k for k in load_saved_settings() if k not in SETTINGS_SCHEMA)
         if old:
             with SETTINGS_LOCK:

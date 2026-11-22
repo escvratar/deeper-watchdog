@@ -151,7 +151,10 @@ public class MainActivity extends Activity {
                 // The background check signs in with the same session as the page
                 String cookie = cm.getCookie(baseUrl(MainActivity.this));
                 if (cookie != null) prefs(MainActivity.this).edit().putString("cookie", cookie).putBoolean("auth_noted", false).apply();
-                if (!failed) errorView.setVisibility(View.GONE);
+                if (!failed) {
+                    errorView.setVisibility(View.GONE);
+                    WidgetHelper.fetchAndUpdate(MainActivity.this);
+                }
             }
         });
 

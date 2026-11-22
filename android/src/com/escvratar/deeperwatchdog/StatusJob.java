@@ -81,6 +81,7 @@ public class StatusJob extends JobService {
             } catch (Exception ignored) {
                 // No network or the server is restarting: the next run asks again, nothing is lost
             }
+            WidgetHelper.fetchAndUpdate(this);
             jobFinished(params, false);
         }).start();
         return true;
