@@ -106,7 +106,7 @@ public class MainActivity extends Activity {
         s.setDomStorageEnabled(true);
         s.setTextZoom(100);
         s.setSupportZoom(false);
-        s.setUserAgentString(s.getUserAgentString() + " DeeperWatchdogApp/1.2");
+        s.setUserAgentString(s.getUserAgentString() + " DeeperWatchdogApp/1.5");
         CookieManager.getInstance().setAcceptCookie(true);
         web.setBackgroundColor(night() ? Color.BLACK : Color.rgb(242, 242, 247));
 
