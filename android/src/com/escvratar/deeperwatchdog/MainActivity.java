@@ -85,6 +85,7 @@ public class MainActivity extends Activity {
             askNotificationPermission();
             StatusJob.schedule(this, true);
         }
+        checkUpdate(false);
     }
 
     private void applyBars() {
@@ -123,6 +124,10 @@ public class MainActivity extends Activity {
             @android.webkit.JavascriptInterface
             public void openSettings() {
                 runOnUiThread(() -> showSettings(false));
+            }
+            @android.webkit.JavascriptInterface
+            public void checkUpdate() {
+                runOnUiThread(() -> MainActivity.this.checkUpdate(true));
             }
         }, "DWApp");
 
