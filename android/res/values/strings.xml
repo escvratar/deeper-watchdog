@@ -11,4 +11,6 @@
     <string name="widget_buttons_desc">Быстрые кнопки Сравнить и Перестроить</string>
     <string name="widget_apps_name">Deeper Watchdog: Приложения</string>
     <string name="widget_apps_desc">Туннели Instagram, Telegram, YouTube и переключение</string>
+    <string name="check_update">Обновления</string>
+    <string name="check_update_long">Проверить обновления на GitHub</string>
 </resources>

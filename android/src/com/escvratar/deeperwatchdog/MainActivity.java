@@ -45,6 +45,7 @@ import java.net.URL;
 public class MainActivity extends Activity {
     static final String DEFAULT_URL = "http://192.168.1.10:8787/";
     static final String ACTION_SETTINGS = "com.escvratar.deeperwatchdog.SETTINGS";
+    static final String ACTION_CHECK_UPDATE = "com.escvratar.deeperwatchdog.CHECK_UPDATE";
     private static final int FILE_REQUEST = 1;
     private static final int INSTALL_REQUEST = 3;
 
@@ -115,7 +116,7 @@ public class MainActivity extends Activity {
         s.setDomStorageEnabled(true);
         s.setTextZoom(100);
         s.setSupportZoom(false);
-        s.setUserAgentString(s.getUserAgentString() + " DeeperWatchdogApp/1.5");
+        s.setUserAgentString(s.getUserAgentString() + " DeeperWatchdogApp/1.6");
         CookieManager.getInstance().setAcceptCookie(true);
         web.setBackgroundColor(night() ? Color.BLACK : Color.rgb(242, 242, 247));
 
@@ -390,7 +391,7 @@ public class MainActivity extends Activity {
                     apkUrl = htmlUrl;
                 }
 
-                String currentVer = "v1.5";
+                String currentVer = "v1.6";
                 try {
                     currentVer = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
                     if (!currentVer.startsWith("v")) currentVer = "v" + currentVer;
@@ -434,14 +435,22 @@ public class MainActivity extends Activity {
     }
 
     private void handleIntent(Intent i) {
-        if (i != null && ACTION_SETTINGS.equals(i.getAction())) showSettings(false);
+        if (i != null) {
+            if (ACTION_SETTINGS.equals(i.getAction())) showSettings(false);
+            else if (ACTION_CHECK_UPDATE.equals(i.getAction())) checkUpdate(true);
+        }
     }
 
     @Override
     protected void onNewIntent(Intent i) {
         super.onNewIntent(i);
-        if (ACTION_SETTINGS.equals(i.getAction())) showSettings(false);
-        else web.reload();
+        if (i != null) {
+            if (ACTION_SETTINGS.equals(i.getAction())) showSettings(false);
+            else if (ACTION_CHECK_UPDATE.equals(i.getAction())) checkUpdate(true);
+            else web.reload();
+        } else {
+            web.reload();
+        }
     }
 
     @Override

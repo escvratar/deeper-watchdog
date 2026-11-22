@@ -1,0 +1,35 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="200dp"
+    android:height="70dp"
+    android:viewportWidth="200"
+    android:viewportHeight="70">
+    <!-- Card Background -->
+    <path
+        android:fillColor="#1C1E24"
+        android:strokeColor="#2E3440"
+        android:strokeWidth="1.5"
+        android:pathData="M 12 4 H 188 A 12 12 0 0 1 200 16 V 54 A 12 12 0 0 1 188 66 H 12 A 12 12 0 0 1 0 54 V 16 A 12 12 0 0 1 12 4 Z" />
+
+    <!-- Status dot -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M 16 29 A 4 4 0 1 1 16 37 A 4 4 0 1 1 16 29 Z" />
+
+    <!-- Title and Subtitle -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 26 23 H 95 V 30 H 26 Z" />
+    <path
+        android:fillColor="#94A3B8"
+        android:pathData="M 26 36 H 80 V 42 H 26 Z" />
+
+    <!-- Button -->
+    <path
+        android:fillColor="#2A1B24"
+        android:strokeColor="#F43F5E"
+        android:strokeWidth="1"
+        android:pathData="M 125 18 H 183 A 6 6 0 0 1 189 24 V 46 A 6 6 0 0 1 183 52 H 125 A 6 6 0 0 1 119 46 V 24 A 6 6 0 0 1 125 18 Z" />
+    <path
+        android:fillColor="#FB7185"
+        android:pathData="M 133 32 H 175 V 38 H 133 Z" />
+</vector>

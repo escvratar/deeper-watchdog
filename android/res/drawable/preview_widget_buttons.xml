@@ -1,0 +1,51 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="240dp"
+    android:height="110dp"
+    android:viewportWidth="240"
+    android:viewportHeight="110">
+    <!-- Card Background -->
+    <path
+        android:fillColor="#1C1E24"
+        android:strokeColor="#2E3440"
+        android:strokeWidth="1.5"
+        android:pathData="M 12 4 H 228 A 12 12 0 0 1 240 16 V 94 A 12 12 0 0 1 228 106 H 12 A 12 12 0 0 1 0 94 V 16 A 12 12 0 0 1 12 4 Z" />
+
+    <!-- Header bar -->
+    <path
+        android:fillColor="#34D399"
+        android:pathData="M 16 18 A 4 4 0 1 1 16 26 A 4 4 0 1 1 16 18 Z" />
+    <path
+        android:fillColor="#E2E8F0"
+        android:pathData="M 26 19 H 85 V 25 H 26 Z" />
+    <path
+        android:fillColor="#64748B"
+        android:pathData="M 195 19 H 224 V 24 H 195 Z" />
+
+    <!-- Button 1: Compare (Blue) -->
+    <path
+        android:fillColor="#1E293B"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="1.5"
+        android:pathData="M 20 36 H 112 A 8 8 0 0 1 120 44 V 88 A 8 8 0 0 1 112 96 H 20 A 8 8 0 0 1 12 88 V 44 A 8 8 0 0 1 20 36 Z" />
+    <!-- Button 1 label placeholder -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M 32 54 H 100 V 62 H 32 Z" />
+    <path
+        android:fillColor="#94A3B8"
+        android:pathData="M 40 70 H 92 V 76 H 40 Z" />
+
+    <!-- Button 2: Rebuild (Red/Rose) -->
+    <path
+        android:fillColor="#2A1B24"
+        android:strokeColor="#F43F5E"
+        android:strokeWidth="1.5"
+        android:pathData="M 128 36 H 220 A 8 8 0 0 1 228 44 V 88 A 8 8 0 0 1 220 96 H 128 A 8 8 0 0 1 120 88 V 44 A 8 8 0 0 1 128 36 Z" />
+    <!-- Button 2 label placeholder -->
+    <path
+        android:fillColor="#FB7185"
+        android:pathData="M 138 54 H 210 V 62 H 138 Z" />
+    <path
+        android:fillColor="#FDA4AF"
+        android:pathData="M 146 70 H 202 V 76 H 146 Z" />
+</vector>

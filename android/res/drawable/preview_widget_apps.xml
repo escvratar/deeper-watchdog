@@ -1,0 +1,78 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="260dp"
+    android:height="130dp"
+    android:viewportWidth="260"
+    android:viewportHeight="130">
+    <!-- Card Background -->
+    <path
+        android:fillColor="#1C1E24"
+        android:strokeColor="#2E3440"
+        android:strokeWidth="1.5"
+        android:pathData="M 12 4 H 248 A 12 12 0 0 1 260 16 V 114 A 12 12 0 0 1 248 126 H 12 A 12 12 0 0 1 0 114 V 16 A 12 12 0 0 1 12 4 Z" />
+
+    <!-- Header -->
+    <path
+        android:fillColor="#E2E8F0"
+        android:pathData="M 16 16 H 120 V 23 H 16 Z" />
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M 205 16 H 244 V 23 H 205 Z" />
+
+    <!-- Row 1: Instagram -->
+    <path
+        android:fillColor="#E1306C"
+        android:pathData="M 16 40 H 22 V 46 H 16 Z" />
+    <path
+        android:fillColor="#F1F5F9"
+        android:pathData="M 28 39 H 85 V 47 H 28 Z" />
+    <!-- Badge US -->
+    <path
+        android:fillColor="#064E3B"
+        android:strokeColor="#10B981"
+        android:strokeWidth="1"
+        android:pathData="M 145 35 H 175 A 4 4 0 0 1 179 39 V 47 A 4 4 0 0 1 175 51 H 145 A 4 4 0 0 1 141 47 V 39 A 4 4 0 0 1 145 35 Z" />
+    <!-- Switch button -->
+    <path
+        android:fillColor="#1E293B"
+        android:strokeColor="#3B82F6"
+        android:strokeWidth="1"
+        android:pathData="M 195 35 H 244 A 4 4 0 0 1 248 39 V 47 A 4 4 0 0 1 244 51 H 195 A 4 4 0 0 1 191 47 V 39 A 4 4 0 0 1 195 35 Z" />
+
+    <!-- Row 2: Telegram -->
+    <path
+        android:fillColor="#0088CC"
+        android:pathData="M 16 70 H 22 V 76 H 16 Z" />
+    <path
+        android:fillColor="#F1F5F9"
+        android:pathData="M 28 69 H 80 V 77 H 28 Z" />
+    <!-- Badge NL -->
+    <path
+        android:fillColor="#064E3B"
+        android:strokeColor="#10B981"
+        android:strokeWidth="1"
+        android:pathData="M 145 65 H 175 A 4 4 0 0 1 179 69 V 77 A 4 4 0 0 1 175 81 H 145 A 4 4 0 0 1 141 77 V 69 A 4 4 0 0 1 145 65 Z" />
+    <path
+        android:fillColor="#1E293B"
+        android:strokeColor="#3B82F6"
+        android:strokeWidth="1"
+        android:pathData="M 195 65 H 244 A 4 4 0 0 1 248 69 V 77 A 4 4 0 0 1 244 81 H 195 A 4 4 0 0 1 191 77 V 69 A 4 4 0 0 1 195 65 Z" />
+
+    <!-- Row 3: YouTube -->
+    <path
+        android:fillColor="#FF0000"
+        android:pathData="M 16 100 H 22 V 106 H 16 Z" />
+    <path
+        android:fillColor="#F1F5F9"
+        android:pathData="M 28 99 H 75 V 107 H 28 Z" />
+    <!-- Badge GB -->
+    <path
+        android:fillColor="#064E3B"
+        android:strokeColor="#10B981"
+        android:strokeWidth="1"
+        android:pathData="M 145 95 H 175 A 4 4 0 0 1 179 99 V 107 A 4 4 0 0 1 175 111 H 145 A 4 4 0 0 1 141 107 V 99 A 4 4 0 0 1 145 95 Z" />
+    <path
+        android:fillColor="#1E293B"
+        android:strokeColor="#3B82F6"
+        android:strokeWidth="1"
+        android:pathData="M 195 95 H 244 A 4 4 0 0 1 248 99 V 107 A 4 4 0 0 1 244 111 H 195 A 4 4 0 0 1 191 107 V 99 A 4 4 0 0 1 195 95 Z" />
+</vector>

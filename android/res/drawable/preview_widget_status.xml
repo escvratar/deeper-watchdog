@@ -1,0 +1,50 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="240dp"
+    android:height="120dp"
+    android:viewportWidth="240"
+    android:viewportHeight="120">
+    <!-- Card Background -->
+    <path
+        android:fillColor="#1C1E24"
+        android:strokeColor="#2E3440"
+        android:strokeWidth="1.5"
+        android:pathData="M 12 4 H 228 A 12 12 0 0 1 240 16 V 104 A 12 12 0 0 1 228 116 H 12 A 12 12 0 0 1 0 104 V 16 A 12 12 0 0 1 12 4 Z" />
+
+    <!-- Header -->
+    <path
+        android:fillColor="#E2E8F0"
+        android:pathData="M 16 16 H 90 V 22 H 16 Z" />
+    <path
+        android:fillColor="#64748B"
+        android:pathData="M 200 16 H 224 V 21 H 200 Z" />
+
+    <!-- Status dot + main status text -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M 18 42 A 5 5 0 1 1 18 52 A 5 5 0 1 1 18 42 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M 30 43 H 160 V 51 H 30 Z" />
+    <path
+        android:fillColor="#94A3B8"
+        android:pathData="M 30 58 H 180 V 64 H 30 Z" />
+
+    <!-- Bottom Buttons: Panic and Check -->
+    <path
+        android:fillColor="#2A1B24"
+        android:strokeColor="#F43F5E"
+        android:strokeWidth="1"
+        android:pathData="M 20 80 H 112 A 6 6 0 0 1 118 86 V 100 A 6 6 0 0 1 112 106 H 20 A 6 6 0 0 1 14 100 V 86 A 6 6 0 0 1 20 80 Z" />
+    <path
+        android:fillColor="#FB7185"
+        android:pathData="M 38 90 H 94 V 96 H 38 Z" />
+
+    <path
+        android:fillColor="#1E293B"
+        android:strokeColor="#38BDF8"
+        android:strokeWidth="1"
+        android:pathData="M 128 80 H 220 A 6 6 0 0 1 226 86 V 100 A 6 6 0 0 1 220 106 H 128 A 6 6 0 0 1 122 100 V 86 A 6 6 0 0 1 128 80 Z" />
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M 146 90 H 202 V 96 H 146 Z" />
+</vector>

@@ -4,6 +4,8 @@
     android:minHeight="70dp"
     android:updatePeriodMillis="1800000"
     android:initialLayout="@layout/widget_buttons"
+    android:previewLayout="@layout/widget_buttons"
+    android:previewImage="@drawable/preview_widget_buttons"
     android:resizeMode="horizontal|vertical"
     android:widgetCategory="home_screen"
     android:description="@string/widget_buttons_desc" />
